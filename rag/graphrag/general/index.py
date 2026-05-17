@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 import networkx as nx
 
@@ -115,8 +116,13 @@ async def run_graphrag(
     start = asyncio.get_running_loop().time()
     tenant_id, kb_id, doc_id = row["tenant_id"], str(row["kb_id"]), row["doc_id"]
     chunks = []
-    for d in settings.retriever.chunk_list(doc_id, tenant_id, [kb_id], max_count=10000, fields=["content_with_weight", "doc_id"], sort_by_position=True):
+    doc_name = ""
+    for d in settings.retriever.chunk_list(doc_id, tenant_id, [kb_id], max_count=10000, fields=["content_with_weight", "doc_id", "docnm_kwd"], sort_by_position=True):
         chunks.append(d["content_with_weight"])
+        if not doc_name:
+            doc_name = d.get("docnm_kwd", "")
+    if doc_name:
+        doc_name = os.path.splitext(doc_name)[0]
 
     timeout_sec = max(120, len(chunks) * 60 * 10) if enable_timeout_assertion else 10000000000
 
@@ -135,6 +141,7 @@ async def run_graphrag(
                 chat_model,
                 embedding_model,
                 callback,
+                fallback_title=doc_name,
             ),
             timeout=timeout_sec,
         )
@@ -256,8 +263,11 @@ async def run_graphrag_for_kb(
 
         for d in raw_chunks:
             content = d["content_with_weight"]
-            if num_tokens_from_string(current_chunk + content) < 4096:
-                current_chunk += content
+            # FIX: 合并 chunk 时添加换行符分隔，确保 Markdown 标题（如 ##）仍在行首
+            separator = "\n" if current_chunk and not current_chunk.endswith("\n") else ""
+            proposed = current_chunk + separator + content
+            if num_tokens_from_string(proposed) < 4096:
+                current_chunk = proposed
             else:
                 if current_chunk:
                     chunks.append(current_chunk)
@@ -495,6 +505,139 @@ async def run_graphrag_for_kb(
     }
 
 
+def _extract_book_and_chapters(doc_id: str, chunks: list[str], fallback_title: str = ""):
+    """从 Markdown chunks 中提取书名和章节名"""
+    book_title = None
+    for chunk in chunks:
+        m = re.search(r"^#\s+(.+)$", chunk, re.MULTILINE)
+        if m:
+            book_title = m.group(1).strip()
+            break
+
+    if not book_title:
+        book_title = fallback_title
+    if not book_title:
+        logging.warning(f"[ChapterGraph] doc_id={doc_id}: 未找到 # 书名，且未提供 fallback_title，跳过章节提取")
+        return None, [], [], []
+
+    chapter_entities = []
+    chapter_relations = []
+    seen_chapters = set()
+    chunk_chapters = []
+
+    chapter_entities.append({
+        "entity_name": book_title,
+        "entity_type": "Book",
+        "description": f"书籍《{book_title}》",
+        "source_id": [doc_id],
+    })
+
+    has_markdown_headers = False
+    for chunk in chunks:
+        chapters_in_chunk = []
+        for m in re.finditer(r"^##\s+(.+)$", chunk, re.MULTILINE):
+            has_markdown_headers = True
+            chapter = m.group(1).strip()
+            chapter_node_name = f"《{book_title}》{chapter}"
+            chapters_in_chunk.append(chapter_node_name)
+            if chapter_node_name not in seen_chapters:
+                seen_chapters.add(chapter_node_name)
+                chapter_entities.append({
+                    "entity_name": chapter_node_name,
+                    "entity_type": "Chapter",
+                    "description": f"《{book_title}》的章节：{chapter}",
+                    "source_id": [doc_id],
+                })
+                chapter_relations.append({
+                    "src_id": book_title,
+                    "tgt_id": chapter_node_name,
+                    "description": f"《{book_title}》包含章节《{chapter}》",
+                    "keywords": ["contains", "章节", "书籍"],
+                    "weight": 1,
+                    "source_id": [doc_id],
+                })
+        chunk_chapters.append(chapters_in_chunk)
+
+    # 如果没有找到任何 ## 标题（说明 chunk 生成时已把 ## 当作 delimiter 切掉了），
+    # 则从每个后续 chunk 的第一行非空文本提取章节标题
+    if not has_markdown_headers:
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                continue
+            first_line = ""
+            for line in chunk.split('\n'):
+                stripped = line.strip()
+                if stripped:
+                    first_line = stripped
+                    break
+            if first_line and len(first_line) <= 100:
+                chapter_node_name = f"《{book_title}》{first_line}"
+                chunk_chapters[i].append(chapter_node_name)
+                if chapter_node_name not in seen_chapters:
+                    seen_chapters.add(chapter_node_name)
+                    chapter_entities.append({
+                        "entity_name": chapter_node_name,
+                        "entity_type": "Chapter",
+                        "description": f"《{book_title}》的章节：{first_line}",
+                        "source_id": [doc_id],
+                    })
+                    chapter_relations.append({
+                        "src_id": book_title,
+                        "tgt_id": chapter_node_name,
+                        "description": f"《{book_title}》包含章节《{first_line}》",
+                        "keywords": ["contains", "章节", "书籍"],
+                        "weight": 1,
+                        "source_id": [doc_id],
+                    })
+        # FIX: chunks[0] 通常包含书名和第一章内容，fallback 时应把它关联到第一个章节
+        if chunks and len(chunk_chapters) > 1:
+            first_chapter = None
+            for chapters in chunk_chapters[1:]:
+                if chapters:
+                    first_chapter = chapters[0]
+                    break
+            if first_chapter and not chunk_chapters[0]:
+                chunk_chapters[0].append(first_chapter)
+
+    logging.info(f"[ChapterGraph] doc_id={doc_id}: book_title={book_title}, chapters={len(seen_chapters)}, has_md_headers={has_markdown_headers}")
+    return book_title, chapter_entities, chapter_relations, chunk_chapters
+
+
+def _link_entities_to_chapters(doc_id: str, chunks: list[str], entities: list[dict], chunk_chapters: list[list[str]]):
+    """基于文本匹配，将实体与包含它的章节建立关系"""
+    relations = []
+    seen_pairs = set()
+    chunk_texts = [chunk.lower() for chunk in chunks]
+
+    for ent in entities:
+        # 跳过书籍和章节自身
+        if ent.get("entity_type") in ("Book", "Chapter"):
+            continue
+        ent_name = ent["entity_name"]
+        ent_name_lower = ent_name.lower()
+        matched = False
+        for idx, text in enumerate(chunk_texts):
+            if ent_name_lower in text:
+                matched = True
+                for chapter in chunk_chapters[idx]:
+                    pair = (chapter, ent_name)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    relations.append({
+                        "src_id": chapter,
+                        "tgt_id": ent_name,
+                        "description": f"章节《{chapter}》涉及实体《{ent_name}》",
+                        "keywords": ["involves", "章节", "实体"],
+                        "weight": 1,
+                        "source_id": [doc_id],
+                    })
+        if not matched:
+            logging.debug(f"[ChapterGraph] doc_id={doc_id}: entity '{ent_name}' not found in any chunk text")
+    logging.info(f"[ChapterGraph] doc_id={doc_id}: entity_chapter_relations={len(relations)}, entities_processed={len(entities)}")
+    return relations
+
+
 async def generate_subgraph(
     extractor: Extractor,
     tenant_id: str,
@@ -507,6 +650,7 @@ async def generate_subgraph(
     embed_bdl,
     callback,
     task_id: str = "",
+    fallback_title: str = "",
 ):
     if task_id and has_canceled(task_id):
         callback(msg=f"Task {task_id} cancelled during subgraph generation for doc {doc_id}.")
@@ -522,7 +666,49 @@ async def generate_subgraph(
         language=language,
         entity_types=entity_types,
     )
-    ents, rels = await ext(doc_id, chunks, callback, task_id=task_id)
+    llm_ents, llm_rels = await ext(doc_id, chunks, callback, task_id=task_id)
+
+    # ---------- 注入章节层级与实体关联 ----------
+    # DEBUG: 打印前2个chunk的内容预览，确认标题是否存在
+    for i, ck in enumerate(chunks[:2]):
+        preview = ck[:300].replace("\n", " | ")
+        callback(msg=f"[ChapterGraph DEBUG] chunk {i} preview: {preview}")
+    callback(msg=f"[ChapterGraph DEBUG] total chunks={len(chunks)}, fallback_title={fallback_title}")
+
+    _, chapter_ents, chapter_rels, chunk_chapters = _extract_book_and_chapters(doc_id, chunks, fallback_title)
+    callback(msg=f"[ChapterGraph DEBUG] chapter_ents={len(chapter_ents)}, chapter_rels={len(chapter_rels)}")
+    if chapter_ents:
+        callback(msg=f"[ChapterGraph DEBUG] chapter_entities={[e['entity_name'] for e in chapter_ents]}")
+    if chapter_rels:
+        callback(msg=f"[ChapterGraph DEBUG] chapter_rels_sample={(chapter_rels[0]['src_id'], chapter_rels[0]['tgt_id'])}")
+
+    ents = list(llm_ents)
+    rels = list(llm_rels)
+
+    if chapter_ents:
+        # 合并 LLM 实体与章节实体，同名时保留 Book/Chapter 类型
+        merged_ents = {}
+        for ent in llm_ents:
+            merged_ents[ent["entity_name"]] = dict(ent)
+        for cent in chapter_ents:
+            name = cent["entity_name"]
+            if name in merged_ents:
+                existing = merged_ents[name]
+                existing["source_id"] = sorted(set(existing.get("source_id", []) + cent.get("source_id", [])))
+                if cent.get("entity_type") in ("Book", "Chapter"):
+                    existing["entity_type"] = cent["entity_type"]
+                    existing["description"] = cent["description"]
+            else:
+                merged_ents[name] = dict(cent)
+        ents = list(merged_ents.values())
+        rels.extend(chapter_rels)
+
+        # 建立章节-实体关系（只对 LLM 提取的原始实体做匹配）
+        entity_chapter_rels = _link_entities_to_chapters(doc_id, chunks, llm_ents, chunk_chapters)
+        rels.extend(entity_chapter_rels)
+        callback(msg=f"[ChapterGraph DEBUG] entity_chapter_rels={len(entity_chapter_rels)}")
+    # -------------------------------------------
+
     subgraph = nx.Graph()
 
     for ent in ents:
@@ -535,14 +721,24 @@ async def generate_subgraph(
         subgraph.add_node(ent["entity_name"], **ent)
 
     ignored_rels = 0
+    ignored_rel_samples = []
     for rel in rels:
         if task_id and has_canceled(task_id):
             callback(msg=f"Task {task_id} cancelled during relationship processing for doc {doc_id}.")
             raise TaskCanceledException(f"Task {task_id} was cancelled")
 
         assert "description" in rel, f"relation {rel} does not have description"
-        if not subgraph.has_node(rel["src_id"]) or not subgraph.has_node(rel["tgt_id"]):
+        has_src = subgraph.has_node(rel["src_id"])
+        has_tgt = subgraph.has_node(rel["tgt_id"])
+        if not has_src or not has_tgt:
             ignored_rels += 1
+            if len(ignored_rel_samples) < 5:
+                ignored_rel_samples.append({
+                    "src_id": rel["src_id"],
+                    "tgt_id": rel["tgt_id"],
+                    "has_src": has_src,
+                    "has_tgt": has_tgt,
+                })
             continue
         rel["source_id"] = [doc_id]
         subgraph.add_edge(
@@ -551,7 +747,10 @@ async def generate_subgraph(
             **rel,
         )
     if ignored_rels:
-        callback(msg=f"ignored {ignored_rels} relations due to missing entities.")
+        callback(msg=f"ignored {ignored_rels}/{len(rels)} relations due to missing entities.")
+        if ignored_rel_samples:
+            callback(msg=f"[ChapterGraph DEBUG] ignored relation samples: {ignored_rel_samples}")
+    callback(msg=f"[ChapterGraph DEBUG] subgraph nodes={subgraph.number_of_nodes()}, edges={subgraph.number_of_edges()}")
     tidy_graph(subgraph, callback, check_attribute=False)
 
     subgraph.graph["source_id"] = [doc_id]
@@ -595,6 +794,13 @@ async def merge_subgraph(
     for node_name, pagerank in pr.items():
         new_graph.nodes[node_name]["pagerank"] = pagerank
 
+    # DEBUG: 检查全局图中 Book 节点的邻居
+    for n in new_graph.nodes:
+        if new_graph.nodes[n].get("entity_type") == "Book":
+            neighbors = [nb for nb in new_graph.neighbors(n) if new_graph.nodes[nb].get("entity_type") == "Chapter"]
+            callback(msg=f"[ChapterGraph DEBUG] After merge, Book '{n}' has {len(neighbors)} Chapter neighbors: {neighbors}")
+            break
+
     await set_graph(tenant_id, kb_id, embedding_model, new_graph, change, callback)
     now = asyncio.get_running_loop().time()
     callback(msg=f"merging subgraph for doc {doc_id} into the global graph done in {now - start:.2f} seconds.")
@@ -627,6 +833,13 @@ async def resolve_entities(
     change = reso.change
     callback(msg=f"Graph resolution removed {len(change.removed_nodes)} nodes and {len(change.removed_edges)} edges.")
     callback(msg="Graph resolution updated pagerank.")
+
+    # DEBUG: 检查实体消解后 Book 节点的邻居
+    for n in graph.nodes:
+        if graph.nodes[n].get("entity_type") == "Book":
+            neighbors = [nb for nb in graph.neighbors(n) if graph.nodes[nb].get("entity_type") == "Chapter"]
+            callback(msg=f"[ChapterGraph DEBUG] After resolution, Book '{n}' has {len(neighbors)} Chapter neighbors: {neighbors}")
+            break
 
     if task_id and has_canceled(task_id):
         callback(msg=f"Task {task_id} cancelled after entity resolution.")

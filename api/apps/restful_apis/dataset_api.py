@@ -14,9 +14,10 @@
 #  limitations under the License.
 #
 import logging
+from typing import TYPE_CHECKING
 
 from peewee import OperationalError
-from quart import request
+from quart import request, Response
 from common.constants import RetCode
 from api.apps import login_required, current_user
 from api.utils.api_utils import get_error_argument_result, get_error_data_result, get_json_result, get_result, add_tenant_id_to_kwargs
@@ -31,6 +32,10 @@ from api.utils.validation_utils import (
     validate_and_parse_request_args,
 )
 from api.apps.services import dataset_api_service
+
+if TYPE_CHECKING:
+    from quart import Blueprint
+    manager: Blueprint
 
 
 @manager.route("/datasets/tags/aggregation", methods=["GET"])  # noqa: F821
@@ -554,6 +559,40 @@ async def get_knowledge_graph(tenant_id, dataset_id):
             return get_result(data=result)
         else:
             return get_result(data=False, message=result, code=RetCode.AUTHENTICATION_ERROR)
+    except Exception as e:
+        logging.exception(e)
+        return get_error_data_result(message="Internal server error")
+
+
+@manager.route("/datasets/<dataset_id>/graph/export", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def export_knowledge_graph(tenant_id, dataset_id):
+    """Get the FULL knowledge graph of a dataset for export/analysis.
+
+    GET /api/v1/datasets/<dataset_id>/graph/export
+    Query params: format=json (default) or csv
+    """
+    try:
+        export_format = request.args.get("format", "json").lower()
+        if export_format == "csv":
+            success, result = await dataset_api_service.export_knowledge_graph_csv(dataset_id, tenant_id)
+            if success:
+                return Response(
+                    result,
+                    mimetype="application/zip",
+                    headers={
+                        "Content-Disposition": f"attachment; filename=knowledge-graph-{dataset_id}.zip"
+                    }
+                )
+            else:
+                return get_result(data=False, message=result, code=RetCode.AUTHENTICATION_ERROR)
+        else:
+            success, result = await dataset_api_service.get_knowledge_graph_full(dataset_id, tenant_id)
+            if success:
+                return get_result(data=result)
+            else:
+                return get_result(data=False, message=result, code=RetCode.AUTHENTICATION_ERROR)
     except Exception as e:
         logging.exception(e)
         return get_error_data_result(message="Internal server error")

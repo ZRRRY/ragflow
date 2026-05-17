@@ -287,12 +287,20 @@ def split_with_pattern(d, pattern: str, content: str, eng) -> list:
         return [dd]
 
     txts = [txt for txt in compiled_pattern.split(content)]
-    for j in range(0, len(txts), 2):
+
+    # 第一个 delimiter 之前的文本（如果存在）作为独立 chunk
+    if txts[0].strip():
+        dd = copy.deepcopy(d)
+        tokenize(dd, txts[0], eng)
+        docs.append(dd)
+
+    # 每个 delimiter 与它后面的文本组成 chunk，delimiter 保留在 chunk 开头
+    for j in range(1, len(txts), 2):
         txt = txts[j]
-        if not txt:
-            continue
         if j + 1 < len(txts):
             txt += txts[j + 1]
+        if not txt.strip():
+            continue
         dd = copy.deepcopy(d)
         tokenize(dd, txt, eng)
         docs.append(dd)
