@@ -144,28 +144,34 @@ class MarkdownElementExtractor:
             text = "\n".join(self.lines)
             if include_meta:
                 pattern = re.compile(dels)
-                last_end = 0
-                for m in pattern.finditer(text):
-                    part = text[last_end : m.start()]
-                    if part and part.strip():
-                        sections.append(
-                            {
-                                "content": part.strip(),
-                                "start_line": text.count("\n", 0, last_end),
-                                "end_line": text.count("\n", 0, m.start()),
-                            }
-                        )
-                    last_end = m.end()
+                txts = [txt for txt in pattern.split(text)]
+                delimiters = [text[m.start():m.end()] for m in pattern.finditer(text)]
 
-                part = text[last_end:]
-                if part and part.strip():
+                # 第一个 delimiter 之前的文本
+                if txts[0].strip():
                     sections.append(
                         {
-                            "content": part.strip(),
-                            "start_line": text.count("\n", 0, last_end),
-                            "end_line": text.count("\n", 0, len(text)),
+                            "content": txts[0].strip(),
+                            "start_line": 0,
+                            "end_line": text.count("\n", 0, len(txts[0])),
                         }
                     )
+
+                # 每个 delimiter 与它后面的文本组成 section，delimiter 保留在开头
+                pos = len(txts[0])
+                for i, delim in enumerate(delimiters):
+                    if i + 1 < len(txts):
+                        combined = (delim + txts[i + 1]).strip()
+                        if combined:
+                            next_pos = pos + len(delim) + len(txts[i + 1])
+                            sections.append(
+                                {
+                                    "content": combined,
+                                    "start_line": text.count("\n", 0, pos),
+                                    "end_line": text.count("\n", 0, next_pos),
+                                }
+                            )
+                        pos = next_pos
             else:
                 parts = re.split(dels, text)
                 sections = [p.strip() for p in parts if p and p.strip()]

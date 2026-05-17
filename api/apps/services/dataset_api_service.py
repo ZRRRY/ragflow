@@ -13,10 +13,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-import logging
+import csv
+import io
 import json
+import logging
 import os
 import re
+import zipfile
 from common.constants import PAGERANK_FLD
 from common import settings
 from api.db.db_models import File
@@ -393,16 +396,14 @@ def list_datasets(tenant_id: str, args: dict):
     return True, {"data": response_data_list, "total": total}
 
 
-async def get_knowledge_graph(dataset_id: str, tenant_id: str):
+async def _fetch_raw_knowledge_graph(dataset_id: str, tenant_id: str):
     """
-    Get knowledge graph for a dataset.
+    Fetch the raw (un-truncated) knowledge graph data from doc store.
 
     :param dataset_id: dataset ID
     :param tenant_id: tenant ID
-    :return: (success, result) or (success, error_message)
+    :return: dict with {"graph": {...}, "mind_map": {...}}
     """
-    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
-        return False, "No authorization."
     _, kb = KnowledgebaseService.get_by_id(dataset_id)
 
     req = {"kb_id": [dataset_id], "knowledge_graph_kwd": ["graph"]}
@@ -411,10 +412,10 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
     from rag.nlp import search
 
     if not settings.docStoreConn.index_exist(search.index_name(kb.tenant_id), dataset_id):
-        return True, obj
+        return obj
     sres = await settings.retriever.search(req, search.index_name(kb.tenant_id), [dataset_id])
     if not len(sres.ids):
-        return True, obj
+        return obj
 
     for id in sres.ids[:1]:
         ty = sres.field[id]["knowledge_graph_kwd"]
@@ -425,13 +426,107 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
 
         obj[ty] = content_json
 
+    return obj
+
+
+async def get_knowledge_graph(dataset_id: str, tenant_id: str):
+    """
+    Get knowledge graph for a dataset (truncated to 512 nodes/edges for visualization).
+
+    :param dataset_id: dataset ID
+    :param tenant_id: tenant ID
+    :return: (success, result) or (success, error_message)
+    """
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return False, "No authorization."
+
+    obj = await _fetch_raw_knowledge_graph(dataset_id, tenant_id)
+
     if "nodes" in obj["graph"]:
-        obj["graph"]["nodes"] = sorted(obj["graph"]["nodes"], key=lambda x: x.get("pagerank", 0), reverse=True)[:256]
+        all_nodes = obj["graph"]["nodes"]
+        # 保护 Book 和 Chapter 节点不被 pagerank 截断，确保层级结构可见
+        protected_types = {"Book", "Chapter"}
+        protected_nodes = [n for n in all_nodes if n.get("entity_type") in protected_types]
+        other_nodes = [n for n in all_nodes if n.get("entity_type") not in protected_types]
+        sorted_other_nodes = sorted(other_nodes, key=lambda x: x.get("pagerank", 0), reverse=True)[:max(0, 256 - len(protected_nodes))]
+        obj["graph"]["nodes"] = protected_nodes + sorted_other_nodes
+
         if "edges" in obj["graph"]:
             node_id_set = {o["id"] for o in obj["graph"]["nodes"]}
             filtered_edges = [o for o in obj["graph"]["edges"] if o["source"] != o["target"] and o["source"] in node_id_set and o["target"] in node_id_set]
-            obj["graph"]["edges"] = sorted(filtered_edges, key=lambda x: x.get("weight", 0), reverse=True)[:128]
+            obj["graph"]["edges"] = sorted(filtered_edges, key=lambda x: x.get("weight", 0), reverse=True)[:256]
     return True, obj
+
+
+async def get_knowledge_graph_full(dataset_id: str, tenant_id: str):
+    """
+    Get the FULL knowledge graph for a dataset without truncation.
+    Used for export/analysis purposes.
+
+    :param dataset_id: dataset ID
+    :param tenant_id: tenant ID
+    :return: (success, result) or (success, error_message)
+    """
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return False, "No authorization."
+
+    obj = await _fetch_raw_knowledge_graph(dataset_id, tenant_id)
+
+    if "edges" in obj.get("graph", {}):
+        obj["graph"]["edges"] = [
+            e for e in obj["graph"]["edges"]
+            if e["source"] != e["target"]
+        ]
+    return True, obj
+
+
+async def export_knowledge_graph_csv(dataset_id: str, tenant_id: str):
+    """
+    Export the full knowledge graph as a ZIP containing nodes.csv and edges.csv.
+
+    :param dataset_id: dataset ID
+    :param tenant_id: tenant ID
+    :return: (success, zip_bytes) or (success, error_message)
+    """
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return False, "No authorization."
+
+    obj = await _fetch_raw_knowledge_graph(dataset_id, tenant_id)
+
+    # Filter self-loops
+    if "edges" in obj.get("graph", {}):
+        obj["graph"]["edges"] = [
+            e for e in obj["graph"]["edges"]
+            if e["source"] != e["target"]
+        ]
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        nodes = obj.get("graph", {}).get("nodes", [])
+        if nodes:
+            node_keys = set()
+            for node in nodes:
+                node_keys.update(node.keys())
+            node_keys = sorted(node_keys)
+            node_csv = io.StringIO()
+            writer = csv.DictWriter(node_csv, fieldnames=node_keys)
+            writer.writeheader()
+            writer.writerows(nodes)
+            zf.writestr("nodes.csv", node_csv.getvalue())
+
+        edges = obj.get("graph", {}).get("edges", [])
+        if edges:
+            edge_keys = set()
+            for edge in edges:
+                edge_keys.update(edge.keys())
+            edge_keys = sorted(edge_keys)
+            edge_csv = io.StringIO()
+            writer = csv.DictWriter(edge_csv, fieldnames=edge_keys)
+            writer.writeheader()
+            writer.writerows(edges)
+
+    buffer.seek(0)
+    return True, buffer.read()
 
 
 def delete_knowledge_graph(dataset_id: str, tenant_id: str):
