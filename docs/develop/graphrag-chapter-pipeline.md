@@ -177,7 +177,7 @@ Book(title)
 │     问题：Book/Chapter pagerank 低、weight=1，被截断过滤   │
 │                                                          │
 │     修改后：                                               │
-│       优先保留 entity_type="Book"/"Chapter" 的节点         │
+│       优先保留 entity_type="书籍"/"章节" 的节点         │
 │       其余节点按 pagerank 填充至 512 上限                 │
 │       边上限放宽到 512                                    │
 ├─────────────────────────────────────────────────────────┤

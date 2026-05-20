@@ -53,7 +53,7 @@
   chapter_node_name = f"《{book_title}》{chapter}"
   chapter_entities.append({
       "entity_name": chapter_node_name,
-      "entity_type": "Chapter",
+      "entity_type": "章节",
       "description": f"《{book_title}》的章节：{chapter}",
       ...
   })
@@ -119,7 +119,7 @@
           if name in merged_ents:
               existing = merged_ents[name]
               existing["source_id"] = sorted(set(existing.get("source_id", []) + cent.get("source_id", [])))
-              if cent.get("entity_type") in ("Book", "Chapter"):
+              if cent.get("entity_type") in ("书籍", "章节"):
                   existing["entity_type"] = cent["entity_type"]
                   existing["description"] = cent["description"]
           else:

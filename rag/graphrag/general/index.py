@@ -544,7 +544,7 @@ def _extract_book_and_chapters(doc_id: str, chunks: list[str], fallback_title: s
 
     chapter_entities.append({
         "entity_name": book_title,
-        "entity_type": "Book",
+        "entity_type": "书籍",
         "description": f"书籍《{book_title}》",
         "source_id": [doc_id],
     })
@@ -561,7 +561,7 @@ def _extract_book_and_chapters(doc_id: str, chunks: list[str], fallback_title: s
                 seen_chapters.add(chapter_node_name)
                 chapter_entities.append({
                     "entity_name": chapter_node_name,
-                    "entity_type": "Chapter",
+                    "entity_type": "章节",
                     "description": f"《{book_title}》的章节：{chapter}",
                     "source_id": [doc_id],
                 })
@@ -594,7 +594,7 @@ def _extract_book_and_chapters(doc_id: str, chunks: list[str], fallback_title: s
                     seen_chapters.add(chapter_node_name)
                     chapter_entities.append({
                         "entity_name": chapter_node_name,
-                        "entity_type": "Chapter",
+                        "entity_type": "章节",
                         "description": f"《{book_title}》的章节：{first_line}",
                         "source_id": [doc_id],
                     })
@@ -628,7 +628,7 @@ def _link_entities_to_chapters(doc_id: str, chunks: list[str], entities: list[di
 
     for ent in entities:
         # 跳过书籍和章节自身
-        if ent.get("entity_type") in ("Book", "Chapter"):
+        if ent.get("entity_type") in ("书籍", "章节"):
             continue
         ent_name = ent["entity_name"]
         ent_name_lower = ent_name.lower()
@@ -712,7 +712,7 @@ async def generate_subgraph(
             if name in merged_ents:
                 existing = merged_ents[name]
                 existing["source_id"] = sorted(set(existing.get("source_id", []) + cent.get("source_id", [])))
-                if cent.get("entity_type") in ("Book", "Chapter"):
+                if cent.get("entity_type") in ("书籍", "章节"):
                     existing["entity_type"] = cent["entity_type"]
                     existing["description"] = cent["description"]
             else:
@@ -813,8 +813,8 @@ async def merge_subgraph(
 
     # DEBUG: 检查全局图中 Book 节点的邻居
     for n in new_graph.nodes:
-        if new_graph.nodes[n].get("entity_type") == "Book":
-            neighbors = [nb for nb in new_graph.neighbors(n) if new_graph.nodes[nb].get("entity_type") == "Chapter"]
+        if new_graph.nodes[n].get("entity_type") == "书籍":
+            neighbors = [nb for nb in new_graph.neighbors(n) if new_graph.nodes[nb].get("entity_type") == "章节"]
             callback(msg=f"[ChapterGraph DEBUG] After merge, Book '{n}' has {len(neighbors)} Chapter neighbors: {neighbors}")
             break
 
@@ -853,8 +853,8 @@ async def resolve_entities(
 
     # DEBUG: 检查实体消解后 Book 节点的邻居
     for n in graph.nodes:
-        if graph.nodes[n].get("entity_type") == "Book":
-            neighbors = [nb for nb in graph.neighbors(n) if graph.nodes[nb].get("entity_type") == "Chapter"]
+        if graph.nodes[n].get("entity_type") == "书籍":
+            neighbors = [nb for nb in graph.neighbors(n) if graph.nodes[nb].get("entity_type") == "章节"]
             callback(msg=f"[ChapterGraph DEBUG] After resolution, Book '{n}' has {len(neighbors)} Chapter neighbors: {neighbors}")
             break
 
