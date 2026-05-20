@@ -445,7 +445,7 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
     if "nodes" in obj["graph"]:
         all_nodes = obj["graph"]["nodes"]
         # 保护 Book 和 Chapter 节点不被 pagerank 截断，确保层级结构可见
-        protected_types = {"Book", "Chapter"}
+        protected_types = {"书籍", "章节"}
         protected_nodes = [n for n in all_nodes if n.get("entity_type") in protected_types]
         other_nodes = [n for n in all_nodes if n.get("entity_type") not in protected_types]
         sorted_other_nodes = sorted(other_nodes, key=lambda x: x.get("pagerank", 0), reverse=True)[:max(0, 256 - len(protected_nodes))]
