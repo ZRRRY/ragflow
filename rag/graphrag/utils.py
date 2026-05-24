@@ -32,6 +32,7 @@ from rag.nlp import rag_tokenizer, search
 from rag.utils.redis_conn import REDIS_CONN
 from common import settings
 from common.doc_store.doc_store_base import OrderByExpr
+from rag.graphrag.config import GraphRAGConfig
 
 GRAPH_FIELD_SEP = "<SEP>"
 
@@ -66,6 +67,9 @@ async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, labe
     total = len(chunks)
     progress = {"done": 0, "next_report": 100}
     progress_lock = asyncio.Lock()
+    # P5: adaptive limiter event injection
+    from rag.graphrag.limiter import current_limiter
+    from rag.graphrag.config import GraphRAGConfig
 
     async def _one(offset: int) -> None:
         batch = chunks[offset : offset + _INSERT_BULK_SIZE]
@@ -74,6 +78,7 @@ async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, labe
         async with sem:
             for attempt in range(max_retries):
                 try:
+                    t0 = asyncio.get_running_loop().time()
                     result = await asyncio.wait_for(
                         thread_pool_exec(
                             settings.docStoreConn.insert,
@@ -83,8 +88,12 @@ async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, labe
                         ),
                         timeout=timeout_s,
                     )
+                    elapsed_ms = (asyncio.get_running_loop().time() - t0) * 1000
                     if result:
                         raise Exception(f"Insert chunk error: {result}, please check log file and Elasticsearch/Infinity status!")
+                    # Record slow doc-store ops for adaptive limiter
+                    if current_limiter and elapsed_ms > GraphRAGConfig.ES_SLOW_THRESHOLD_MS:
+                        current_limiter.record_event_sync("es_slow")
                     break
                 except asyncio.TimeoutError:
                     if attempt < max_retries - 1:
@@ -99,6 +108,11 @@ async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, labe
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
                         logging.warning(f"Insert batch at offset {offset}/{total} attempt {attempt + 1} failed: {e}, retrying in {wait}s")
+                        # P5: record potential CAS / version conflicts for adaptive limiter
+                        if current_limiter:
+                            err_str = str(e).lower()
+                            if any(k in err_str for k in ("conflict", "version", "concurrent modification")):
+                                current_limiter.record_event_sync("cas_conflict")
                         await asyncio.sleep(wait)
                     else:
                         raise
@@ -423,6 +437,149 @@ async def get_relation(tenant_id, kb_id, from_ent_name, to_ent_name, size=1):
     return res
 
 
+async def query_existing_entities(tenant_id, kb_id, node_names):
+    """Batch-query existing entity documents from the doc store by name.
+
+    Returns a dict mapping ``entity_name -> doc fields``.
+    """
+    if not node_names:
+        return {}
+
+    BATCH_SIZE = 100
+    existing = {}
+
+    for i in range(0, len(node_names), BATCH_SIZE):
+        batch = node_names[i:i + BATCH_SIZE]
+        conds = {
+            "fields": ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"],
+            "size": len(batch),
+            "knowledge_graph_kwd": ["entity"],
+            "entity_kwd": batch,
+        }
+        try:
+            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+            for id in es_res.ids:
+                fields = es_res.field[id]
+                ent_name = fields.get("entity_kwd")
+                if isinstance(ent_name, list):
+                    ent_name = ent_name[0]
+                if ent_name:
+                    existing[ent_name] = fields
+        except Exception as e:
+            logging.warning("query_existing_entities batch %d failed: %s", i, e)
+
+    return existing
+
+
+async def query_existing_relations(tenant_id, kb_id, edge_pairs):
+    """Batch-query existing relation documents from the doc store.
+
+    ``edge_pairs`` is a list of ``(from_node, to_node)`` tuples.
+    Returns a dict mapping ``(from, to) -> doc fields``.
+    """
+    if not edge_pairs:
+        return {}
+
+    BATCH_SIZE = 50
+    existing = {}
+
+    for i in range(0, len(edge_pairs), BATCH_SIZE):
+        batch = edge_pairs[i:i + BATCH_SIZE]
+        all_nodes = list(set(u for u, v in batch) | set(v for u, v in batch))
+
+        conds = {
+            "fields": ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+            "size": min(len(batch) * 10, 10000),
+            "knowledge_graph_kwd": ["relation"],
+            "from_entity_kwd": all_nodes,
+            "to_entity_kwd": all_nodes,
+        }
+
+        try:
+            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+            for id in es_res.ids:
+                fields = es_res.field[id]
+                from_node = fields.get("from_entity_kwd")
+                to_node = fields.get("to_entity_kwd")
+                if isinstance(from_node, list):
+                    from_node = from_node[0]
+                if isinstance(to_node, list):
+                    to_node = to_node[0]
+                if from_node and to_node:
+                    key = get_from_to(from_node, to_node)
+                    existing[key] = fields
+        except Exception as e:
+            logging.warning("query_existing_relations batch %d failed: %s", i, e)
+
+    return existing
+
+
+async def query_node_relations(tenant_id, kb_id, node_names):
+    """Query all relation documents where at least one endpoint is in ``node_names``.
+
+    Returns a list of doc field dicts (deduplicated).
+    """
+    if not node_names:
+        return []
+
+    BATCH_SIZE = 100
+    all_fields = []
+    seen = set()
+
+    for i in range(0, len(node_names), BATCH_SIZE):
+        batch = node_names[i:i + BATCH_SIZE]
+
+        # Query by from_entity_kwd
+        conds = {
+            "fields": ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+            "size": 10000,
+            "knowledge_graph_kwd": ["relation"],
+            "from_entity_kwd": batch,
+        }
+        try:
+            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+            for id in es_res.ids:
+                fields = es_res.field[id]
+                from_node = fields.get("from_entity_kwd")
+                to_node = fields.get("to_entity_kwd")
+                if isinstance(from_node, list):
+                    from_node = from_node[0]
+                if isinstance(to_node, list):
+                    to_node = to_node[0]
+                key = get_from_to(from_node, to_node)
+                if key not in seen:
+                    seen.add(key)
+                    all_fields.append(fields)
+        except Exception as e:
+            logging.warning("query_node_relations from-batch %d failed: %s", i, e)
+
+        # Query by to_entity_kwd
+        conds = {
+            "fields": ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+            "size": 10000,
+            "knowledge_graph_kwd": ["relation"],
+            "to_entity_kwd": batch,
+        }
+        try:
+            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+            for id in es_res.ids:
+                fields = es_res.field[id]
+                from_node = fields.get("from_entity_kwd")
+                to_node = fields.get("to_entity_kwd")
+                if isinstance(from_node, list):
+                    from_node = from_node[0]
+                if isinstance(to_node, list):
+                    to_node = to_node[0]
+                key = get_from_to(from_node, to_node)
+                if key not in seen:
+                    seen.add(key)
+                    all_fields.append(fields)
+        except Exception as e:
+            logging.warning("query_node_relations to-batch %d failed: %s", i, e)
+
+    return all_fields
+
+
 async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta, chunks):
     enable_timeout_assertion = os.environ.get("ENABLE_TIMEOUT_ASSERTION")
     chunk = {
@@ -459,7 +616,7 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
 
 
 async def does_graph_contains(tenant_id, kb_id, doc_id):
-    # Get doc_ids of graph
+    # Legacy path: check monolithic graph chunk
     fields = ["source_id"]
     condition = {
         "knowledge_graph_kwd": ["graph"],
@@ -471,10 +628,23 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
         0, 1, search.index_name(tenant_id), [kb_id]
     )
     fields2 = settings.docStoreConn.get_fields(res, fields)
-    graph_doc_ids = set()
     for chunk_id in fields2.keys():
         graph_doc_ids = set(fields2[chunk_id]["source_id"])
-    return doc_id in graph_doc_ids
+        if doc_id in graph_doc_ids:
+            return True
+
+    # Incremental path: check per-document subgraph chunks
+    condition = {
+        "knowledge_graph_kwd": ["subgraph"],
+        "source_id": doc_id,
+    }
+    res = await thread_pool_exec(
+        settings.docStoreConn.search,
+        fields, [], condition, [], OrderByExpr(),
+        0, 1, search.index_name(tenant_id), [kb_id]
+    )
+    fields2 = settings.docStoreConn.get_fields(res, fields)
+    return len(fields2) > 0
 
 
 async def get_graph_doc_ids(tenant_id, kb_id) -> list[str]:
@@ -488,7 +658,93 @@ async def get_graph_doc_ids(tenant_id, kb_id) -> list[str]:
     return doc_ids
 
 
-async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
+async def get_graph_from_index(tenant_id, kb_id):
+    """Assemble the global graph from discrete ``entity`` and ``relation``
+    chunks stored in the doc store (incremental / decoupled storage mode).
+
+    This replaces the monolithic ``knowledge_graph_kwd="graph"`` JSON blob
+    with on-the-fly assembly from indexed node/edge documents.
+    """
+    graph = nx.Graph()
+    graph.graph["source_id"] = []
+    seen_sources = set()
+
+    # ------------------------------------------------------------------
+    # 1. Pull all entity chunks (paginated, same bounds as rebuild_graph)
+    # ------------------------------------------------------------------
+    ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
+    bs = 256
+    total_entities = 0
+
+    for i in range(0, 1024 * bs, bs):
+        es_res = await thread_pool_exec(
+            settings.docStoreConn.search,
+            ent_flds, [],
+            {"kb_id": kb_id, "knowledge_graph_kwd": ["entity"], "removed_kwd": "N"},
+            [], OrderByExpr(), i, bs,
+            search.index_name(tenant_id), [kb_id],
+        )
+        es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
+        if len(es_res) == 0:
+            break
+
+        for _cid, d in es_res.items():
+            try:
+                meta = json.loads(d["content_with_weight"])
+                ent_name = d["entity_kwd"]
+                graph.add_node(ent_name, **meta)
+                total_entities += 1
+                for sid in meta.get("source_id", []):
+                    seen_sources.add(sid)
+            except Exception:
+                logging.exception("Failed to parse entity chunk %s", _cid)
+                continue
+
+    if total_entities == 0:
+        return None
+
+    # ------------------------------------------------------------------
+    # 2. Pull all relation chunks
+    # ------------------------------------------------------------------
+    rel_flds = ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"]
+    total_relations = 0
+
+    for i in range(0, 1024 * bs, bs):
+        es_res = await thread_pool_exec(
+            settings.docStoreConn.search,
+            rel_flds, [],
+            {"kb_id": kb_id, "knowledge_graph_kwd": ["relation"]},
+            [], OrderByExpr(), i, bs,
+            search.index_name(tenant_id), [kb_id],
+        )
+        es_res = settings.docStoreConn.get_fields(es_res, rel_flds)
+        if len(es_res) == 0:
+            break
+
+        for _cid, d in es_res.items():
+            try:
+                meta = json.loads(d["content_with_weight"])
+                from_node = d["from_entity_kwd"]
+                to_node = d["to_entity_kwd"]
+                if from_node in graph.nodes and to_node in graph.nodes:
+                    graph.add_edge(from_node, to_node, **meta)
+                    total_relations += 1
+                for sid in meta.get("source_id", []):
+                    seen_sources.add(sid)
+            except Exception:
+                logging.exception("Failed to parse relation chunk %s", _cid)
+                continue
+
+    graph.graph["source_id"] = sorted(seen_sources)
+    logging.info(
+        "get_graph_from_index: kb=%s entities=%d relations=%d sources=%d",
+        kb_id, total_entities, total_relations, len(seen_sources),
+    )
+    return graph
+
+
+async def get_graph_from_json(tenant_id, kb_id, exclude_rebuild=None):
+    """Legacy path: load the monolithic graph JSON blob."""
     conds = {"fields": ["content_with_weight", "removed_kwd", "source_id"], "size": 1, "knowledge_graph_kwd": ["graph"]}
     res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
     if not res.total == 0:
@@ -503,11 +759,36 @@ async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
                 return g
             except Exception:
                 continue
-    result = None
-    return result
+    return None
 
 
-async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
+async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
+    """Dual-path graph loader.
+
+    When ``USE_INCREMENTAL_GRAPH`` is enabled we first try to assemble the
+    graph from indexed ``entity`` / ``relation`` documents.  If that yields an
+    empty graph or raises, we automatically fall back to the legacy monolithic
+    JSON blob so the pipeline never breaks.
+    """
+    if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
+        try:
+            graph = await get_graph_from_index(tenant_id, kb_id)
+            if graph is not None and len(graph.nodes) > 0:
+                return graph
+            logging.warning(
+                "get_graph_from_index returned empty for kb=%s; falling back to JSON",
+                kb_id,
+            )
+        except Exception as exc:
+            logging.error(
+                "get_graph_from_index failed for kb=%s: %s; falling back to JSON",
+                kb_id, exc,
+            )
+
+    return await get_graph_from_json(tenant_id, kb_id, exclude_rebuild)
+
+
+async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
     global chat_limiter
     start = asyncio.get_running_loop().time()
 
@@ -652,6 +933,162 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
     now = asyncio.get_running_loop().time()
     if callback:
         callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
+
+
+async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
+    """Incremental write path for Phase 1 (storage decoupling).
+
+    Key differences from the monolithic path:
+
+    1. **No subgraph rewrite** – per-document subgraph checkpoints are already
+       managed by ``generate_subgraph``; rewriting them here is redundant and
+       expensive for large KBs.
+    2. **Graph JSON is still written** (shadow storage) so the legacy
+       ``get_graph_from_json`` path remains usable for instant rollback.
+       Only the *old* graph chunk is deleted, never subgraphs.
+    3. **Entity / relation chunks are still produced for the delta** so the
+       ``get_graph_from_index`` path can assemble a consistent graph.
+    """
+    global chat_limiter
+    start = asyncio.get_running_loop().time()
+
+    # ------------------------------------------------------------------
+    # 1. Shadow-storage graph JSON (deterministic id for stable overwrite)
+    # ------------------------------------------------------------------
+    graph_chunk_id = chunk_id({"content_with_weight": f"graph::{kb_id}", "kb_id": kb_id})
+    chunks = [
+        {
+            "id": graph_chunk_id,
+            "content_with_weight": json.dumps(nx.node_link_data(graph, edges="edges"), ensure_ascii=False),
+            "knowledge_graph_kwd": "graph",
+            "kb_id": kb_id,
+            "source_id": graph.graph.get("source_id", []),
+            "available_int": 0,
+            "removed_kwd": "N",
+        }
+    ]
+
+    # ------------------------------------------------------------------
+    # 2. Embeddings for the delta only
+    # ------------------------------------------------------------------
+    tasks = []
+    for ii, node in enumerate(change.added_updated_nodes):
+        node_attrs = graph.nodes[node]
+        tasks.append(asyncio.create_task(
+            graph_node_to_chunk(kb_id, embd_mdl, node, node_attrs, chunks)
+        ))
+        if ii % 100 == 9 and callback:
+            callback(msg=f"Get embedding of nodes: {ii}/{len(change.added_updated_nodes)}")
+    try:
+        await asyncio.gather(*tasks, return_exceptions=False)
+    except Exception as e:
+        logging.error(f"Error in get_embedding_of_nodes: {e}")
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    tasks = []
+    for ii, (from_node, to_node) in enumerate(change.added_updated_edges):
+        edge_attrs = graph.get_edge_data(from_node, to_node)
+        if not edge_attrs:
+            continue
+        tasks.append(asyncio.create_task(
+            graph_edge_to_chunk(kb_id, embd_mdl, from_node, to_node, edge_attrs, chunks)
+        ))
+        if ii % 100 == 9 and callback:
+            callback(msg=f"Get embedding of edges: {ii}/{len(change.added_updated_edges)}")
+    try:
+        await asyncio.gather(*tasks, return_exceptions=False)
+    except Exception as e:
+        logging.error(f"Error in get_embedding_of edges: {e}")
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    now = asyncio.get_running_loop().time()
+    if callback:
+        callback(msg=f"set_graph_delta converted graph change to {len(chunks)} chunks in {now - start:.2f}s.")
+    start = now
+
+    # ------------------------------------------------------------------
+    # 3. Delete old shadow graph chunk (NOT subgraphs) + removed entities/edges
+    # ------------------------------------------------------------------
+    await thread_pool_exec(
+        settings.docStoreConn.delete,
+        {"knowledge_graph_kwd": ["graph"]},
+        search.index_name(tenant_id),
+        kb_id
+    )
+
+    if change.removed_nodes:
+        BATCH_SIZE = 100
+        sorted_nodes = sorted(change.removed_nodes)
+        for i in range(0, len(sorted_nodes), BATCH_SIZE):
+            batch = sorted_nodes[i:i + BATCH_SIZE]
+            await thread_pool_exec(
+                settings.docStoreConn.delete,
+                {"knowledge_graph_kwd": ["entity"], "entity_kwd": batch},
+                search.index_name(tenant_id),
+                kb_id
+            )
+
+    if change.removed_edges:
+        async def del_edges(from_node, to_node):
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    async with chat_limiter:
+                        await thread_pool_exec(
+                            settings.docStoreConn.delete,
+                            {"knowledge_graph_kwd": ["relation"], "from_entity_kwd": from_node, "to_entity_kwd": to_node},
+                            search.index_name(tenant_id),
+                            kb_id
+                        )
+                    return
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        logging.warning(f"del_edges({from_node}, {to_node}) attempt {attempt + 1} failed: {e}, retrying in {wait}s")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+
+        tasks = []
+        for from_node, to_node in change.removed_edges:
+            tasks.append(asyncio.create_task(del_edges(from_node, to_node)))
+        try:
+            await asyncio.gather(*tasks, return_exceptions=False)
+        except Exception as e:
+            logging.error(f"Error while deleting edges: {e}")
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    del_now = asyncio.get_running_loop().time()
+    if callback:
+        callback(msg=f"set_graph_delta removed {len(change.removed_nodes)} nodes and {len(change.removed_edges)} edges from index in {del_now - start:.2f}s.")
+    start = del_now
+
+    await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert chunks")
+    now = asyncio.get_running_loop().time()
+    if callback:
+        callback(msg=f"set_graph_delta added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
+
+
+async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
+    """Router: dispatches to the monolithic or incremental path based on
+    ``GraphRAGConfig.USE_INCREMENTAL_GRAPH``.
+
+    Callers (``merge_subgraph``, ``resolve_entities``, ``extract_community``)
+    do not need to change; the switch is transparent.
+    """
+    if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
+        await set_graph_delta(tenant_id, kb_id, embd_mdl, graph, change, callback)
+    else:
+        await _set_graph_monolithic(tenant_id, kb_id, embd_mdl, graph, change, callback)
 
 
 def is_continuous_subsequence(subseq, seq):

@@ -45,7 +45,6 @@ services:
       - ./entrypoint.sh:/ragflow/entrypoint.sh
       - ../rag:/ragflow/rag
       - ../api:/ragflow/api
-      - ../deepdoc:/ragflow/deepdoc
     env_file: .env
     networks:
       - ragflow
