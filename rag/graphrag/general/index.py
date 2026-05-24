@@ -38,19 +38,25 @@ from rag.graphrag.phase_markers import (
     has_phase_marker,
     set_phase_marker,
 )
+from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.utils import (
+    GRAPH_FIELD_SEP,
     GraphChange,
     chunk_id,
     does_graph_contains,
+    get_from_to,
     get_graph,
     graph_merge,
     insert_chunks_bounded,
+    query_existing_entities,
+    query_existing_relations,
+    query_node_relations,
     set_graph,
     tidy_graph,
 )
 from common.misc_utils import thread_pool_exec
 from rag.nlp import rag_tokenizer, search
-from rag.utils.redis_conn import RedisDistributedLock
+from rag.utils.redis_conn import RedisDistributedLock, REDIS_CONN
 from common import settings
 from common.doc_store.doc_store_base import OrderByExpr
 
@@ -368,6 +374,12 @@ async def run_graphrag_for_kb(
             except Exception as e:
                 failed_docs.append((doc_id, repr(e)))
                 callback(msg=f"[GraphRAG] build_subgraph doc:{doc_id} FAILED: {e!r}")
+                # P5: record LLM rate-limit signals for adaptive limiter
+                from rag.graphrag.limiter import current_limiter
+                if current_limiter:
+                    err_str = str(e).lower()
+                    if any(k in err_str for k in ("rate limit", "429", "tpm limit", "too many requests", "requests per minute")):
+                        current_limiter.record_event_sync("llm_rate_limit")
 
     if has_canceled(row["id"]):
         callback(msg=f"Task {row['id']} cancelled before processing documents.")
@@ -450,6 +462,32 @@ async def run_graphrag_for_kb(
         now = asyncio.get_running_loop().time()
         callback(msg=f"[GraphRAG] kb:{kb_id} all requested phases already complete; nothing to do.")
         return {"ok_docs": ok_docs, "failed_docs": failed_docs, "total_docs": len(doc_ids), "total_chunks": total_chunks, "seconds": now - start}
+
+    # P5-T3: optionally offload resolution/community to a Redis Stream queue
+    if GraphRAGConfig.USE_ASYNC_KG_PHASES:
+        queue_payload = {
+            "tenant_id": tenant_id,
+            "kb_id": kb_id,
+            "task_id": row["id"],
+            "with_resolution": with_resolution and resolution_pending,
+            "with_community": with_community and community_pending,
+            "kb_task_llm_id": row.get("llm_id"),
+            "task_language": language,
+        }
+        ok = REDIS_CONN.queue_product(GraphRAGConfig.KG_POSTPROCESS_QUEUE, queue_payload)
+        if ok:
+            callback(msg=f"[GraphRAG] kb:{kb_id} queued resolution/community to {GraphRAGConfig.KG_POSTPROCESS_QUEUE}")
+            now = asyncio.get_running_loop().time()
+            return {
+                "ok_docs": ok_docs,
+                "failed_docs": failed_docs,
+                "total_docs": len(doc_ids),
+                "total_chunks": total_chunks,
+                "seconds": now - start,
+                "postprocess_queued": True,
+            }
+        else:
+            callback(msg=f"[GraphRAG] kb:{kb_id} FAILED to queue postprocess; falling back to synchronous execution.")
 
     if has_canceled(row["id"]):
         callback(msg=f"Task {row['id']} cancelled before resolution/community extraction.")
@@ -787,6 +825,129 @@ async def generate_subgraph(
     return subgraph
 
 
+async def merge_subgraph_incremental(
+    tenant_id: str,
+    kb_id: str,
+    doc_id: str,
+    subgraph: nx.Graph,
+    embedding_model,
+    callback,
+):
+    """Incremental merge: does not load the global graph into memory.
+
+    Only queries existing nodes / edges that appear in the new subgraph,
+    merges attributes in memory, skips global PageRank, and writes delta.
+    """
+    start = asyncio.get_running_loop().time()
+    change = GraphChange()
+
+    node_names = list(subgraph.nodes())
+
+    # 1. Query existing entities in the doc store
+    callback(msg=f"[P2] Querying {len(node_names)} entities for existing data...")
+    existing_entities = await query_existing_entities(tenant_id, kb_id, node_names)
+    callback(msg=f"[P2] Found {len(existing_entities)} existing entities.")
+
+    # 2. Build delta graph with merged nodes
+    delta_graph = nx.Graph()
+    delta_graph.graph["source_id"] = list(subgraph.graph.get("source_id", []))
+
+    for node_name, attr in subgraph.nodes(data=True):
+        if node_name in existing_entities:
+            old_fields = existing_entities[node_name]
+            try:
+                old_meta = json.loads(old_fields["content_with_weight"])
+            except Exception:
+                old_meta = {}
+
+            merged_attr = dict(old_meta)
+            # Merge description
+            new_desc = attr.get("description", "")
+            if new_desc:
+                old_desc = merged_attr.get("description", "")
+                merged_attr["description"] = old_desc + GRAPH_FIELD_SEP + new_desc if old_desc else new_desc
+            # Merge source_id (deduplicate)
+            old_sources = set(merged_attr.get("source_id", []))
+            new_sources = set(attr.get("source_id", []))
+            merged_attr["source_id"] = sorted(old_sources | new_sources)
+            # Entity type: prefer existing, fallback to new
+            if attr.get("entity_type"):
+                if not merged_attr.get("entity_type"):
+                    merged_attr["entity_type"] = attr["entity_type"]
+            # Copy any new attributes not in old
+            for k, v in attr.items():
+                if k not in merged_attr:
+                    merged_attr[k] = v
+            # Preserve pagerank from old if present
+            if "pagerank" not in merged_attr:
+                merged_attr["pagerank"] = old_meta.get("pagerank", 0.001)
+
+            delta_graph.add_node(node_name, **merged_attr)
+            change.added_updated_nodes.add(node_name)
+        else:
+            # New node
+            new_attr = dict(attr)
+            if "pagerank" not in new_attr:
+                new_attr["pagerank"] = 0.001
+            delta_graph.add_node(node_name, **new_attr)
+            change.added_updated_nodes.add(node_name)
+
+    # 3. Query existing relations
+    edge_pairs = list(subgraph.edges())
+    callback(msg=f"[P2] Querying {len(edge_pairs)} relations for existing data...")
+    existing_relations = await query_existing_relations(tenant_id, kb_id, edge_pairs)
+    callback(msg=f"[P2] Found {len(existing_relations)} existing relations.")
+
+    # 4. Build delta edges
+    for source, target, attr in subgraph.edges(data=True):
+        edge_key = get_from_to(source, target)
+        if edge_key in existing_relations:
+            old_fields = existing_relations[edge_key]
+            try:
+                old_meta = json.loads(old_fields["content_with_weight"])
+            except Exception:
+                old_meta = {}
+
+            merged_attr = dict(old_meta)
+            # Merge weight
+            merged_attr["weight"] = merged_attr.get("weight", 0) + attr.get("weight", 0)
+            # Merge description
+            new_desc = attr.get("description", "")
+            if new_desc:
+                old_desc = merged_attr.get("description", "")
+                merged_attr["description"] = old_desc + GRAPH_FIELD_SEP + new_desc if old_desc else new_desc
+            # Merge keywords (deduplicate)
+            old_kw = set(merged_attr.get("keywords", []))
+            new_kw = set(attr.get("keywords", []))
+            merged_attr["keywords"] = sorted(old_kw | new_kw)
+            # Merge source_id
+            old_sources = set(merged_attr.get("source_id", []))
+            new_sources = set(attr.get("source_id", []))
+            merged_attr["source_id"] = sorted(old_sources | new_sources)
+            # Copy any new attributes
+            for k, v in attr.items():
+                if k not in merged_attr:
+                    merged_attr[k] = v
+
+            delta_graph.add_edge(source, target, **merged_attr)
+            change.added_updated_edges.add(edge_key)
+        else:
+            delta_graph.add_edge(source, target, **attr)
+            change.added_updated_edges.add(edge_key)
+
+    # 5. Update rank (degree-based approximation; global PageRank is deferred)
+    for node_name in delta_graph.nodes:
+        delta_graph.nodes[node_name]["rank"] = int(delta_graph.degree(node_name))
+
+    # 6. Write delta
+    await set_graph(tenant_id, kb_id, embedding_model, delta_graph, change, callback)
+
+    now = asyncio.get_running_loop().time()
+    callback(msg=f"[P2] incremental merge for doc {doc_id} done in {now - start:.2f}s "
+                 f"(nodes: {len(change.added_updated_nodes)}, edges: {len(change.added_updated_edges)}).")
+    return delta_graph
+
+
 @timeout(60 * 3)
 async def merge_subgraph(
     tenant_id: str,
@@ -798,6 +959,17 @@ async def merge_subgraph(
 ):
     start = asyncio.get_running_loop().time()
     change = GraphChange()
+
+    if GraphRAGConfig.USE_INCREMENTAL_MERGE:
+        try:
+            return await merge_subgraph_incremental(
+                tenant_id, kb_id, doc_id, subgraph, embedding_model, callback
+            )
+        except Exception as exc:
+            logging.error("merge_subgraph_incremental failed, falling back to monolithic merge: %s", exc)
+            callback(msg=f"[P2] incremental merge failed, falling back to monolithic merge: {exc}")
+            # fall through to monolithic path
+
     old_graph = await get_graph(tenant_id, kb_id, subgraph.graph["source_id"])
     if old_graph is not None:
         logging.info("Merge with an exiting graph...................")
@@ -824,6 +996,159 @@ async def merge_subgraph(
     return new_graph
 
 
+async def resolve_entities_incremental(
+    tenant_id: str,
+    kb_id: str,
+    subgraph_nodes: set[str],
+    llm_bdl,
+    embed_bdl,
+    callback,
+    task_id: str = "",
+):
+    """Incremental entity resolution without loading the global graph.
+
+    For each entity type present in ``subgraph_nodes``, queries existing
+    entities of the same type from the doc store, builds a local subgraph
+    (including all neighbours so edge-redirects are not lost), and runs
+    :class:`EntityResolution` on that local view only.
+    """
+    from collections import defaultdict
+
+    start = asyncio.get_running_loop().time()
+
+    if not subgraph_nodes:
+        callback(msg="[P3] No subgraph nodes, skipping resolution.")
+        return
+
+    # 1. Query attributes of new nodes
+    new_node_fields = await query_existing_entities(tenant_id, kb_id, list(subgraph_nodes))
+
+    # 2. Group new nodes by type
+    new_nodes_by_type = defaultdict(list)
+    node_attrs = {}
+    for node_name in subgraph_nodes:
+        fields = new_node_fields.get(node_name)
+        if not fields:
+            continue
+        try:
+            meta = json.loads(fields["content_with_weight"])
+        except Exception:
+            continue
+        ent_type = meta.get("entity_type", "-")
+        new_nodes_by_type[ent_type].append(node_name)
+        node_attrs[node_name] = meta
+
+    if not new_nodes_by_type:
+        callback(msg="[P3] No valid new nodes with types, skipping resolution.")
+        return
+
+    er = EntityResolution(llm_bdl)
+    overall_change = GraphChange()
+    all_local_graphs = []
+
+    for ent_type, new_nodes in new_nodes_by_type.items():
+        if not new_nodes:
+            continue
+
+        # 3. Query existing nodes of the same type
+        conds = {
+            "fields": ["entity_kwd", "content_with_weight"],
+            "size": 10000,
+            "knowledge_graph_kwd": ["entity"],
+            "entity_type_kwd": ent_type,
+        }
+        existing_node_attrs = {}
+        try:
+            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+            for id in es_res.ids:
+                fields = es_res.field[id]
+                ent_name = fields.get("entity_kwd")
+                if isinstance(ent_name, list):
+                    ent_name = ent_name[0]
+                if ent_name and ent_name not in subgraph_nodes:
+                    try:
+                        meta = json.loads(fields["content_with_weight"])
+                    except Exception:
+                        meta = {}
+                    existing_node_attrs[ent_name] = meta
+        except Exception as e:
+            logging.warning("P3: failed to query existing %s entities: %s", ent_type, e)
+            continue
+
+        if not existing_node_attrs:
+            continue
+
+        # 4. Build local graph with new + existing nodes of this type
+        local_graph = nx.Graph()
+        for node_name in new_nodes:
+            if node_name in node_attrs:
+                local_graph.add_node(node_name, **node_attrs[node_name])
+        for ent_name, meta in existing_node_attrs.items():
+            local_graph.add_node(ent_name, **meta)
+
+        # 5. Pull all relations touching any node in the local graph
+        #    (including neighbours of other types) so _merge_graph_nodes
+        #    can redirect every edge correctly.
+        all_node_names = list(local_graph.nodes())
+        rel_fields = await query_node_relations(tenant_id, kb_id, all_node_names)
+        for fields in rel_fields:
+            from_node = fields.get("from_entity_kwd")
+            to_node = fields.get("to_entity_kwd")
+            if isinstance(from_node, list):
+                from_node = from_node[0]
+            if isinstance(to_node, list):
+                to_node = to_node[0]
+            if from_node and to_node:
+                try:
+                    meta = json.loads(fields["content_with_weight"])
+                except Exception:
+                    meta = {}
+                local_graph.add_edge(from_node, to_node, **meta)
+
+        callback(
+            msg=f"[P3] Type '{ent_type}': {len(new_nodes)} new vs {len(existing_node_attrs)} existing, "
+                f"{len(rel_fields)} relations, {local_graph.number_of_nodes()} nodes in local graph."
+        )
+
+        # 6. Run EntityResolution on the local graph
+        try:
+            reso = await er(local_graph, set(new_nodes), callback=callback, task_id=task_id)
+        except Exception as e:
+            logging.warning("P3: EntityResolution failed for type %s: %s", ent_type, e)
+            continue
+
+        change = reso.change
+        overall_change.removed_nodes.update(change.removed_nodes)
+        overall_change.added_updated_nodes.update(change.added_updated_nodes)
+        overall_change.removed_edges.update(change.removed_edges)
+        overall_change.added_updated_edges.update(change.added_updated_edges)
+        all_local_graphs.append(reso.graph)
+
+    if not all_local_graphs:
+        callback(msg="[P3] No resolution performed (no existing candidates).")
+        return
+
+    # 7. Build combined graph from all local graphs so set_graph can read attrs
+    combined_graph = nx.Graph()
+    for g in all_local_graphs:
+        for node_name, attrs in g.nodes(data=True):
+            combined_graph.add_node(node_name, **attrs)
+        for u, v, attrs in g.edges(data=True):
+            combined_graph.add_edge(u, v, **attrs)
+        if g.graph.get("source_id"):
+            combined_graph.graph.setdefault("source_id", []).extend(g.graph["source_id"])
+    combined_graph.graph["source_id"] = list(set(combined_graph.graph.get("source_id", [])))
+
+    callback(
+        msg=f"[P3] Overall resolution removed {len(overall_change.removed_nodes)} nodes and "
+            f"{len(overall_change.removed_edges)} edges."
+    )
+
+    await set_graph(tenant_id, kb_id, embed_bdl, combined_graph, overall_change, callback)
+    now = asyncio.get_running_loop().time()
+    callback(msg=f"[P3] incremental resolution done in {now - start:.2f}s.")
+
+
 @timeout(60 * 30, 1)
 async def resolve_entities(
     graph,
@@ -842,6 +1167,20 @@ async def resolve_entities(
         raise TaskCanceledException(f"Task {task_id} was cancelled")
 
     start = asyncio.get_running_loop().time()
+
+    if GraphRAGConfig.USE_INCREMENTAL_RESOLUTION:
+        try:
+            await resolve_entities_incremental(
+                tenant_id, kb_id, subgraph_nodes, llm_bdl, embed_bdl, callback, task_id=task_id
+            )
+            now = asyncio.get_running_loop().time()
+            callback(msg=f"Graph resolution done in {now - start:.2f}s.")
+            return
+        except Exception as exc:
+            logging.error("resolve_entities_incremental failed, falling back to monolithic: %s", exc)
+            callback(msg=f"[P3] incremental resolution failed, falling back to monolithic: {exc}")
+            # fall through to monolithic path
+
     er = EntityResolution(
         llm_bdl,
     )
@@ -867,25 +1206,22 @@ async def resolve_entities(
     callback(msg=f"Graph resolution done in {now - start:.2f}s.")
 
 
-@timeout(60 * 30, 1)
-async def extract_community(
-    graph,
+async def _extract_community_core(
+    graph: nx.Graph,
     tenant_id: str,
     kb_id: str,
-    doc_id: str,
     llm_bdl,
-    embed_bdl,
     callback,
     task_id: str = "",
+    label_prefix: str = "",
 ):
-    if task_id and has_canceled(task_id):
-        callback(msg=f"Task {task_id} cancelled before community extraction.")
-        raise TaskCanceledException(f"Task {task_id} was cancelled")
+    """Shared implementation of community detection + indexing.
 
+    Operates on the supplied ``graph`` (which may be the full global graph or
+    a delta).  Returns ``(community_structure, community_reports)``.
+    """
     start = asyncio.get_running_loop().time()
-    ext = CommunityReportsExtractor(
-        llm_bdl,
-    )
+    ext = CommunityReportsExtractor(llm_bdl)
     cr = await ext(graph, callback=callback, task_id=task_id)
 
     if task_id and has_canceled(task_id):
@@ -894,11 +1230,12 @@ async def extract_community(
 
     community_structure = cr.structured_output
     community_reports = cr.output
-    doc_ids = graph.graph["source_id"]
+    doc_ids = graph.graph.get("source_id", [])
 
     now = asyncio.get_running_loop().time()
-    callback(msg=f"Graph extracted {len(cr.structured_output)} communities in {now - start:.2f}s.")
+    callback(msg=f"{label_prefix}Graph extracted {len(cr.structured_output)} communities in {now - start:.2f}s.")
     start = now
+
     if task_id and has_canceled(task_id):
         callback(msg=f"Task {task_id} cancelled during community indexing.")
         raise TaskCanceledException(f"Task {task_id} was cancelled")
@@ -909,25 +1246,20 @@ async def extract_community(
             "report": rep,
             "evidences": "\n".join([f.get("explanation", "") for f in stru["findings"]]),
         }
-        # Deterministic id derived from (kb_id, community title) so reruns of
-        # extract_community produce stable ids.  Combined with insert-then-
-        # prune below, this means a crash mid-insert leaves the prior set of
-        # community reports intact -- never the partial-delete state the old
-        # delete-then-insert order produced.
         chunk_payload_for_id = {
             "content_with_weight": f"community_report::{stru['title']}",
             "kb_id": kb_id,
         }
         chunk = {
             "id": chunk_id(chunk_payload_for_id),
-            "docnm_kwd": stru["title"],
-            "title_tks": rag_tokenizer.tokenize(stru["title"]),
+            "docnm_kwd": stru['title'],
+            "title_tks": rag_tokenizer.tokenize(stru['title']),
             "content_with_weight": json.dumps(obj, ensure_ascii=False),
             "content_ltks": rag_tokenizer.tokenize(obj["report"] + " " + obj["evidences"]),
             "knowledge_graph_kwd": "community_report",
-            "weight_flt": stru["weight"],
-            "entities_kwd": stru["entities"],
-            "important_kwd": stru["entities"],
+            "weight_flt": stru['weight'],
+            "entities_kwd": stru['entities'],
+            "important_kwd": stru['entities'],
             "kb_id": kb_id,
             "source_id": list(doc_ids),
             "available_int": 0,
@@ -937,10 +1269,6 @@ async def extract_community(
 
     new_ids: set[str] = {c["id"] for c in chunks}
 
-    # Snapshot existing community_report ids BEFORE inserting so we can
-    # delete exactly the stale set afterwards.  If the search fails we fall
-    # back to the prior delete-everything-then-insert behaviour rather than
-    # leaving an inconsistent mix.
     old_ids: list[str] = []
     try:
         existing_res = await thread_pool_exec(
@@ -955,12 +1283,8 @@ async def extract_community(
         await thread_pool_exec(settings.docStoreConn.delete, {"knowledge_graph_kwd": "community_report", "kb_id": kb_id}, search.index_name(tenant_id), kb_id)
         old_ids = []
 
-    await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert community reports")
+    await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label=f"{label_prefix}Insert community reports")
 
-    # Now that all new reports are persisted, prune stale rows.  Anything in
-    # old_ids that is not also in new_ids is no longer current (community
-    # composition changed across runs).  A failure here just leaves stale
-    # rows; the new rows are already in place.
     stale_ids = [i for i in old_ids if i not in new_ids]
     if stale_ids:
         try:
@@ -978,5 +1302,68 @@ async def extract_community(
         raise TaskCanceledException(f"Task {task_id} was cancelled")
 
     now = asyncio.get_running_loop().time()
-    callback(msg=f"Graph indexed {len(cr.structured_output)} communities in {now - start:.2f}s.")
+    callback(msg=f"{label_prefix}Graph indexed {len(cr.structured_output)} communities in {now - start:.2f}s.")
     return community_structure, community_reports
+
+
+async def extract_community_indexed(
+    tenant_id: str,
+    kb_id: str,
+    llm_bdl,
+    embed_bdl,
+    callback,
+    task_id: str = "",
+):
+    """Load the full graph from the doc-store index and run community detection.
+
+    This is the P4 async path: it guarantees that community detection sees the
+    complete global topology regardless of whether the caller passed a delta
+    subgraph or a full graph.
+    """
+    start = asyncio.get_running_loop().time()
+    graph = await get_graph_from_index(tenant_id, kb_id)
+    if graph is None or len(graph.nodes) == 0:
+        callback(msg="[P4] No graph found in index, skipping community extraction.")
+        return [], []
+
+    callback(
+        msg=f"[P4] Loaded {len(graph.nodes)} nodes, {len(graph.edges)} edges from index "
+            f"for community detection in {asyncio.get_running_loop().time() - start:.2f}s."
+    )
+    return await _extract_community_core(
+        graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id, label_prefix="[P4] "
+    )
+
+
+@timeout(60 * 30, 1)
+async def extract_community(
+    graph,
+    tenant_id: str,
+    kb_id: str,
+    doc_id: str,
+    llm_bdl,
+    embed_bdl,
+    callback,
+    task_id: str = "",
+):
+    if task_id and has_canceled(task_id):
+        callback(msg=f"Task {task_id} cancelled before community extraction.")
+        raise TaskCanceledException(f"Task {task_id} was cancelled")
+
+    start = asyncio.get_running_loop().time()
+
+    if GraphRAGConfig.USE_ASYNC_COMMUNITY:
+        # P4: If the incoming graph is a delta (single-doc source_id), load
+        # the full graph from index so Leiden sees the global topology.
+        source_ids = graph.graph.get("source_id", []) if graph else []
+        if len(source_ids) <= 1:
+            callback(msg="[P4] Incoming graph appears to be a delta; loading full graph from index.")
+            return await extract_community_indexed(
+                tenant_id, kb_id, llm_bdl, embed_bdl, callback, task_id=task_id
+            )
+        else:
+            callback(msg="[P4] Incoming graph appears complete; using it directly for community detection.")
+
+    return await _extract_community_core(
+        graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id
+    )

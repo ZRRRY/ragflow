@@ -51,6 +51,9 @@ from rag.utils.raptor_utils import (
 )
 from common.log_utils import init_root_logger
 from common.config_utils import show_configs
+from rag.graphrag.config import GraphRAGConfig
+from rag.graphrag.limiter import AdaptiveConcurrencyLimiter, current_limiter
+from rag.graphrag.phase_markers import PHASE_RESOLUTION, PHASE_COMMUNITY, has_phase_marker, set_phase_marker
 from rag.graphrag.utils import get_llm_cache, set_llm_cache, get_tags_from_cache, set_tags_to_cache
 from rag.prompts.generator import keyword_extraction, question_proposal, content_tagging, run_toc_from_text, \
     gen_metadata
@@ -146,7 +149,20 @@ task_limiter = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 chunk_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHUNK_BUILDERS)
 embed_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHUNK_BUILDERS)
 minio_limiter = asyncio.Semaphore(MAX_CONCURRENT_MINIO)
-kg_limiter = asyncio.Semaphore(2)
+if GraphRAGConfig.USE_ADAPTIVE_LIMITER:
+    kg_limiter = AdaptiveConcurrencyLimiter(
+        initial_limit=GraphRAGConfig.MAX_CONCURRENT_KG_TASKS,
+        min_limit=GraphRAGConfig.MIN_CONCURRENT_KG_TASKS,
+        max_limit=GraphRAGConfig.MAX_CONCURRENT_KG_TASKS,
+        adjust_interval=GraphRAGConfig.ADAPTIVE_INTERVAL,
+        degrade_threshold=GraphRAGConfig.ADAPTIVE_DEGRADE_THRESHOLD,
+        increase_threshold=GraphRAGConfig.ADAPTIVE_INCREASE_THRESHOLD,
+    )
+    # Expose to downstream modules (utils.py / index.py) so they can record events.
+    import rag.graphrag.limiter as _limiter_mod
+    _limiter_mod.current_limiter = kg_limiter
+else:
+    kg_limiter = asyncio.Semaphore(GraphRAGConfig.MAX_CONCURRENT_KG_TASKS)
 WORKER_HEARTBEAT_TIMEOUT = int(os.environ.get('WORKER_HEARTBEAT_TIMEOUT', '120'))
 stop_event = threading.Event()
 
@@ -1358,15 +1374,24 @@ async def do_handle_task(task):
         chat_model = LLMBundle(task_tenant_id, chat_model_config, lang=task_language)
         # run RAPTOR
         async with kg_limiter:
-            chunks, token_count, raptor_cleanup_chunks = await run_raptor_for_kb(
-                row=task,
-                kb_parser_config=kb_parser_config,
-                chat_mdl=chat_model,
-                embd_mdl=embedding_model,
-                vector_size=vector_size,
-                callback=progress_callback,
-                doc_ids=task.get("doc_ids", []),
-            )
+            try:
+                chunks, token_count, raptor_cleanup_chunks = await run_raptor_for_kb(
+                    row=task,
+                    kb_parser_config=kb_parser_config,
+                    chat_mdl=chat_model,
+                    embd_mdl=embedding_model,
+                    vector_size=vector_size,
+                    callback=progress_callback,
+                    doc_ids=task.get("doc_ids", []),
+                )
+                if isinstance(kg_limiter, AdaptiveConcurrencyLimiter):
+                    kg_limiter.record_event_sync("success")
+            except Exception as exc:
+                if isinstance(kg_limiter, AdaptiveConcurrencyLimiter):
+                    err_str = str(exc).lower()
+                    if any(k in err_str for k in ("rate limit", "429", "tpm limit", "too many requests", "requests per minute")):
+                        kg_limiter.record_event_sync("llm_rate_limit")
+                raise
         if fake_doc_ids := task.get("doc_ids", []):
             task_doc_id = fake_doc_ids[0]  # use the first document ID to represent this task for logging purposes
     # Either using graphrag or Standard chunking methods
@@ -1404,20 +1429,29 @@ async def do_handle_task(task):
         with_resolution = graphrag_conf.get("resolution", False)
         with_community = graphrag_conf.get("community", False)
         async with kg_limiter:
-            # await run_graphrag(task, task_language, with_resolution, with_community, chat_model, embedding_model, progress_callback)
-            from rag.graphrag.general.index import run_graphrag_for_kb # Lazy load, save around 2s
-            result = await run_graphrag_for_kb(
-                row=task,
-                doc_ids=task.get("doc_ids", []),
-                language=task_language,
-                kb_parser_config=kb_parser_config,
-                chat_model=chat_model,
-                embedding_model=embedding_model,
-                callback=progress_callback,
-                with_resolution=with_resolution,
-                with_community=with_community,
-            )
-            logging.info(f"GraphRAG task result for task {task}:\n{result}")
+            try:
+                # await run_graphrag(task, task_language, with_resolution, with_community, chat_model, embedding_model, progress_callback)
+                from rag.graphrag.general.index import run_graphrag_for_kb # Lazy load, save around 2s
+                result = await run_graphrag_for_kb(
+                    row=task,
+                    doc_ids=task.get("doc_ids", []),
+                    language=task_language,
+                    kb_parser_config=kb_parser_config,
+                    chat_model=chat_model,
+                    embedding_model=embedding_model,
+                    callback=progress_callback,
+                    with_resolution=with_resolution,
+                    with_community=with_community,
+                )
+                logging.info(f"GraphRAG task result for task {task}:\n{result}")
+                if isinstance(kg_limiter, AdaptiveConcurrencyLimiter):
+                    kg_limiter.record_event_sync("success")
+            except Exception as exc:
+                if isinstance(kg_limiter, AdaptiveConcurrencyLimiter):
+                    err_str = str(exc).lower()
+                    if any(k in err_str for k in ("rate limit", "429", "tpm limit", "too many requests", "requests per minute")):
+                        kg_limiter.record_event_sync("llm_rate_limit")
+                raise
         progress_callback(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
         return
     elif task_type == "mindmap":
@@ -1713,6 +1747,131 @@ async def task_manager():
         task_limiter.release()
 
 
+async def kg_postprocess_consumer():
+    """P5-T3: Background consumer for async resolution/community phases.
+
+    Reads from the Redis Stream queue ``graphrag:postprocess`` and executes
+    ``resolve_entities`` / ``extract_community`` with the same resource guards
+    (``kg_limiter``) as the main GraphRAG pipeline.
+    """
+    if not GraphRAGConfig.USE_ASYNC_KG_PHASES:
+        return
+
+    queue_name = GraphRAGConfig.KG_POSTPROCESS_QUEUE
+    group_name = SVR_CONSUMER_GROUP_NAME + "_kg_pp"
+    consumer_name = CONSUMER_NAME + "_kg_pp"
+    logging.info(f"[KG-PP] Consumer starting on {queue_name} (group={group_name})")
+
+    while not stop_event.is_set():
+        msg = None
+        try:
+            msg = REDIS_CONN.queue_consumer(queue_name, group_name, consumer_name)
+        except Exception:
+            logging.exception("[KG-PP] queue_consumer error")
+            await asyncio.sleep(5)
+            continue
+
+        if not msg:
+            await asyncio.sleep(1)
+            continue
+
+        payload = msg.get_message()
+        tenant_id = payload.get("tenant_id")
+        kb_id = payload.get("kb_id")
+        task_id = payload.get("task_id")
+        with_resolution = payload.get("with_resolution", False)
+        with_community = payload.get("with_community", False)
+        kb_task_llm_id = payload.get("kb_task_llm_id")
+        task_language = payload.get("task_language", "English")
+
+        logging.info(
+            f"[KG-PP] Processing kb={kb_id} task={task_id} resolution={with_resolution} community={with_community}"
+        )
+
+        try:
+            if has_canceled(task_id):
+                logging.info(f"[KG-PP] kb={kb_id} task={task_id} has been cancelled, skipping")
+                msg.ack()
+                continue
+
+            # Re-bind models (same pattern as the main pipeline)
+            chat_model_config = get_model_config_by_type_and_name(tenant_id, LLMType.CHAT, kb_task_llm_id)
+            chat_model = LLMBundle(tenant_id, chat_model_config, lang=task_language)
+            embd_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.EMBEDDING)
+            embedding_model = LLMBundle(tenant_id, embd_model_config, lang=task_language)
+
+            # Load persisted graph
+            from rag.graphrag.utils import get_graph
+            final_graph = await get_graph(tenant_id, kb_id)
+            if final_graph is None:
+                logging.error(f"[KG-PP] kb={kb_id} no persisted graph found, cannot proceed")
+                msg.ack()
+                continue
+
+            # Simple logging callback (no frontend progress bar for async jobs)
+            def pp_callback(msg=None, prog=None):
+                if msg:
+                    logging.info(f"[KG-PP] kb={kb_id}: {msg}")
+
+            # Lock per-KB so only one postprocess runs at a time
+            kb_lock = RedisDistributedLock(f"graphrag_task_{kb_id}", lock_value="postprocess", timeout=3600)
+            await kb_lock.spin_acquire()
+            try:
+                if has_canceled(task_id):
+                    logging.info(f"[KG-PP] kb={kb_id} task={task_id} cancelled after lock acquire")
+                    msg.ack()
+                    continue
+
+                resolution_pending = with_resolution and not has_phase_marker(kb_id, PHASE_RESOLUTION)
+                community_pending = with_community and not has_phase_marker(kb_id, PHASE_COMMUNITY)
+
+                if not resolution_pending and not community_pending:
+                    logging.info(f"[KG-PP] kb={kb_id} all phases already done")
+                    msg.ack()
+                    continue
+
+                async with kg_limiter:
+                    if resolution_pending:
+                        from rag.graphrag.general.index import resolve_entities
+                        subgraph_nodes = set(final_graph.nodes())
+                        await resolve_entities(
+                            final_graph,
+                            subgraph_nodes,
+                            tenant_id,
+                            kb_id,
+                            None,
+                            chat_model,
+                            embedding_model,
+                            pp_callback,
+                            task_id=task_id,
+                        )
+                        set_phase_marker(kb_id, PHASE_RESOLUTION)
+                        logging.info(f"[KG-PP] kb={kb_id} resolution done")
+
+                    if community_pending:
+                        from rag.graphrag.general.index import extract_community
+                        await extract_community(
+                            final_graph,
+                            tenant_id,
+                            kb_id,
+                            None,
+                            chat_model,
+                            embedding_model,
+                            pp_callback,
+                            task_id=task_id,
+                        )
+                        set_phase_marker(kb_id, PHASE_COMMUNITY)
+                        logging.info(f"[KG-PP] kb={kb_id} community done")
+
+                msg.ack()
+                logging.info(f"[KG-PP] kb={kb_id} postprocess complete")
+            finally:
+                kb_lock.release()
+        except Exception as e:
+            logging.exception(f"[KG-PP] kb={kb_id} postprocess failed: {e}")
+            # Do NOT ack – let the message remain pending for retry / dead-letter inspection
+
+
 async def main():
     # Stagger executor startup to prevent connection storm to Infinity
     # Extract worker number from CONSUMER_NAME (e.g., "task_executor_abc123_5" -> 5)
@@ -1752,9 +1911,12 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     report_task = asyncio.create_task(report_status())
+    kg_pp_task = asyncio.create_task(kg_postprocess_consumer())
     tasks = []
 
     logging.info(f"RAGFlow ingestion is ready after {time.time() - start_ts}s initialization.")
+    if isinstance(kg_limiter, AdaptiveConcurrencyLimiter):
+        kg_limiter.start_monitoring()
     try:
         while not stop_event.is_set():
             await task_limiter.acquire()
@@ -1765,7 +1927,8 @@ async def main():
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         report_task.cancel()
-        await asyncio.gather(report_task, return_exceptions=True)
+        kg_pp_task.cancel()
+        await asyncio.gather(report_task, kg_pp_task, return_exceptions=True)
     logging.error("BUG!!! You should not reach here!!!")
 
 
