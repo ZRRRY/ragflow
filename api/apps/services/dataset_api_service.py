@@ -22,6 +22,8 @@ import re
 import zipfile
 from common.constants import PAGERANK_FLD
 from common import settings
+from networkx.readwrite import json_graph
+from rag.graphrag.utils import get_graph_from_index, get_graph_from_json
 from api.db.db_models import File
 from api.db.services.document_service import DocumentService, queue_raptor_o_graphrag_tasks
 from api.db.services.file2document_service import File2DocumentService
@@ -400,31 +402,35 @@ async def _fetch_raw_knowledge_graph(dataset_id: str, tenant_id: str):
     """
     Fetch the raw (un-truncated) knowledge graph data from doc store.
 
+    Assembles the graph from indexed entity/relation documents instead of reading
+    the monolithic graph JSON blob, which may be stale or incomplete in
+    incremental-mode pipelines.
+
     :param dataset_id: dataset ID
     :param tenant_id: tenant ID
     :return: dict with {"graph": {...}, "mind_map": {...}}
     """
     _, kb = KnowledgebaseService.get_by_id(dataset_id)
 
-    req = {"kb_id": [dataset_id], "knowledge_graph_kwd": ["graph"]}
-
     obj = {"graph": {}, "mind_map": {}}
     from rag.nlp import search
 
     if not settings.docStoreConn.index_exist(search.index_name(kb.tenant_id), dataset_id):
         return obj
-    sres = await settings.retriever.search(req, search.index_name(kb.tenant_id), [dataset_id])
-    if not len(sres.ids):
-        return obj
 
-    for id in sres.ids[:1]:
-        ty = sres.field[id]["knowledge_graph_kwd"]
-        try:
-            content_json = json.loads(sres.field[id]["content_with_weight"])
-        except Exception:
-            continue
-
-        obj[ty] = content_json
+    # Assemble the canonical graph from indexed entity/relation chunks.
+    # We bypass ``get_graph`` here because that helper honours the
+    # ``USE_INCREMENTAL_GRAPH`` switch; for export we always want the
+    # most complete view, so we force the index-first path.
+    graph = await get_graph_from_index(kb.tenant_id, dataset_id)
+    if graph is None or len(graph.nodes) == 0:
+        logging.warning(
+            "get_graph_from_index returned empty for kb=%s; falling back to JSON blob",
+            dataset_id,
+        )
+        graph = await get_graph_from_json(kb.tenant_id, dataset_id)
+    if graph is not None and len(graph.nodes) > 0:
+        obj["graph"] = json_graph.node_link_data(graph, edges="edges")
 
     return obj
 

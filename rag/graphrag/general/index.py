@@ -247,7 +247,7 @@ async def run_graphrag_for_kb(
     fields_for_chunks = ["content_with_weight", "doc_id"]
 
     if not doc_ids:
-        logging.info(f"Fetching all docs for {kb_id}")
+        logging.info("Fetching all docs for %s", kb_id)
         docs, _ = DocumentService.get_by_kb_id(
             kb_id=kb_id,
             page_number=0,
@@ -476,7 +476,7 @@ async def run_graphrag_for_kb(
         }
         ok = REDIS_CONN.queue_product(GraphRAGConfig.KG_POSTPROCESS_QUEUE, queue_payload)
         if ok:
-            callback(msg=f"[GraphRAG] kb:{kb_id} queued resolution/community to {GraphRAGConfig.KG_POSTPROCESS_QUEUE}")
+            logging.info("[GraphRAG] kb:%s queued resolution/community to %s", kb_id, GraphRAGConfig.KG_POSTPROCESS_QUEUE)
             now = asyncio.get_running_loop().time()
             return {
                 "ok_docs": ok_docs,
@@ -487,7 +487,7 @@ async def run_graphrag_for_kb(
                 "postprocess_queued": True,
             }
         else:
-            callback(msg=f"[GraphRAG] kb:{kb_id} FAILED to queue postprocess; falling back to synchronous execution.")
+            logging.warning("[GraphRAG] kb:%s FAILED to queue postprocess; falling back to synchronous execution.", kb_id)
 
     if has_canceled(row["id"]):
         callback(msg=f"Task {row['id']} cancelled before resolution/community extraction.")
@@ -844,9 +844,9 @@ async def merge_subgraph_incremental(
     node_names = list(subgraph.nodes())
 
     # 1. Query existing entities in the doc store
-    callback(msg=f"[P2] Querying {len(node_names)} entities for existing data...")
+    logging.info("[P2] Querying %d entities for existing data...", len(node_names))
     existing_entities = await query_existing_entities(tenant_id, kb_id, node_names)
-    callback(msg=f"[P2] Found {len(existing_entities)} existing entities.")
+    logging.info("[P2] Found %d existing entities.", len(existing_entities))
 
     # 2. Build delta graph with merged nodes
     delta_graph = nx.Graph()
@@ -894,9 +894,9 @@ async def merge_subgraph_incremental(
 
     # 3. Query existing relations
     edge_pairs = list(subgraph.edges())
-    callback(msg=f"[P2] Querying {len(edge_pairs)} relations for existing data...")
+    logging.info("[P2] Querying %d relations for existing data...", len(edge_pairs))
     existing_relations = await query_existing_relations(tenant_id, kb_id, edge_pairs)
-    callback(msg=f"[P2] Found {len(existing_relations)} existing relations.")
+    logging.info("[P2] Found %d existing relations.", len(existing_relations))
 
     # 4. Build delta edges
     for source, target, attr in subgraph.edges(data=True):
@@ -943,8 +943,8 @@ async def merge_subgraph_incremental(
     await set_graph(tenant_id, kb_id, embedding_model, delta_graph, change, callback)
 
     now = asyncio.get_running_loop().time()
-    callback(msg=f"[P2] incremental merge for doc {doc_id} done in {now - start:.2f}s "
-                 f"(nodes: {len(change.added_updated_nodes)}, edges: {len(change.added_updated_edges)}).")
+    logging.info("[P2] incremental merge for doc %s done in %.2fs (nodes: %d, edges: %d).",
+                 doc_id, now - start, len(change.added_updated_nodes), len(change.added_updated_edges))
     return delta_graph
 
 
@@ -966,8 +966,8 @@ async def merge_subgraph(
                 tenant_id, kb_id, doc_id, subgraph, embedding_model, callback
             )
         except Exception as exc:
-            logging.error("merge_subgraph_incremental failed, falling back to monolithic merge: %s", exc)
-            callback(msg=f"[P2] incremental merge failed, falling back to monolithic merge: {exc}")
+            logging.error("merge_subgraph_incremental failed, falling back to monolithic merge: %s", exc, exc_info=True)
+            logging.warning("[P2] incremental merge failed, falling back to monolithic merge: %s", exc)
             # fall through to monolithic path
 
     old_graph = await get_graph(tenant_id, kb_id, subgraph.graph["source_id"])
@@ -1017,7 +1017,7 @@ async def resolve_entities_incremental(
     start = asyncio.get_running_loop().time()
 
     if not subgraph_nodes:
-        callback(msg="[P3] No subgraph nodes, skipping resolution.")
+        logging.info("[P3] No subgraph nodes, skipping resolution.")
         return
 
     # 1. Query attributes of new nodes
@@ -1039,7 +1039,7 @@ async def resolve_entities_incremental(
         node_attrs[node_name] = meta
 
     if not new_nodes_by_type:
-        callback(msg="[P3] No valid new nodes with types, skipping resolution.")
+        logging.info("[P3] No valid new nodes with types, skipping resolution.")
         return
 
     er = EntityResolution(llm_bdl)
@@ -1105,9 +1105,9 @@ async def resolve_entities_incremental(
                     meta = {}
                 local_graph.add_edge(from_node, to_node, **meta)
 
-        callback(
-            msg=f"[P3] Type '{ent_type}': {len(new_nodes)} new vs {len(existing_node_attrs)} existing, "
-                f"{len(rel_fields)} relations, {local_graph.number_of_nodes()} nodes in local graph."
+        logging.info(
+            "[P3] Type '%s': %d new vs %d existing, %d relations, %d nodes in local graph.",
+            ent_type, len(new_nodes), len(existing_node_attrs), len(rel_fields), local_graph.number_of_nodes(),
         )
 
         # 6. Run EntityResolution on the local graph
@@ -1125,7 +1125,7 @@ async def resolve_entities_incremental(
         all_local_graphs.append(reso.graph)
 
     if not all_local_graphs:
-        callback(msg="[P3] No resolution performed (no existing candidates).")
+        logging.info("[P3] No resolution performed (no existing candidates).")
         return
 
     # 7. Build combined graph from all local graphs so set_graph can read attrs
@@ -1139,14 +1139,14 @@ async def resolve_entities_incremental(
             combined_graph.graph.setdefault("source_id", []).extend(g.graph["source_id"])
     combined_graph.graph["source_id"] = list(set(combined_graph.graph.get("source_id", [])))
 
-    callback(
-        msg=f"[P3] Overall resolution removed {len(overall_change.removed_nodes)} nodes and "
-            f"{len(overall_change.removed_edges)} edges."
+    logging.info(
+        "[P3] Overall resolution removed %d nodes and %d edges.",
+        len(overall_change.removed_nodes), len(overall_change.removed_edges),
     )
 
     await set_graph(tenant_id, kb_id, embed_bdl, combined_graph, overall_change, callback)
     now = asyncio.get_running_loop().time()
-    callback(msg=f"[P3] incremental resolution done in {now - start:.2f}s.")
+    logging.info("[P3] incremental resolution done in %.2fs.", now - start)
 
 
 @timeout(60 * 30, 1)
@@ -1177,8 +1177,8 @@ async def resolve_entities(
             callback(msg=f"Graph resolution done in {now - start:.2f}s.")
             return
         except Exception as exc:
-            logging.error("resolve_entities_incremental failed, falling back to monolithic: %s", exc)
-            callback(msg=f"[P3] incremental resolution failed, falling back to monolithic: {exc}")
+            logging.error("resolve_entities_incremental failed, falling back to monolithic: %s", exc, exc_info=True)
+            logging.warning("[P3] incremental resolution failed, falling back to monolithic: %s", exc)
             # fall through to monolithic path
 
     er = EntityResolution(
@@ -1213,7 +1213,6 @@ async def _extract_community_core(
     llm_bdl,
     callback,
     task_id: str = "",
-    label_prefix: str = "",
 ):
     """Shared implementation of community detection + indexing.
 
@@ -1233,7 +1232,7 @@ async def _extract_community_core(
     doc_ids = graph.graph.get("source_id", [])
 
     now = asyncio.get_running_loop().time()
-    callback(msg=f"{label_prefix}Graph extracted {len(cr.structured_output)} communities in {now - start:.2f}s.")
+    callback(msg=f"Graph extracted {len(cr.structured_output)} communities in {now - start:.2f}s.")
     start = now
 
     if task_id and has_canceled(task_id):
@@ -1302,7 +1301,7 @@ async def _extract_community_core(
         raise TaskCanceledException(f"Task {task_id} was cancelled")
 
     now = asyncio.get_running_loop().time()
-    callback(msg=f"{label_prefix}Graph indexed {len(cr.structured_output)} communities in {now - start:.2f}s.")
+    callback(msg=f"Graph indexed {len(cr.structured_output)} communities in {now - start:.2f}s.")
     return community_structure, community_reports
 
 
@@ -1323,15 +1322,15 @@ async def extract_community_indexed(
     start = asyncio.get_running_loop().time()
     graph = await get_graph_from_index(tenant_id, kb_id)
     if graph is None or len(graph.nodes) == 0:
-        callback(msg="[P4] No graph found in index, skipping community extraction.")
+        logging.info("[P4] No graph found in index, skipping community extraction.")
         return [], []
 
-    callback(
-        msg=f"[P4] Loaded {len(graph.nodes)} nodes, {len(graph.edges)} edges from index "
-            f"for community detection in {asyncio.get_running_loop().time() - start:.2f}s."
+    logging.info(
+        "[P4] Loaded %d nodes, %d edges from index for community detection in %.2fs.",
+        len(graph.nodes), len(graph.edges), asyncio.get_running_loop().time() - start,
     )
     return await _extract_community_core(
-        graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id, label_prefix="[P4] "
+        graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id
     )
 
 
@@ -1357,12 +1356,12 @@ async def extract_community(
         # the full graph from index so Leiden sees the global topology.
         source_ids = graph.graph.get("source_id", []) if graph else []
         if len(source_ids) <= 1:
-            callback(msg="[P4] Incoming graph appears to be a delta; loading full graph from index.")
+            logging.info("[P4] Incoming graph appears to be a delta; loading full graph from index.")
             return await extract_community_indexed(
                 tenant_id, kb_id, llm_bdl, embed_bdl, callback, task_id=task_id
             )
         else:
-            callback(msg="[P4] Incoming graph appears complete; using it directly for community detection.")
+            logging.info("[P4] Incoming graph appears complete; using it directly for community detection.")
 
     return await _extract_community_core(
         graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id

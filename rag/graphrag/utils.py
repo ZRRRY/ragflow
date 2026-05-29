@@ -98,7 +98,7 @@ async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, labe
                 except asyncio.TimeoutError:
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
-                        logging.warning(f"Insert batch at offset {offset}/{total} attempt {attempt + 1} timed out, retrying in {wait}s")
+                        logging.warning("Insert batch at offset %d/%d attempt %d timed out, retrying in %ds", offset, total, attempt + 1, wait)
                         await asyncio.sleep(wait)
                     else:
                         raise
@@ -107,7 +107,7 @@ async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, labe
                 except Exception as e:
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
-                        logging.warning(f"Insert batch at offset {offset}/{total} attempt {attempt + 1} failed: {e}, retrying in {wait}s")
+                        logging.warning("Insert batch at offset %d/%d attempt %d failed: %s, retrying in %ds", offset, total, attempt + 1, e, wait)
                         # P5: record potential CAS / version conflicts for adaptive limiter
                         if current_limiter:
                             err_str = str(e).lower()
@@ -398,6 +398,7 @@ async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks):
         "source_id": meta["source_id"],
         "kb_id": kb_id,
         "available_int": 0,
+        "removed_kwd": "N",
     }
     chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
     ebd = get_embed_cache(embd_mdl.llm_name, ent_name)
@@ -594,6 +595,7 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
         "weight_int": int(meta["weight"]),
         "kb_id": kb_id,
         "available_int": 0,
+        "removed_kwd": "N",
     }
     chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
     txt = f"{from_ent_name}->{to_ent_name}"
@@ -673,14 +675,14 @@ async def get_graph_from_index(tenant_id, kb_id):
     # 1. Pull all entity chunks (paginated, same bounds as rebuild_graph)
     # ------------------------------------------------------------------
     ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
-    bs = 256
+    bs = 5000
     total_entities = 0
 
-    for i in range(0, 1024 * bs, bs):
+    for i in range(0, 1024 * 256, bs):
         es_res = await thread_pool_exec(
             settings.docStoreConn.search,
             ent_flds, [],
-            {"kb_id": kb_id, "knowledge_graph_kwd": ["entity"], "removed_kwd": "N"},
+            {"kb_id": kb_id, "knowledge_graph_kwd": ["entity"]},
             [], OrderByExpr(), i, bs,
             search.index_name(tenant_id), [kb_id],
         )
@@ -692,7 +694,10 @@ async def get_graph_from_index(tenant_id, kb_id):
             try:
                 meta = json.loads(d["content_with_weight"])
                 ent_name = d["entity_kwd"]
-                graph.add_node(ent_name, **meta)
+                if isinstance(ent_name, list):
+                    ent_name = ent_name[0] if ent_name else None
+                if ent_name:
+                    graph.add_node(ent_name, **meta)
                 total_entities += 1
                 for sid in meta.get("source_id", []):
                     seen_sources.add(sid)
@@ -726,7 +731,11 @@ async def get_graph_from_index(tenant_id, kb_id):
                 meta = json.loads(d["content_with_weight"])
                 from_node = d["from_entity_kwd"]
                 to_node = d["to_entity_kwd"]
-                if from_node in graph.nodes and to_node in graph.nodes:
+                if isinstance(from_node, list):
+                    from_node = from_node[0] if from_node else None
+                if isinstance(to_node, list):
+                    to_node = to_node[0] if to_node else None
+                if from_node and to_node and from_node in graph.nodes and to_node in graph.nodes:
                     graph.add_edge(from_node, to_node, **meta)
                     total_relations += 1
                 for sid in meta.get("source_id", []):
@@ -837,7 +846,7 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
     try:
         await asyncio.gather(*tasks, return_exceptions=False)
     except Exception as e:
-        logging.error(f"Error in get_embedding_of_nodes: {e}")
+        logging.error("Error in get_embedding_of_nodes: %s", e)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -856,7 +865,7 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
     try:
         await asyncio.gather(*tasks, return_exceptions=False)
     except Exception as e:
-        logging.error(f"Error in get_embedding_of_edges: {e}")
+        logging.error("Error in get_embedding_of_edges: %s", e)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -906,7 +915,7 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
                 except Exception as e:
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
-                        logging.warning(f"del_edges({from_node}, {to_node}) attempt {attempt + 1} failed: {e}, retrying in {wait}s")
+                        logging.warning("del_edges(%s, %s) attempt %d failed: %s, retrying in %ds", from_node, to_node, attempt + 1, e, wait)
                         await asyncio.sleep(wait)
                     else:
                         raise
@@ -918,7 +927,7 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
         try:
             await asyncio.gather(*tasks, return_exceptions=False)
         except Exception as e:
-            logging.error(f"Error while deleting edges: {e}")
+            logging.error("Error while deleting edges: %s", e)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -943,34 +952,21 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
     1. **No subgraph rewrite** – per-document subgraph checkpoints are already
        managed by ``generate_subgraph``; rewriting them here is redundant and
        expensive for large KBs.
-    2. **Graph JSON is still written** (shadow storage) so the legacy
-       ``get_graph_from_json`` path remains usable for instant rollback.
-       Only the *old* graph chunk is deleted, never subgraphs.
-    3. **Entity / relation chunks are still produced for the delta** so the
+    2. **No graph JSON shadow storage** – the monolithic graph JSON blob is
+       intentionally NOT rewritten because ``delta_graph`` only contains the
+       current document's nodes/edges.  Writing it would overwrite the global
+       graph with partial data.  The canonical graph is assembled on demand by
+       ``get_graph_from_index`` from the indexed entity/relation documents.
+    3. **Entity / relation chunks are produced for the delta** so the
        ``get_graph_from_index`` path can assemble a consistent graph.
     """
     global chat_limiter
     start = asyncio.get_running_loop().time()
 
     # ------------------------------------------------------------------
-    # 1. Shadow-storage graph JSON (deterministic id for stable overwrite)
+    # 1. Embeddings for the delta only
     # ------------------------------------------------------------------
-    graph_chunk_id = chunk_id({"content_with_weight": f"graph::{kb_id}", "kb_id": kb_id})
-    chunks = [
-        {
-            "id": graph_chunk_id,
-            "content_with_weight": json.dumps(nx.node_link_data(graph, edges="edges"), ensure_ascii=False),
-            "knowledge_graph_kwd": "graph",
-            "kb_id": kb_id,
-            "source_id": graph.graph.get("source_id", []),
-            "available_int": 0,
-            "removed_kwd": "N",
-        }
-    ]
-
-    # ------------------------------------------------------------------
-    # 2. Embeddings for the delta only
-    # ------------------------------------------------------------------
+    chunks = []
     tasks = []
     for ii, node in enumerate(change.added_updated_nodes):
         node_attrs = graph.nodes[node]
@@ -982,7 +978,7 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
     try:
         await asyncio.gather(*tasks, return_exceptions=False)
     except Exception as e:
-        logging.error(f"Error in get_embedding_of_nodes: {e}")
+        logging.error("Error in get_embedding_of_nodes: %s", e)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1001,7 +997,7 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
     try:
         await asyncio.gather(*tasks, return_exceptions=False)
     except Exception as e:
-        logging.error(f"Error in get_embedding_of edges: {e}")
+        logging.error("Error in get_embedding_of edges: %s", e)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1009,19 +1005,12 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
 
     now = asyncio.get_running_loop().time()
     if callback:
-        callback(msg=f"set_graph_delta converted graph change to {len(chunks)} chunks in {now - start:.2f}s.")
+        callback(msg=f"set_graph converted graph change to {len(chunks)} chunks in {now - start:.2f}s.")
     start = now
 
     # ------------------------------------------------------------------
-    # 3. Delete old shadow graph chunk (NOT subgraphs) + removed entities/edges
+    # 2. Delete removed entities/edges (graph JSON shadow storage is left alone)
     # ------------------------------------------------------------------
-    await thread_pool_exec(
-        settings.docStoreConn.delete,
-        {"knowledge_graph_kwd": ["graph"]},
-        search.index_name(tenant_id),
-        kb_id
-    )
-
     if change.removed_nodes:
         BATCH_SIZE = 100
         sorted_nodes = sorted(change.removed_nodes)
@@ -1050,7 +1039,7 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
                 except Exception as e:
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
-                        logging.warning(f"del_edges({from_node}, {to_node}) attempt {attempt + 1} failed: {e}, retrying in {wait}s")
+                        logging.warning("del_edges(%s, %s) attempt %d failed: %s, retrying in %ds", from_node, to_node, attempt + 1, e, wait)
                         await asyncio.sleep(wait)
                     else:
                         raise
@@ -1061,7 +1050,7 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
         try:
             await asyncio.gather(*tasks, return_exceptions=False)
         except Exception as e:
-            logging.error(f"Error while deleting edges: {e}")
+            logging.error("Error while deleting edges: %s", e)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1069,13 +1058,13 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
 
     del_now = asyncio.get_running_loop().time()
     if callback:
-        callback(msg=f"set_graph_delta removed {len(change.removed_nodes)} nodes and {len(change.removed_edges)} edges from index in {del_now - start:.2f}s.")
+        callback(msg=f"set_graph removed {len(change.removed_nodes)} nodes and {len(change.removed_edges)} edges from index in {del_now - start:.2f}s.")
     start = del_now
 
     await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert chunks")
     now = asyncio.get_running_loop().time()
     if callback:
-        callback(msg=f"set_graph_delta added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
+        callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
 
 
 async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
@@ -1144,7 +1133,7 @@ async def get_entity_type2samples(idxnms, kb_ids: list):
         try:
             smp = json.loads(smp)
         except Exception as e:
-            logging.exception(e)
+            logging.exception("Failed to parse entity type samples: %s", e)
 
         for ty, ents in smp.items():
             res[ty].extend(ents)
@@ -1165,8 +1154,8 @@ def flat_uniq_list(arr, key):
 async def rebuild_graph(tenant_id, kb_id, exclude_rebuild=None):
     graph = nx.Graph()
     flds = ["knowledge_graph_kwd", "content_with_weight", "source_id"]
-    bs = 256
-    for i in range(0, 1024 * bs, bs):
+    bs = 5000
+    for i in range(0, 1024 * 256, bs):
         es_res = await thread_pool_exec(
             settings.docStoreConn.search,
             flds, [], {"kb_id": kb_id, "knowledge_graph_kwd": ["subgraph"]},
