@@ -1443,7 +1443,7 @@ async def do_handle_task(task):
                     with_resolution=with_resolution,
                     with_community=with_community,
                 )
-                logging.info(f"GraphRAG task result for task {task}:\n{result}")
+                logging.info("GraphRAG task result for task %s:\n%s", task.get("id", "?"), result)
                 if isinstance(kg_limiter, AdaptiveConcurrencyLimiter):
                     kg_limiter.record_event_sync("success")
             except Exception as exc:
@@ -1760,7 +1760,7 @@ async def kg_postprocess_consumer():
     queue_name = GraphRAGConfig.KG_POSTPROCESS_QUEUE
     group_name = SVR_CONSUMER_GROUP_NAME + "_kg_pp"
     consumer_name = CONSUMER_NAME + "_kg_pp"
-    logging.info(f"[KG-PP] Consumer starting on {queue_name} (group={group_name})")
+    logging.info("[KG-PP] Consumer starting on %s (group=%s)", queue_name, group_name)
 
     while not stop_event.is_set():
         msg = None
@@ -1785,12 +1785,13 @@ async def kg_postprocess_consumer():
         task_language = payload.get("task_language", "English")
 
         logging.info(
-            f"[KG-PP] Processing kb={kb_id} task={task_id} resolution={with_resolution} community={with_community}"
+            "[KG-PP] Processing kb=%s task=%s resolution=%s community=%s",
+            kb_id, task_id, with_resolution, with_community,
         )
 
         try:
             if has_canceled(task_id):
-                logging.info(f"[KG-PP] kb={kb_id} task={task_id} has been cancelled, skipping")
+                logging.info("[KG-PP] kb=%s task=%s has been cancelled, skipping", kb_id, task_id)
                 msg.ack()
                 continue
 
@@ -1804,21 +1805,21 @@ async def kg_postprocess_consumer():
             from rag.graphrag.utils import get_graph
             final_graph = await get_graph(tenant_id, kb_id)
             if final_graph is None:
-                logging.error(f"[KG-PP] kb={kb_id} no persisted graph found, cannot proceed")
+                logging.error("[KG-PP] kb=%s no persisted graph found, cannot proceed", kb_id)
                 msg.ack()
                 continue
 
             # Simple logging callback (no frontend progress bar for async jobs)
             def pp_callback(msg=None, prog=None):
                 if msg:
-                    logging.info(f"[KG-PP] kb={kb_id}: {msg}")
+                    logging.info("[KG-PP] kb=%s: %s", kb_id, msg)
 
             # Lock per-KB so only one postprocess runs at a time
             kb_lock = RedisDistributedLock(f"graphrag_task_{kb_id}", lock_value="postprocess", timeout=3600)
             await kb_lock.spin_acquire()
             try:
                 if has_canceled(task_id):
-                    logging.info(f"[KG-PP] kb={kb_id} task={task_id} cancelled after lock acquire")
+                    logging.info("[KG-PP] kb=%s task=%s cancelled after lock acquire", kb_id, task_id)
                     msg.ack()
                     continue
 
@@ -1826,7 +1827,7 @@ async def kg_postprocess_consumer():
                 community_pending = with_community and not has_phase_marker(kb_id, PHASE_COMMUNITY)
 
                 if not resolution_pending and not community_pending:
-                    logging.info(f"[KG-PP] kb={kb_id} all phases already done")
+                    logging.info("[KG-PP] kb=%s all phases already done", kb_id)
                     msg.ack()
                     continue
 
@@ -1846,7 +1847,7 @@ async def kg_postprocess_consumer():
                             task_id=task_id,
                         )
                         set_phase_marker(kb_id, PHASE_RESOLUTION)
-                        logging.info(f"[KG-PP] kb={kb_id} resolution done")
+                        logging.info("[KG-PP] kb=%s resolution done", kb_id)
 
                     if community_pending:
                         from rag.graphrag.general.index import extract_community
@@ -1861,14 +1862,14 @@ async def kg_postprocess_consumer():
                             task_id=task_id,
                         )
                         set_phase_marker(kb_id, PHASE_COMMUNITY)
-                        logging.info(f"[KG-PP] kb={kb_id} community done")
+                        logging.info("[KG-PP] kb=%s community done", kb_id)
 
                 msg.ack()
-                logging.info(f"[KG-PP] kb={kb_id} postprocess complete")
+                logging.info("[KG-PP] kb=%s postprocess complete", kb_id)
             finally:
                 kb_lock.release()
-        except Exception as e:
-            logging.exception(f"[KG-PP] kb={kb_id} postprocess failed: {e}")
+        except Exception:
+            logging.exception("[KG-PP] kb=%s postprocess failed", kb_id)
             # Do NOT ack – let the message remain pending for retry / dead-letter inspection
 
 
@@ -1881,7 +1882,7 @@ async def main():
         # This spreads out connection attempts over several seconds
         startup_delay = worker_num * 2.0 + random.uniform(0, 0.5)
         if startup_delay > 0:
-            logging.info(f"Staggering startup by {startup_delay:.2f}s to prevent connection storm")
+            logging.info("Staggering startup by %.2fs to prevent connection storm", startup_delay)
             await asyncio.sleep(startup_delay)
     except (ValueError, IndexError):
         pass  # Non-standard consumer name, skip delay

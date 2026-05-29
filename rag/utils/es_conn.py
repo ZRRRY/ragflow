@@ -256,12 +256,22 @@ class ESConnection(ESConnectionBase):
 
         has_dense = any(isinstance(m, MatchDenseExpr) for m in match_expressions)
         has_explicit_sort = bool(order_by and order_by.fields)
-        use_search_after = (
+        needs_deep_pagination = (
             limit > 0
             and (offset + limit > MAX_RESULT_WINDOW)
-            and has_explicit_sort
             and not has_dense
         )
+
+        use_search_after = False
+        if needs_deep_pagination:
+            if has_explicit_sort:
+                use_search_after = True
+            else:
+                # No explicit sort but deep pagination needed.
+                # Use document 'id' (keyword) instead of '_id' because
+                # _id fielddata is disallowed by default in ES.
+                s = s.sort({"id.keyword": {"order": "asc", "unmapped_type": "keyword"}})
+                use_search_after = True
 
         if limit > 0 and not use_search_after:
             s = s[offset:offset + limit]
