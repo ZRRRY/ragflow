@@ -911,7 +911,7 @@ class SILICONFLOWEmbed(Base):
                 "input": texts_batch,
                 "encoding_format": "float",
             }
-            response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=30)
+            response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=120)
             try:
                 res = response.json()
                 ress.extend([d["embedding"] for d in res["data"]])
@@ -928,7 +928,7 @@ class SILICONFLOWEmbed(Base):
             "input": text,
             "encoding_format": "float",
         }
-        response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=30)
+        response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=120)
         try:
             res = response.json()
             return np.array(res["data"][0]["embedding"]), total_token_count_from_response(res)
