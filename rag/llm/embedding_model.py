@@ -15,7 +15,9 @@
 #
 import json
 import os
+import random
 import threading
+import time
 from abc import ABC
 from contextlib import contextmanager
 from urllib.parse import urljoin
@@ -894,6 +896,54 @@ class SILICONFLOWEmbed(Base):
         self.base_url = normalized_base_url
         self.model_name = model_name
 
+    _MAX_RETRIES = 3
+    _RETRYABLE_EXCEPTIONS = (
+        requests.exceptions.SSLError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ReadTimeout,
+        requests.exceptions.ChunkedEncodingError,
+    )
+
+    def _post_with_retry(self, payload: dict) -> requests.Response:
+        """Send POST with exponential backoff on network/SSL errors."""
+        last_exc = None
+        for attempt in range(self._MAX_RETRIES + 1):
+            try:
+                response = requests.post(
+                    self.base_url, json=payload, headers=self.headers, timeout=120
+                )
+                # Also retry on 5xx / 429 to be safe
+                if response.status_code >= 500 or response.status_code == 429:
+                    if attempt < self._MAX_RETRIES:
+                        delay = (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(
+                            "[SILICONFLOW] HTTP %s on attempt %d/%d, retrying in %.2fs",
+                            response.status_code,
+                            attempt + 1,
+                            self._MAX_RETRIES + 1,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                return response
+            except self._RETRYABLE_EXCEPTIONS as exc:
+                last_exc = exc
+                if attempt < self._MAX_RETRIES:
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        "[SILICONFLOW] %s on attempt %d/%d, retrying in %.2fs: %s",
+                        type(exc).__name__,
+                        attempt + 1,
+                        self._MAX_RETRIES + 1,
+                        delay,
+                        exc,
+                    )
+                    time.sleep(delay)
+                else:
+                    break
+        raise last_exc if last_exc else Exception("Max retries exceeded")
+
     def encode(self, texts: list):
         batch_size = 16
         ress = []
@@ -911,7 +961,7 @@ class SILICONFLOWEmbed(Base):
                 "input": texts_batch,
                 "encoding_format": "float",
             }
-            response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=120)
+            response = self._post_with_retry(payload)
             try:
                 res = response.json()
                 ress.extend([d["embedding"] for d in res["data"]])
@@ -928,7 +978,7 @@ class SILICONFLOWEmbed(Base):
             "input": text,
             "encoding_format": "float",
         }
-        response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=120)
+        response = self._post_with_retry(payload)
         try:
             res = response.json()
             return np.array(res["data"][0]["embedding"]), total_token_count_from_response(res)
