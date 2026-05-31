@@ -37,6 +37,10 @@ DEFAULT_RECORD_DELIMITER = "##"
 DEFAULT_ENTITY_INDEX_DELIMITER = "<|>"
 DEFAULT_RESOLUTION_RESULT_DELIMITER = "&&"
 
+# Entity types that should skip resolution (book and chapter nodes are
+# intentionally kept separate even if they share names across documents).
+EXCLUDED_RESOLUTION_TYPES = {"书籍", "章节"}
+
 
 @dataclass
 class EntityResolutionResult:
@@ -88,11 +92,17 @@ class EntityResolution(Extractor):
         }
 
         nodes = sorted(graph.nodes())
-        entity_types = sorted(set(graph.nodes[node].get('entity_type', '-') for node in nodes))
+        entity_types = sorted({
+            graph.nodes[node].get('entity_type', '-')
+            for node in nodes
+            if graph.nodes[node].get('entity_type') not in EXCLUDED_RESOLUTION_TYPES
+        })
         node_clusters = {entity_type: [] for entity_type in entity_types}
 
         for node in nodes:
-            node_clusters[graph.nodes[node].get('entity_type', '-')].append(node)
+            ent_type = graph.nodes[node].get('entity_type', '-')
+            if ent_type not in EXCLUDED_RESOLUTION_TYPES:
+                node_clusters[ent_type].append(node)
 
         candidate_resolution = {entity_type: [] for entity_type in entity_types}
         for k, v in node_clusters.items():

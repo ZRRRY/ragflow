@@ -25,7 +25,7 @@ from api.db.services.document_service import DocumentService
 from api.db.services.task_service import has_canceled
 from common.exceptions import TaskCanceledException
 from common.connection_utils import timeout
-from rag.graphrag.entity_resolution import EntityResolution
+from rag.graphrag.entity_resolution import EntityResolution, EXCLUDED_RESOLUTION_TYPES
 from rag.graphrag.general.community_reports_extractor import CommunityReportsExtractor
 from rag.graphrag.general.extractor import Extractor
 from rag.graphrag.general.graph_extractor import GraphExtractor as GeneralKGExt
@@ -1047,7 +1047,7 @@ async def resolve_entities_incremental(
     all_local_graphs = []
 
     for ent_type, new_nodes in new_nodes_by_type.items():
-        if not new_nodes:
+        if not new_nodes or ent_type in EXCLUDED_RESOLUTION_TYPES:
             continue
 
         # 3. Query existing nodes of the same type
