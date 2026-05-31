@@ -797,6 +797,129 @@ async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
     return await get_graph_from_json(tenant_id, kb_id, exclude_rebuild)
 
 
+async def _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback=None):
+    """Batch-embed nodes and append chunks. Replaces the per-node asyncio.gather pattern."""
+    if not change.added_updated_nodes:
+        return
+
+    items = []
+    for node in change.added_updated_nodes:
+        node_attrs = graph.nodes[node]
+        chunk = {
+            "id": get_uuid(),
+            "important_kwd": [node],
+            "title_tks": rag_tokenizer.tokenize(node),
+            "entity_kwd": node,
+            "knowledge_graph_kwd": "entity",
+            "entity_type_kwd": node_attrs.get("entity_type", ""),
+            "content_with_weight": json.dumps(node_attrs, ensure_ascii=False),
+            "content_ltks": rag_tokenizer.tokenize(node_attrs.get("description", "")),
+            "source_id": node_attrs.get("source_id", []),
+            "kb_id": kb_id,
+            "available_int": 0,
+            "removed_kwd": "N",
+        }
+        chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
+        items.append((chunk, node, node))
+
+    await _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label="nodes")
+
+
+async def _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback=None):
+    """Batch-embed edges and append chunks. Replaces the per-edge asyncio.gather pattern."""
+    if not change.added_updated_edges:
+        return
+
+    items = []
+    for from_node, to_node in change.added_updated_edges:
+        edge_attrs = graph.get_edge_data(from_node, to_node)
+        if not edge_attrs:
+            continue
+        chunk = {
+            "id": get_uuid(),
+            "from_entity_kwd": from_node,
+            "to_entity_kwd": to_node,
+            "knowledge_graph_kwd": "relation",
+            "content_with_weight": json.dumps(edge_attrs, ensure_ascii=False),
+            "content_ltks": rag_tokenizer.tokenize(edge_attrs.get("description", "")),
+            "important_kwd": edge_attrs.get("keywords", []),
+            "source_id": edge_attrs.get("source_id", []),
+            "weight_int": int(edge_attrs.get("weight", 0)),
+            "kb_id": kb_id,
+            "available_int": 0,
+            "removed_kwd": "N",
+        }
+        chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
+        cache_key = f"{from_node}->{to_node}"
+        embed_text = f"{cache_key}: {edge_attrs.get('description', '')}"
+        items.append((chunk, cache_key, embed_text))
+
+    await _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label="edges")
+
+
+async def _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label):
+    """Shared batch embedding logic with cache lookup and batch API calls.
+
+    Batches are executed concurrently up to ``chat_limiter`` (default 10) so
+    throughput is batch_size × concurrency.
+    """
+    if not items:
+        return
+
+    missed_indices = []
+    missed_texts = []
+    embeddings = [None] * len(items)
+
+    for idx, (_, cache_key, embed_text) in enumerate(items):
+        ebd = get_embed_cache(embd_mdl.llm_name, cache_key)
+        if ebd is not None:
+            embeddings[idx] = ebd
+        else:
+            missed_indices.append(idx)
+            missed_texts.append(embed_text)
+
+    if missed_texts:
+        batch_size = 32
+        total = len(missed_texts)
+
+        async def _embed_one_batch(i):
+            async with chat_limiter:
+                if callback:
+                    callback(msg=f"Get embedding of {label}: {i}/{total}")
+                batch = missed_texts[i:i + batch_size]
+                ebd_arr, _ = await asyncio.wait_for(
+                    thread_pool_exec(embd_mdl.encode, batch),
+                    timeout=30000000,
+                )
+                return i, ebd_arr
+
+        tasks = []
+        for i in range(0, total, batch_size):
+            tasks.append(asyncio.create_task(_embed_one_batch(i)))
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+        except Exception as e:
+            logging.error("Error in batch embedding of %s: %s", label, e)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        for i, ebd_arr in results:
+            for j, ebd in enumerate(ebd_arr):
+                global_idx = missed_indices[i + j]
+                embeddings[global_idx] = ebd
+                _, cache_key, _ = items[global_idx]
+                set_embed_cache(embd_mdl.llm_name, cache_key, ebd)
+
+    for idx, (chunk, _, _) in enumerate(items):
+        ebd = embeddings[idx]
+        assert ebd is not None
+        chunk["q_%d_vec" % len(ebd)] = ebd
+        chunks.append(chunk)
+
+
 async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
     global chat_limiter
     start = asyncio.get_running_loop().time()
@@ -835,41 +958,9 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
             }
         )
 
-    tasks = []
-    for ii, node in enumerate(change.added_updated_nodes):
-        node_attrs = graph.nodes[node]
-        tasks.append(asyncio.create_task(
-            graph_node_to_chunk(kb_id, embd_mdl, node, node_attrs, chunks)
-        ))
-        if ii % 100 == 9 and callback:
-            callback(msg=f"Get embedding of nodes: {ii}/{len(change.added_updated_nodes)}")
-    try:
-        await asyncio.gather(*tasks, return_exceptions=False)
-    except Exception as e:
-        logging.error("Error in get_embedding_of_nodes: %s", e)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
 
-    tasks = []
-    for ii, (from_node, to_node) in enumerate(change.added_updated_edges):
-        edge_attrs = graph.get_edge_data(from_node, to_node)
-        if not edge_attrs:
-            continue
-        tasks.append(asyncio.create_task(
-            graph_edge_to_chunk(kb_id, embd_mdl, from_node, to_node, edge_attrs, chunks)
-        ))
-        if ii % 100 == 9 and callback:
-            callback(msg=f"Get embedding of edges: {ii}/{len(change.added_updated_edges)}")
-    try:
-        await asyncio.gather(*tasks, return_exceptions=False)
-    except Exception as e:
-        logging.error("Error in get_embedding_of_edges: %s", e)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    await _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback)
+    await _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback)
 
     now = asyncio.get_running_loop().time()
     if callback:
@@ -965,43 +1056,9 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
 
     # ------------------------------------------------------------------
     # 1. Embeddings for the delta only
-    # ------------------------------------------------------------------
     chunks = []
-    tasks = []
-    for ii, node in enumerate(change.added_updated_nodes):
-        node_attrs = graph.nodes[node]
-        tasks.append(asyncio.create_task(
-            graph_node_to_chunk(kb_id, embd_mdl, node, node_attrs, chunks)
-        ))
-        if ii % 100 == 9 and callback:
-            callback(msg=f"Get embedding of nodes: {ii}/{len(change.added_updated_nodes)}")
-    try:
-        await asyncio.gather(*tasks, return_exceptions=False)
-    except Exception as e:
-        logging.error("Error in get_embedding_of_nodes: %s", e)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-    tasks = []
-    for ii, (from_node, to_node) in enumerate(change.added_updated_edges):
-        edge_attrs = graph.get_edge_data(from_node, to_node)
-        if not edge_attrs:
-            continue
-        tasks.append(asyncio.create_task(
-            graph_edge_to_chunk(kb_id, embd_mdl, from_node, to_node, edge_attrs, chunks)
-        ))
-        if ii % 100 == 9 and callback:
-            callback(msg=f"Get embedding of edges: {ii}/{len(change.added_updated_edges)}")
-    try:
-        await asyncio.gather(*tasks, return_exceptions=False)
-    except Exception as e:
-        logging.error("Error in get_embedding_of edges: %s", e)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    await _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback)
+    await _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback)
 
     now = asyncio.get_running_loop().time()
     if callback:
@@ -1010,6 +1067,7 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
 
     # ------------------------------------------------------------------
     # 2. Delete removed entities/edges (graph JSON shadow storage is left alone)
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     if change.removed_nodes:
         BATCH_SIZE = 100
