@@ -233,7 +233,7 @@ function CheckboxFormMultiple({
                           parent={{
                             ...x,
                             id: x.field,
-                            field: ``,
+                            field: x.field,
                           }}
                         />
                       </div>

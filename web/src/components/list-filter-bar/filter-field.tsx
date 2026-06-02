@@ -148,7 +148,10 @@ export const FilterField = memo(
                       item={child}
                       parent={{
                         ...item,
-                        field: `${parent.field}.${item.field}`,
+                        field:
+                          child.list && child.list.length > 0
+                            ? `${parent.field}.${item.field}`
+                            : parent.field,
                       }}
                       level={level + 1}
                     />

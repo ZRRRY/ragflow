@@ -48,6 +48,7 @@ services:
       - ./entrypoint.sh:/ragflow/entrypoint.sh
       - ../rag:/ragflow/rag
       - ../api:/ragflow/api
+      - ../web/dist:/ragflow/web/dist
     env_file: .env
     networks:
       - ragflow
@@ -97,6 +98,7 @@ services:
       - ./service_conf.yaml.template:/ragflow/conf/service_conf.yaml.template
       - ./entrypoint.sh:/ragflow/entrypoint.sh
       - ../rag:/ragflow/rag
+      - ../web/dist:/ragflow/web/dist
     env_file: .env
     networks:
       - ragflow

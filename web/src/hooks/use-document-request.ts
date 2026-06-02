@@ -155,7 +155,7 @@ export const useFetchDocumentList = (loop = true) => {
         },
         {
           suffix: filterValue.type as string[],
-          run_status: run as string[],
+          run: run as string[],
           return_empty_metadata: returnEmptyMetadata,
           metadata: filterValue.metadata as Record<string, string[]>,
         },
