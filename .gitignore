@@ -235,3 +235,7 @@ bin/*
 .claude/settings.local.json
 # Ignore Markdown files in root directory only
 /*.md
+
+# Ignore local agent and playwright-mcp directories
+.agents/
+.playwright-mcp/
