@@ -50,6 +50,11 @@ services:
       - ../rag:/ragflow/rag
       - ../api:/ragflow/api
       - ../web/dist:/ragflow/web/dist
+      - ../tools/scripts:/ragflow/tools/scripts
+      - ../common:/ragflow/common
+      - ../agent:/ragflow/agent
+      - ../deepdoc:/ragflow/deepdoc
+      - ../memory:/ragflow/memory
     env_file: .env
     networks:
       - ragflow
@@ -100,6 +105,11 @@ services:
       - ./entrypoint.sh:/ragflow/entrypoint.sh
       - ../rag:/ragflow/rag
       - ../web/dist:/ragflow/web/dist
+      - ../tools/scripts:/ragflow/tools/scripts
+      - ../common:/ragflow/common
+      - ../agent:/ragflow/agent
+      - ../deepdoc:/ragflow/deepdoc
+      - ../memory:/ragflow/memory
     env_file: .env
     networks:
       - ragflow
