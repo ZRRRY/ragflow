@@ -626,7 +626,7 @@ func (s *FileService) deleteSingleFile(ctx context.Context, file *entity.File) e
 				}
 
 				// Delete document record
-				if err := documentDAO.Delete(docID); err != nil {
+				if _, err := documentDAO.Delete(docID); err != nil {
 					common.Logger.Error(fmt.Sprintf("Fail to delete document: %s, error: %v", docID, err))
 				}
 			}
@@ -662,7 +662,7 @@ func (s *FileService) deleteDocumentFromEngine(ctx context.Context, doc *entity.
 	reqCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 	condition := map[string]interface{}{"doc_id": doc.ID}
-	if _, err := docEngine.Delete(reqCtx, condition, indexName, doc.KbID); err != nil {
+	if _, err := docEngine.DeleteChunks(reqCtx, condition, indexName, doc.KbID); err != nil {
 		return fmt.Errorf("delete document from engine: %w", err)
 	}
 	return nil

@@ -79,6 +79,7 @@ type OCRFileResponse struct {
 }
 
 type ParseFileResponse struct {
+	TaskID string `json:"task_id"`
 }
 
 type ListTaskStatus struct {
@@ -129,8 +130,9 @@ type ChatConfig struct {
 }
 
 type APIConfig struct {
-	ApiKey *string
-	Region *string
+	ApiKey  *string
+	Region  *string
+	BaseURL *string
 }
 
 type EmbeddingConfig struct {

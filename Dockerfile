@@ -55,7 +55,7 @@ RUN mkdir -p /usr/share/infinity/resource && \
     cp -r /tmp/resource/* /usr/share/infinity/resource && \
     rm -rf /tmp/resource
 
-ARG NGINX_VERSION=1.29.5-1~noble
+ARG NGINX_VERSION=1.31.0-1~noble
 RUN --mount=type=cache,id=ragflow_apt,target=/var/cache/apt,sharing=locked \
     mkdir -p /etc/apt/keyrings && \
     curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg && \
@@ -146,6 +146,7 @@ RUN --mount=type=cache,id=ragflow_uv,target=/root/.cache/uv,sharing=locked \
         sed -i 's|pypi.org|mirrors.aliyun.com/pypi|g' uv.lock; \
     else \
         sed -i 's|mirrors.aliyun.com/pypi|pypi.org|g' uv.lock; \
+        sed -i 's|gitee.com|github.com|g' uv.lock; \
     fi; \
     uv sync --python 3.13 --frozen && \
     # Ensure pip is available in the venv for runtime package installation (fixes #12651)
@@ -189,6 +190,7 @@ COPY mcp mcp
 COPY common common
 COPY memory memory
 COPY bin bin
+COPY tools/scripts tools/scripts
 
 COPY docker/service_conf.yaml.template ./conf/service_conf.yaml.template
 COPY docker/entrypoint.sh ./

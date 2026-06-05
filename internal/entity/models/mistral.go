@@ -30,30 +30,12 @@ import (
 )
 
 // MistralModel implements ModelDriver for Mistral AI.
-//
-// Mistral exposes an OpenAI-compatible REST API at https://api.mistral.ai/v1
-// (chat completions at /chat/completions, list models at /models). The wire
-// shape matches OpenAI closely enough that the chat path here is a direct
-// port of the OpenAI driver, with the differences kept small on purpose:
-// no reasoning_content pass-through (Mistral does not expose one), and a
-// distinct Name() so the factory can route to this driver.
+
 type MistralModel struct {
-	BaseURL    map[string]string
-	URLSuffix  URLSuffix
-	httpClient *http.Client
+	baseModel BaseModel
 }
 
 // NewMistralModel creates a new Mistral model instance.
-//
-// We clone http.DefaultTransport so we keep Go's defaults for
-// ProxyFromEnvironment, DialContext (with KeepAlive), HTTP/2,
-// TLSHandshakeTimeout, and ExpectContinueTimeout, and only override
-// the connection-pool fields we care about.
-//
-// The Client itself has no Timeout. http.Client.Timeout would also
-// cap the time spent reading the response body, which would cut off
-// long-lived SSE streams in ChatStreamlyWithSender. Non-streaming
-// callers wrap each request with context.WithTimeout instead.
 func NewMistralModel(baseURL map[string]string, urlSuffix URLSuffix) *MistralModel {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
@@ -63,54 +45,40 @@ func NewMistralModel(baseURL map[string]string, urlSuffix URLSuffix) *MistralMod
 	transport.ResponseHeaderTimeout = 60 * time.Second
 
 	return &MistralModel{
-		BaseURL:   baseURL,
-		URLSuffix: urlSuffix,
-		httpClient: &http.Client{
-			Transport: transport,
+		baseModel: BaseModel{
+			BaseURL:   baseURL,
+			URLSuffix: urlSuffix,
+			httpClient: &http.Client{
+				Transport: transport,
+			},
 		},
 	}
 }
 
 func (m *MistralModel) NewInstance(baseURL map[string]string) ModelDriver {
-	return NewMistralModel(baseURL, m.URLSuffix)
+	return NewMistralModel(baseURL, m.baseModel.URLSuffix)
 }
 
 func (m *MistralModel) Name() string {
 	return "mistral"
 }
 
-// baseURLForRegion returns the base URL for the given region, or an
-// error if no entry exists. This makes a misconfigured region fail
-// fast with a clear message, instead of silently producing a relative
-// URL that the HTTP transport then rejects.
-func (m *MistralModel) baseURLForRegion(region string) (string, error) {
-	base, ok := m.BaseURL[region]
-	if !ok || base == "" {
-		return "", fmt.Errorf("mistral: no base URL configured for region %q", region)
-	}
-	return base, nil
-}
-
 // ChatWithMessages sends multiple messages with roles and returns the response.
 func (m *MistralModel) ChatWithMessages(modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig) (*ChatResponse, error) {
-	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
-		return nil, fmt.Errorf("api key is required")
+	if err := m.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
 	}
 
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("messages is empty")
 	}
 
-	region := "default"
-	if apiConfig.Region != nil && *apiConfig.Region != "" {
-		region = *apiConfig.Region
-	}
-
-	baseURL, err := m.baseURLForRegion(region)
+	baseURL, err := m.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return nil, err
 	}
-	url := fmt.Sprintf("%s/%s", baseURL, m.URLSuffix.Chat)
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := fmt.Sprintf("%s/%s", baseURL, m.baseModel.URLSuffix.Chat)
 
 	apiMessages := make([]map[string]interface{}, len(messages))
 	for i, msg := range messages {
@@ -160,7 +128,7 @@ func (m *MistralModel) ChatWithMessages(modelName string, messages []Message, ap
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := m.httpClient.Do(req)
+	resp, err := m.baseModel.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -195,22 +163,65 @@ func (m *MistralModel) ChatWithMessages(modelName string, messages []Message, ap
 		return nil, fmt.Errorf("invalid message format")
 	}
 
-	content, ok := messageMap["content"].(string)
-	if !ok {
-		return nil, fmt.Errorf("invalid content format")
+	content, reasonContent, err := extractMistralContent(messageMap["content"])
+	if err != nil {
+		return nil, err
 	}
 
-	emptyReason := ""
 	return &ChatResponse{
 		Answer:        &content,
-		ReasonContent: &emptyReason,
+		ReasonContent: &reasonContent,
 	}, nil
 }
 
-// ChatStreamlyWithSender sends messages and streams the response via the
-// sender function. The Mistral SSE stream uses the same shape as OpenAI:
-// "data:" lines carrying JSON events, with a final "[DONE]" line.
+func extractMistralContent(raw interface{}) (string, string, error) {
+	switch v := raw.(type) {
+	case string:
+		return v, "", nil
+	case []interface{}:
+		var answer, reasoning strings.Builder
+		for _, part := range v {
+			pm, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch pm["type"] {
+			case "text":
+				if t, ok := pm["text"].(string); ok {
+					answer.WriteString(t)
+				}
+			case "thinking":
+				// thinking is an array of inner text parts; concatenate
+				// any inner element with a non-empty text field.
+				inner, ok := pm["thinking"].([]interface{})
+				if !ok {
+					continue
+				}
+				for _, sub := range inner {
+					sm, ok := sub.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					if t, ok := sm["text"].(string); ok {
+						reasoning.WriteString(t)
+					}
+				}
+			}
+		}
+		return answer.String(), reasoning.String(), nil
+	case nil:
+		return "", "", nil
+	default:
+		return "", "", fmt.Errorf("mistral: unsupported content type %T", raw)
+	}
+}
+
+// ChatStreamlyWithSender sends messages and streams the response
 func (m *MistralModel) ChatStreamlyWithSender(modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig, sender func(*string, *string) error) error {
+	if err := m.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return err
+	}
+
 	if sender == nil {
 		return fmt.Errorf("sender is required")
 	}
@@ -219,20 +230,12 @@ func (m *MistralModel) ChatStreamlyWithSender(modelName string, messages []Messa
 		return fmt.Errorf("messages is empty")
 	}
 
-	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
-		return fmt.Errorf("api key is required")
-	}
-
-	var region = "default"
-	if apiConfig.Region != nil && *apiConfig.Region != "" {
-		region = *apiConfig.Region
-	}
-
-	baseURL, err := m.baseURLForRegion(region)
+	baseURL, err := m.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return err
 	}
-	url := fmt.Sprintf("%s/%s", baseURL, m.URLSuffix.Chat)
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := fmt.Sprintf("%s/%s", baseURL, m.baseModel.URLSuffix.Chat)
 
 	apiMessages := make([]map[string]interface{}, len(messages))
 	for i, msg := range messages {
@@ -249,10 +252,6 @@ func (m *MistralModel) ChatStreamlyWithSender(modelName string, messages []Messa
 	}
 
 	if chatModelConfig != nil {
-		// Refuse to run if the caller explicitly asked for stream=false.
-		// The body of this method only knows how to read SSE, so a
-		// non-SSE JSON response would be parsed as if it were a stream
-		// and produce no chunks. Better to fail clearly.
 		if chatModelConfig.Stream != nil && !*chatModelConfig.Stream {
 			return fmt.Errorf("stream must be true in ChatStreamlyWithSender")
 		}
@@ -276,9 +275,6 @@ func (m *MistralModel) ChatStreamlyWithSender(modelName string, messages []Messa
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Use an explicit background context. SSE streams are long-lived
-	// so we do not attach a hard deadline here; the transport's
-	// ResponseHeaderTimeout caps the connection-establishment phase.
 	req, err := http.NewRequestWithContext(context.Background(), "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -287,7 +283,7 @@ func (m *MistralModel) ChatStreamlyWithSender(modelName string, messages []Messa
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := m.httpClient.Do(req)
+	resp, err := m.baseModel.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
@@ -378,32 +374,26 @@ type mistralEmbeddingResponse struct {
 	Object string                 `json:"object"`
 }
 
-// Embed turns a list of texts into embedding vectors using the
-// Mistral /v1/embeddings endpoint (mistral-embed). The output has
-// one vector per input, in the same order the inputs were given.
+// Embed turns a list of texts into embedding vectors
 func (m *MistralModel) Embed(modelName *string, texts []string, apiConfig *APIConfig, embeddingConfig *EmbeddingConfig) ([]EmbeddingData, error) {
-	if len(texts) == 0 {
-		return []EmbeddingData{}, nil
+	if err := m.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
 	}
 
-	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
-		return nil, fmt.Errorf("api key is required")
+	if len(texts) == 0 {
+		return []EmbeddingData{}, nil
 	}
 
 	if modelName == nil || *modelName == "" {
 		return nil, fmt.Errorf("model name is required")
 	}
 
-	region := "default"
-	if apiConfig.Region != nil && *apiConfig.Region != "" {
-		region = *apiConfig.Region
-	}
-
-	baseURL, err := m.baseURLForRegion(region)
+	baseURL, err := m.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return nil, err
 	}
-	url := fmt.Sprintf("%s/%s", baseURL, m.URLSuffix.Embedding)
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := fmt.Sprintf("%s/%s", baseURL, m.baseModel.URLSuffix.Embedding)
 
 	reqBody := map[string]interface{}{
 		"model": *modelName,
@@ -426,7 +416,7 @@ func (m *MistralModel) Embed(modelName *string, texts []string, apiConfig *APICo
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := m.httpClient.Do(req)
+	resp, err := m.baseModel.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -446,10 +436,6 @@ func (m *MistralModel) Embed(modelName *string, texts []string, apiConfig *APICo
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Reorder the returned vectors by their reported index so the output
-	// always lines up with the input texts, even if the upstream API ever
-	// returns items out of order. A nil slot at the end indicates the
-	// upstream did not return an embedding for that input.
 	embeddings := make([]EmbeddingData, len(texts))
 	filled := make([]bool, len(texts))
 	for _, item := range parsed.Data {
@@ -457,9 +443,6 @@ func (m *MistralModel) Embed(modelName *string, texts []string, apiConfig *APICo
 			return nil, fmt.Errorf("mistral: response index %d out of range for %d inputs", item.Index, len(texts))
 		}
 		if filled[item.Index] {
-			// A malformed response that repeats the same index would
-			// silently overwrite the earlier vector. Fail loudly so
-			// the caller never uses ambiguous output.
 			return nil, fmt.Errorf("mistral: duplicate embedding index %d in response", item.Index)
 		}
 		embeddings[item.Index] = EmbeddingData{
@@ -479,20 +462,16 @@ func (m *MistralModel) Embed(modelName *string, texts []string, apiConfig *APICo
 
 // ListModels returns the list of model ids visible to the API key.
 func (m *MistralModel) ListModels(apiConfig *APIConfig) ([]string, error) {
-	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
-		return nil, fmt.Errorf("api key is required")
+	if err := m.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
 	}
 
-	region := "default"
-	if apiConfig.Region != nil && *apiConfig.Region != "" {
-		region = *apiConfig.Region
-	}
-
-	baseURL, err := m.baseURLForRegion(region)
+	baseURL, err := m.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return nil, err
 	}
-	url := fmt.Sprintf("%s/%s", baseURL, m.URLSuffix.Models)
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := fmt.Sprintf("%s/%s", baseURL, m.baseModel.URLSuffix.Models)
 
 	ctx, cancel := context.WithTimeout(context.Background(), nonStreamCallTimeout)
 	defer cancel()
@@ -504,7 +483,7 @@ func (m *MistralModel) ListModels(apiConfig *APIConfig) ([]string, error) {
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := m.httpClient.Do(req)
+	resp, err := m.baseModel.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -547,7 +526,7 @@ func (m *MistralModel) ListModels(apiConfig *APIConfig) ([]string, error) {
 
 // Balance is not exposed by the Mistral API, so this returns "no such method".
 func (m *MistralModel) Balance(apiConfig *APIConfig) (map[string]interface{}, error) {
-	return nil, fmt.Errorf("no such method")
+	return nil, fmt.Errorf("%s, no such method", m.Name())
 }
 
 // CheckConnection runs a lightweight ListModels call to verify the API key.
@@ -559,42 +538,44 @@ func (m *MistralModel) CheckConnection(apiConfig *APIConfig) error {
 	return nil
 }
 
-// Rerank calculates similarity scores between query and documents. Mistral
-// does not expose a public rerank API, so this returns "no such method".
+// Rerank calculates similarity scores between query and documents
 func (m *MistralModel) Rerank(modelName *string, query string, documents []string, apiConfig *APIConfig, rerankConfig *RerankConfig) (*RerankResponse, error) {
-	return nil, fmt.Errorf("no such method")
+	return nil, fmt.Errorf("%s, no such method", m.Name())
 }
 
 // TranscribeAudio transcribe audio
-func (z *MistralModel) TranscribeAudio(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig) (*ASRResponse, error) {
-	return nil, fmt.Errorf("%s, no such method", z.Name())
+func (m *MistralModel) TranscribeAudio(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig) (*ASRResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", m.Name())
 }
 
-func (z *MistralModel) TranscribeAudioWithSender(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig, sender func(*string, *string) error) error {
-	return fmt.Errorf("%s, no such method", z.Name())
+func (m *MistralModel) TranscribeAudioWithSender(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig, sender func(*string, *string) error) error {
+	return fmt.Errorf("%s, no such method", m.Name())
 }
 
 // AudioSpeech convert text to audio
-func (z *MistralModel) AudioSpeech(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig) (*TTSResponse, error) {
-	return nil, fmt.Errorf("%s, no such method", z.Name())
+func (m *MistralModel) AudioSpeech(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig) (*TTSResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", m.Name())
 }
 
-func (z *MistralModel) AudioSpeechWithSender(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig, sender func(*string, *string) error) error {
-	return fmt.Errorf("%s, no such method", z.Name())
+func (m *MistralModel) AudioSpeechWithSender(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig, sender func(*string, *string) error) error {
+	return fmt.Errorf("%s, no such method", m.Name())
 }
 
 // OCRFile OCR file
-func (z *MistralModel) OCRFile(modelName *string, content []byte, urls *string, apiConfig *APIConfig, ocrConfig *OCRConfig) (*OCRFileResponse, error) {
+func (m *MistralModel) OCRFile(modelName *string, content []byte, urls *string, apiConfig *APIConfig, ocrConfig *OCRConfig) (*OCRFileResponse, error) {
+	if err := m.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
+	}
+
 	if (urls == nil || *urls == "") && (content == nil || len(content) == 0) {
 		return nil, fmt.Errorf("file url or content is required")
 	}
 
-	region := "default"
-	if apiConfig.Region != nil && *apiConfig.Region != "" {
-		region = *apiConfig.Region
+	resolvedBaseURL, err := m.baseModel.GetBaseURL(apiConfig)
+	if err != nil {
+		return nil, err
 	}
-
-	url := fmt.Sprintf("%s/%s", z.BaseURL[region], z.URLSuffix.OCR)
+	url := fmt.Sprintf("%s/%s", resolvedBaseURL, m.baseModel.URLSuffix.OCR)
 
 	var docURL string
 	if urls != nil && *urls != "" {
@@ -629,7 +610,7 @@ func (z *MistralModel) OCRFile(modelName *string, content []byte, urls *string, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := z.httpClient.Do(req)
+	resp, err := m.baseModel.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -668,15 +649,14 @@ func (z *MistralModel) OCRFile(modelName *string, content []byte, urls *string, 
 	}, nil
 }
 
-func (z *MistralModel) ParseFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, parseFileConfig *ParseFileConfig) (*ParseFileResponse, error) {
-	//TODO implement me
-	panic("implement me")
+func (m *MistralModel) ParseFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, parseFileConfig *ParseFileConfig) (*ParseFileResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", m.Name())
 }
 
-func (z *MistralModel) ListTasks(apiConfig *APIConfig) ([]ListTaskStatus, error) {
-	return nil, fmt.Errorf("no such method", z.Name())
+func (m *MistralModel) ListTasks(apiConfig *APIConfig) ([]ListTaskStatus, error) {
+	return nil, fmt.Errorf("%s, no such method", m.Name())
 }
 
-func (z *MistralModel) ShowTask(taskID string, apiConfig *APIConfig) (*TaskResponse, error) {
-	return nil, fmt.Errorf("no such method", z.Name())
+func (m *MistralModel) ShowTask(taskID string, apiConfig *APIConfig) (*TaskResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", m.Name())
 }

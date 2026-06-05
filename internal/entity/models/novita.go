@@ -24,39 +24,27 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // NovitaModel implements ModelDriver for Novita.ai
-// (https://novita.ai/docs/api-reference/).
-//
-// Novita exposes an OpenAI-compatible REST API at
-// https://api.novita.ai/v3/openai (chat completions at
-// /chat/completions, list models at /models). It serves a large
-// catalog of third-party models (DeepSeek, Llama, Qwen3, Kimi,
-// Gemma, Mistral, etc.) behind a single OpenAI-shaped surface.
-//
-// The wire shape matches OpenAI standard with ONE notable
-// difference: reasoning models like qwen3-* embed their
-// chain-of-thought INLINE inside content as <think>...</think>
-// tags, rather than in a separate reasoning_content field. The
-// driver detects those tags and routes the inner text to
-// ChatResponse.ReasonContent (non-stream) or the sender's second
-// arg (stream), keeping the answer clean of tag clutter.
 type NovitaModel struct {
-	BaseURL    map[string]string
-	URLSuffix  URLSuffix
-	httpClient *http.Client
+	baseModel BaseModel
 }
 
 // NewNovitaModel creates a new Novita model instance.
-//
-// Same transport convention as other Go drivers in this package:
-// clone http.DefaultTransport, override the connection-pool fields,
-// no client-level Timeout so SSE streams are not capped.
 func NewNovitaModel(baseURL map[string]string, urlSuffix URLSuffix) *NovitaModel {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	var transport *http.Transport
+	if ok {
+		transport = defaultTransport.Clone()
+	} else {
+		transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		}
+	}
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 10
 	transport.IdleConnTimeout = 90 * time.Second
@@ -64,32 +52,22 @@ func NewNovitaModel(baseURL map[string]string, urlSuffix URLSuffix) *NovitaModel
 	transport.ResponseHeaderTimeout = 60 * time.Second
 
 	return &NovitaModel{
-		BaseURL:   baseURL,
-		URLSuffix: urlSuffix,
-		httpClient: &http.Client{
-			Transport: transport,
+		baseModel: BaseModel{
+			BaseURL:   baseURL,
+			URLSuffix: urlSuffix,
+			httpClient: &http.Client{
+				Transport: transport,
+			},
 		},
 	}
 }
 
 func (n *NovitaModel) NewInstance(baseURL map[string]string) ModelDriver {
-	return NewNovitaModel(baseURL, n.URLSuffix)
+	return NewNovitaModel(baseURL, n.baseModel.URLSuffix)
 }
 
 func (n *NovitaModel) Name() string {
 	return "novita"
-}
-
-func (n *NovitaModel) baseURLForRegion(region string) (string, error) {
-	base, ok := n.BaseURL[region]
-	if !ok || base == "" {
-		return "", fmt.Errorf("novita: no base URL configured for region %q", region)
-	}
-	// Strip a trailing "/" so callers can safely do
-	// fmt.Sprintf("%s/%s", base, suffix) without producing "//" in
-	// the path. The shipped config has no trailing slash, but a
-	// tenant can override the URL per-instance and may add one.
-	return strings.TrimSuffix(base, "/"), nil
 }
 
 const (
@@ -229,23 +207,19 @@ func (e *novitaThinkExtractor) Flush() *novitaThinkSegment {
 
 // ChatWithMessages sends multiple messages with roles and returns the response.
 func (n *NovitaModel) ChatWithMessages(modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig) (*ChatResponse, error) {
-	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
-		return nil, fmt.Errorf("api key is required")
+	if err := n.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
 	}
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("messages is empty")
 	}
 
-	region := "default"
-	if apiConfig.Region != nil && *apiConfig.Region != "" {
-		region = *apiConfig.Region
-	}
-
-	baseURL, err := n.baseURLForRegion(region)
+	baseURL, err := n.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return nil, err
 	}
-	url := fmt.Sprintf("%s/%s", baseURL, n.URLSuffix.Chat)
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := fmt.Sprintf("%s/%s", baseURL, n.baseModel.URLSuffix.Chat)
 
 	apiMessages := make([]map[string]interface{}, len(messages))
 	for i, msg := range messages {
@@ -304,7 +278,7 @@ func (n *NovitaModel) ChatWithMessages(modelName string, messages []Message, api
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := n.httpClient.Do(req)
+	resp, err := n.baseModel.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -377,26 +351,23 @@ func (n *NovitaModel) ChatWithMessages(modelName string, messages []Message, api
 //     across SSE chunk boundaries, then routes content/reasoning to
 //     the first/second sender arg respectively.
 func (n *NovitaModel) ChatStreamlyWithSender(modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig, sender func(*string, *string) error) error {
+	if err := n.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return err
+	}
+
 	if sender == nil {
 		return fmt.Errorf("sender is required")
 	}
 	if len(messages) == 0 {
 		return fmt.Errorf("messages is empty")
 	}
-	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
-		return fmt.Errorf("api key is required")
-	}
 
-	region := "default"
-	if apiConfig.Region != nil && *apiConfig.Region != "" {
-		region = *apiConfig.Region
-	}
-
-	baseURL, err := n.baseURLForRegion(region)
+	baseURL, err := n.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return err
 	}
-	url := fmt.Sprintf("%s/%s", baseURL, n.URLSuffix.Chat)
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := fmt.Sprintf("%s/%s", baseURL, n.baseModel.URLSuffix.Chat)
 
 	apiMessages := make([]map[string]interface{}, len(messages))
 	for i, msg := range messages {
@@ -446,7 +417,7 @@ func (n *NovitaModel) ChatStreamlyWithSender(modelName string, messages []Messag
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := n.httpClient.Do(req)
+	resp, err := n.baseModel.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
@@ -556,20 +527,16 @@ func (n *NovitaModel) ChatStreamlyWithSender(modelName string, messages []Messag
 
 // ListModels returns the list of model ids visible to the API key.
 func (n *NovitaModel) ListModels(apiConfig *APIConfig) ([]string, error) {
-	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
-		return nil, fmt.Errorf("api key is required")
+	if err := n.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
 	}
 
-	region := "default"
-	if apiConfig.Region != nil && *apiConfig.Region != "" {
-		region = *apiConfig.Region
-	}
-
-	baseURL, err := n.baseURLForRegion(region)
+	baseURL, err := n.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return nil, err
 	}
-	url := fmt.Sprintf("%s/%s", baseURL, n.URLSuffix.Models)
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := fmt.Sprintf("%s/%s", baseURL, n.baseModel.URLSuffix.Models)
 
 	ctx, cancel := context.WithTimeout(context.Background(), nonStreamCallTimeout)
 	defer cancel()
@@ -581,7 +548,7 @@ func (n *NovitaModel) ListModels(apiConfig *APIConfig) ([]string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := n.httpClient.Do(req)
+	resp, err := n.baseModel.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -626,19 +593,283 @@ func (n *NovitaModel) CheckConnection(apiConfig *APIConfig) error {
 	return err
 }
 
-// Embed is not exposed on Novita's OpenAI-compatible surface yet.
+type novitaEmbeddingData struct {
+	Embedding []float64 `json:"embedding"`
+	Object    string    `json:"object"`
+	Index     int       `json:"index"`
+}
+
+type novitaEmbeddingResponse struct {
+	Data   []novitaEmbeddingData `json:"data"`
+	Model  string                `json:"model"`
+	Object string                `json:"object"`
+}
+
+// Embed turns a list of texts into embedding vectors using the Novita
+// /v3/embeddings endpoint. The output has one vector per input, in the
+// same order the inputs were given.
 func (n *NovitaModel) Embed(modelName *string, texts []string, apiConfig *APIConfig, embeddingConfig *EmbeddingConfig) ([]EmbeddingData, error) {
-	return nil, fmt.Errorf("%s, no such method", n.Name())
+	if err := n.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
+	}
+
+	if len(texts) == 0 {
+		return []EmbeddingData{}, nil
+	}
+
+	if modelName == nil || *modelName == "" {
+		return nil, fmt.Errorf("model name is required")
+	}
+
+	baseURL, err := n.baseModel.GetBaseURL(apiConfig)
+	if err != nil {
+		return nil, err
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := fmt.Sprintf("%s/%s", baseURL, n.baseModel.URLSuffix.Embedding)
+
+	reqBody := map[string]interface{}{
+		"model": *modelName,
+		"input": texts,
+	}
+	if embeddingConfig != nil && embeddingConfig.Dimension > 0 {
+		reqBody["dimensions"] = embeddingConfig.Dimension
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), nonStreamCallTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
+
+	resp, err := n.baseModel.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Novita embeddings API error: %s, body: %s", resp.Status, string(body))
+	}
+
+	var parsed novitaEmbeddingResponse
+	if err = json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	embeddings := make([]EmbeddingData, len(texts))
+	filled := make([]bool, len(texts))
+	for _, item := range parsed.Data {
+		if item.Index < 0 || item.Index >= len(texts) {
+			return nil, fmt.Errorf("novita: response index %d out of range for %d inputs", item.Index, len(texts))
+		}
+		if filled[item.Index] {
+			return nil, fmt.Errorf("novita: duplicate embedding index %d in response", item.Index)
+		}
+		embeddings[item.Index] = EmbeddingData{
+			Embedding: item.Embedding,
+			Index:     item.Index,
+		}
+		filled[item.Index] = true
+	}
+	for i, ok := range filled {
+		if !ok {
+			return nil, fmt.Errorf("novita: missing embedding for input index %d", i)
+		}
+	}
+
+	return embeddings, nil
 }
 
-// Rerank is not exposed by the Novita API.
+type novitaRerankResult struct {
+	Document struct {
+		Text string `json:"text"`
+	} `json:"document"`
+	Index          int     `json:"index"`
+	RelevanceScore float64 `json:"relevance_score"`
+}
+
+type novitaRerankResponse struct {
+	Results []novitaRerankResult `json:"results"`
+}
+
+// Rerank scores documents against the query using the Novita
+// /openai/v1/rerank endpoint and returns one RerankResult per scored
+// document in the API's ranking order. Caller may sort by Index to
+// recover original input order.
 func (n *NovitaModel) Rerank(modelName *string, query string, documents []string, apiConfig *APIConfig, rerankConfig *RerankConfig) (*RerankResponse, error) {
-	return nil, fmt.Errorf("%s, no such method", n.Name())
+	if err := n.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
+	}
+
+	if len(documents) == 0 {
+		return &RerankResponse{}, nil
+	}
+	if modelName == nil || *modelName == "" {
+		return nil, fmt.Errorf("model name is required")
+	}
+
+	baseURL, err := n.baseModel.GetBaseURL(apiConfig)
+	if err != nil {
+		return nil, err
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	if n.baseModel.URLSuffix.Rerank == "" {
+		return nil, fmt.Errorf("novita: no rerank URL suffix configured")
+	}
+	url := fmt.Sprintf("%s/%s", baseURL, n.baseModel.URLSuffix.Rerank)
+
+	topN := len(documents)
+	if rerankConfig != nil && rerankConfig.TopN > 0 && rerankConfig.TopN < topN {
+		topN = rerankConfig.TopN
+	}
+
+	reqBody := map[string]interface{}{
+		"model":     *modelName,
+		"query":     query,
+		"documents": documents,
+		"top_n":     topN,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), nonStreamCallTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
+
+	resp, err := n.baseModel.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Novita rerank API error: %s, body: %s", resp.Status, string(body))
+	}
+
+	var parsed novitaRerankResponse
+	if err = json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	rerankResponse := RerankResponse{Data: make([]RerankResult, 0, len(parsed.Results))}
+	seen := make([]bool, len(documents))
+	for _, item := range parsed.Results {
+		if item.Index < 0 || item.Index >= len(documents) {
+			return nil, fmt.Errorf("novita: rerank index %d out of range for %d inputs", item.Index, len(documents))
+		}
+		if seen[item.Index] {
+			return nil, fmt.Errorf("novita: duplicate rerank index %d in response", item.Index)
+		}
+		rerankResponse.Data = append(rerankResponse.Data, RerankResult{
+			Index:          item.Index,
+			RelevanceScore: item.RelevanceScore,
+		})
+		seen[item.Index] = true
+	}
+
+	return &rerankResponse, nil
 }
 
-// Balance is not exposed by the Novita API.
+// Balance Get remaining credit
 func (n *NovitaModel) Balance(apiConfig *APIConfig) (map[string]interface{}, error) {
-	return nil, fmt.Errorf("%s, no such method", n.Name())
+	if err := n.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
+	}
+
+	baseURL, err := n.baseModel.GetBaseURL(apiConfig)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("%s/%s", baseURL, n.baseModel.URLSuffix.Balance)
+
+	// Build request body
+	reqBody := map[string]interface{}{}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("GET", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
+
+	resp, err := n.baseModel.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response
+	var result map[string]interface{}
+	if err = json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	balanceInterface, exists := result["availableBalance"]
+	if !exists || balanceInterface == nil {
+		return nil, fmt.Errorf("missing 'availableBalance' in response. Raw body: %s", string(body))
+	}
+
+	balanceStr, ok := balanceInterface.(string)
+	if !ok {
+		return nil, fmt.Errorf("'availableBalance' is not a string. Raw body: %s", string(body))
+	}
+	balance, err := strconv.ParseFloat(balanceStr, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse 'availableBalance' as float: %w. Raw body: %s", err, string(body))
+	}
+
+	var response = map[string]interface{}{
+		"balance":  balance,
+		"currency": "USD",
+	}
+
+	return response, nil
 }
 
 func (n *NovitaModel) TranscribeAudio(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig) (*ASRResponse, error) {
@@ -663,14 +894,14 @@ func (n *NovitaModel) OCRFile(modelName *string, content []byte, url *string, ap
 }
 
 // ParseFile parse file
-func (z *NovitaModel) ParseFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, parseFileConfig *ParseFileConfig) (*ParseFileResponse, error) {
-	return nil, fmt.Errorf("%s, no such method", z.Name())
+func (n *NovitaModel) ParseFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, parseFileConfig *ParseFileConfig) (*ParseFileResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", n.Name())
 }
 
-func (z *NovitaModel) ListTasks(apiConfig *APIConfig) ([]ListTaskStatus, error) {
-	return nil, fmt.Errorf("%s, no such method", z.Name())
+func (n *NovitaModel) ListTasks(apiConfig *APIConfig) ([]ListTaskStatus, error) {
+	return nil, fmt.Errorf("%s, no such method", n.Name())
 }
 
-func (z *NovitaModel) ShowTask(taskID string, apiConfig *APIConfig) (*TaskResponse, error) {
-	return nil, fmt.Errorf("%s, no such method", z.Name())
+func (n *NovitaModel) ShowTask(taskID string, apiConfig *APIConfig) (*TaskResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", n.Name())
 }

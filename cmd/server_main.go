@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package main
 
 import (
@@ -75,12 +91,6 @@ func main() {
 		common.Fatal("Server port is not configured. Please specify via --port flag or config file.")
 	}
 
-	// Load model providers configuration
-	if err := server.LoadModelProviders(""); err != nil {
-		common.Fatal("Failed to load model providers", zap.Error(err))
-	}
-	common.Info("Model providers loaded", zap.Int("count", len(server.GetModelProviders())))
-
 	// Reinitialize logger with configured level if different
 	if config.Log.Level != "" && config.Log.Level != "info" {
 		if err := common.Init(config.Log.Level); err != nil {
@@ -100,13 +110,6 @@ func main() {
 	// Initialize database
 	if err := dao.InitDB(); err != nil {
 		common.Fatal("Failed to initialize database", zap.Error(err))
-	}
-
-	// Initialize LLM factory data models from configuration file
-	if err := dao.InitLLMFactory(); err != nil {
-		common.Error("Failed to initialize LLM factory", err)
-	} else {
-		common.Info("LLM factory initialized successfully")
 	}
 
 	// Initialize doc engine
@@ -135,8 +138,12 @@ func main() {
 	local.InitAdminStatus(1, "admin server not connected")
 
 	// Initialize tokenizer (rag_analyzer)
+	dictPath := os.Getenv("RAGFLOW_DICT_PATH")
+	if dictPath == "" {
+		dictPath = "/usr/share/infinity/resource"
+	}
 	tokenizerCfg := &tokenizer.PoolConfig{
-		DictPath: "/usr/share/infinity/resource",
+		DictPath: dictPath,
 	}
 	if err := tokenizer.Init(tokenizerCfg); err != nil {
 		common.Fatal("Failed to initialize tokenizer", zap.Error(err))
@@ -167,6 +174,8 @@ func startServer(config *server.Config) {
 	userService := service.NewUserService()
 	documentService := service.NewDocumentService()
 	datasetsService := service.NewDatasetService()
+	knowledgebaseService := service.NewKnowledgebaseService()
+	metadataService := service.NewMetadataService()
 	chunkService := service.NewChunkService()
 	llmService := service.NewLLMService()
 	tenantService := service.NewTenantService()
@@ -177,6 +186,7 @@ func startServer(config *server.Config) {
 	searchService := service.NewSearchService()
 	fileService := service.NewFileService()
 	memoryService := service.NewMemoryService()
+	mcpService := service.NewMCPService()
 	modelProviderService := service.NewModelProviderService()
 
 	// Initialize doc engine for skill search
@@ -185,10 +195,11 @@ func startServer(config *server.Config) {
 	// Initialize handler layer
 	authHandler := handler.NewAuthHandler()
 	userHandler := handler.NewUserHandler(userService)
-	tenantHandler := handler.NewTenantHandler(tenantService, userService)
+	tenantHandler := handler.NewTenantHandler(tenantService, userService, knowledgebaseService)
 	documentHandler := handler.NewDocumentHandler(documentService, datasetsService)
-	datasetsHandler := handler.NewDatasetsHandler(datasetsService)
+	datasetsHandler := handler.NewDatasetsHandler(datasetsService, metadataService)
 	systemHandler := handler.NewSystemHandler(systemService)
+	knowledgebaseHandler := handler.NewKnowledgebaseHandler(knowledgebaseService, userService, documentService)
 	chunkHandler := handler.NewChunkHandler(chunkService, userService)
 	llmHandler := handler.NewLLMHandler(llmService, userService)
 	chatHandler := handler.NewChatHandler(chatService, userService)
@@ -197,11 +208,18 @@ func startServer(config *server.Config) {
 	searchHandler := handler.NewSearchHandler(searchService, userService)
 	fileHandler := handler.NewFileHandler(fileService, userService)
 	memoryHandler := handler.NewMemoryHandler(memoryService)
+	mcpHandler := handler.NewMCPHandler(mcpService)
 	skillSearchHandler := handler.NewSkillSearchHandler(docEngine)
 	providerHandler := handler.NewProviderHandler(userService, modelProviderService)
+	agentHandler := handler.NewAgentHandler(service.NewAgentService(), fileService)
+	relatedQuestionsHandler := handler.NewSearchbotHandler(
+		searchService,
+		tenantService,
+		&handler.SearchbotRealLLM{Svc: modelProviderService},
+	)
 
 	// Initialize router
-	r := router.NewRouter(authHandler, userHandler, tenantHandler, documentHandler, datasetsHandler, systemHandler, chunkHandler, llmHandler, chatHandler, chatSessionHandler, connectorHandler, searchHandler, fileHandler, memoryHandler, skillSearchHandler, providerHandler)
+	r := router.NewRouter(authHandler, userHandler, tenantHandler, documentHandler, datasetsHandler, systemHandler, knowledgebaseHandler, chunkHandler, llmHandler, chatHandler, chatSessionHandler, connectorHandler, searchHandler, fileHandler, memoryHandler, mcpHandler, skillSearchHandler, providerHandler, agentHandler, relatedQuestionsHandler)
 
 	// Create Gin engine
 	ginEngine := gin.New()
