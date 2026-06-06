@@ -671,79 +671,92 @@ async def get_graph_from_index(tenant_id, kb_id):
     graph = nx.Graph()
     graph.graph["source_id"] = []
     seen_sources = set()
+    total_entities = 0
+    total_relations = 0
 
     # ------------------------------------------------------------------
-    # 1. Pull all entity chunks (paginated, same bounds as rebuild_graph)
+    # 1. Pull all entity chunks via scroll (bypass max_result_window)
     # ------------------------------------------------------------------
     ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
-    bs = 5000
-    total_entities = 0
 
-    for i in range(0, 1024 * 256, bs):
-        es_res = await thread_pool_exec(
-            settings.docStoreConn.search,
-            ent_flds, [],
-            {"kb_id": kb_id, "knowledge_graph_kwd": ["entity"]},
-            [], OrderByExpr(), i, bs,
-            search.index_name(tenant_id), [kb_id],
-        )
-        es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
-        if len(es_res) == 0:
-            break
+    ent_query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"kb_id": [kb_id]}},
+                    {"terms": {"knowledge_graph_kwd": ["entity"]}},
+                ]
+            }
+        }
+    }
 
-        for _cid, d in es_res.items():
-            try:
-                meta = json.loads(d["content_with_weight"])
-                ent_name = d["entity_kwd"]
-                if isinstance(ent_name, list):
-                    ent_name = ent_name[0] if ent_name else None
-                if ent_name:
-                    graph.add_node(ent_name, **meta)
+    es_res = await thread_pool_exec(
+        settings.docStoreConn.search_with_scroll,
+        search.index_name(tenant_id),
+        ent_query,
+        ent_flds,
+    )
+    es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
+
+    for _cid, d in es_res.items():
+        try:
+            meta = json.loads(d["content_with_weight"])
+            ent_name = d["entity_kwd"]
+            if isinstance(ent_name, list):
+                ent_name = ent_name[0] if ent_name else None
+            if ent_name:
+                graph.add_node(ent_name, **meta)
                 total_entities += 1
-                for sid in meta.get("source_id", []):
-                    seen_sources.add(sid)
-            except Exception:
-                logging.exception("Failed to parse entity chunk %s", _cid)
-                continue
+            for sid in meta.get("source_id", []):
+                seen_sources.add(sid)
+        except Exception:
+            logging.exception("Failed to parse entity chunk %s", _cid)
+            continue
 
-    if total_entities == 0:
+    if len(graph.nodes) == 0:
         return None
 
     # ------------------------------------------------------------------
-    # 2. Pull all relation chunks
+    # 2. Pull all relation chunks via scroll (bypass max_result_window)
     # ------------------------------------------------------------------
     rel_flds = ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"]
-    total_relations = 0
 
-    for i in range(0, 1024 * bs, bs):
-        es_res = await thread_pool_exec(
-            settings.docStoreConn.search,
-            rel_flds, [],
-            {"kb_id": kb_id, "knowledge_graph_kwd": ["relation"]},
-            [], OrderByExpr(), i, bs,
-            search.index_name(tenant_id), [kb_id],
-        )
-        es_res = settings.docStoreConn.get_fields(es_res, rel_flds)
-        if len(es_res) == 0:
-            break
+    rel_query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"kb_id": [kb_id]}},
+                    {"terms": {"knowledge_graph_kwd": ["relation"]}},
+                ]
+            }
+        }
+    }
 
-        for _cid, d in es_res.items():
-            try:
-                meta = json.loads(d["content_with_weight"])
-                from_node = d["from_entity_kwd"]
-                to_node = d["to_entity_kwd"]
-                if isinstance(from_node, list):
-                    from_node = from_node[0] if from_node else None
-                if isinstance(to_node, list):
-                    to_node = to_node[0] if to_node else None
-                if from_node and to_node and from_node in graph.nodes and to_node in graph.nodes:
-                    graph.add_edge(from_node, to_node, **meta)
-                    total_relations += 1
-                for sid in meta.get("source_id", []):
-                    seen_sources.add(sid)
-            except Exception:
-                logging.exception("Failed to parse relation chunk %s", _cid)
-                continue
+    es_res = await thread_pool_exec(
+        settings.docStoreConn.search_with_scroll,
+        search.index_name(tenant_id),
+        rel_query,
+        rel_flds,
+    )
+    es_res = settings.docStoreConn.get_fields(es_res, rel_flds)
+
+    for _cid, d in es_res.items():
+        try:
+            meta = json.loads(d["content_with_weight"])
+            from_node = d["from_entity_kwd"]
+            to_node = d["to_entity_kwd"]
+            if isinstance(from_node, list):
+                from_node = from_node[0] if from_node else None
+            if isinstance(to_node, list):
+                to_node = to_node[0] if to_node else None
+            if from_node and to_node and from_node in graph.nodes and to_node in graph.nodes:
+                graph.add_edge(from_node, to_node, **meta)
+                total_relations += 1
+            for sid in meta.get("source_id", []):
+                seen_sources.add(sid)
+        except Exception:
+            logging.exception("Failed to parse relation chunk %s", _cid)
+            continue
 
     graph.graph["source_id"] = sorted(seen_sources)
     logging.info(

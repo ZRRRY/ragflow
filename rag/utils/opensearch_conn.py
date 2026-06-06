@@ -396,6 +396,49 @@ class OSConnection(DocStoreConnection):
         logger.error(f"OSConnection.search timeout for {ATTEMPT_TIME} times!")
         raise Exception("OSConnection.search timeout.")
 
+    def search_with_scroll(self, index_names, query_body: dict, fields: list[str], scroll_timeout="2m", batch_size=1000):
+        """Use OpenSearch scroll API to fetch all results safely.
+
+        This bypasses the index.max_result_window limit and is suitable
+        for retrieving large result sets (e.g. GraphRAG entity/relation
+        chunks) without causing OpenSearch OOM or connection storms.
+        """
+        scroll_id = None
+        try:
+            res = self.os.search(
+                index=index_names,
+                body=query_body,
+                scroll=scroll_timeout,
+                size=batch_size,
+                _source=True,
+            )
+            scroll_id = res.get("_scroll_id")
+            hits = res["hits"]["hits"]
+
+            while True:
+                page = self.os.scroll(scroll_id=scroll_id, scroll=scroll_timeout)
+                page_hits = page["hits"]["hits"]
+                if not page_hits:
+                    break
+                hits.extend(page_hits)
+                scroll_id = page.get("_scroll_id")
+                if not scroll_id:
+                    break
+
+            # Return format compatible with __getSource / get_fields
+            return {"hits": {"hits": hits}}
+        except Exception as e:
+            logger.exception(
+                f"OSConnection.search_with_scroll {str(index_names)} query: " + json.dumps(query_body)
+            )
+            raise e
+        finally:
+            if scroll_id:
+                try:
+                    self.os.clear_scroll(scroll_id=scroll_id)
+                except Exception:
+                    pass
+
     def get(self, chunkId: str, indexName: str, knowledgebaseIds: list[str]) -> dict | None:
         for i in range(ATTEMPT_TIME):
             try:
