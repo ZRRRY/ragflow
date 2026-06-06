@@ -47,7 +47,7 @@ chat_limiter = LoopLocalSemaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)
 # number of simultaneous requests to ES/Infinity bounded.  Override with
 # GRAPHRAG_INSERT_BULK_SIZE and GRAPHRAG_INSERT_CONCURRENCY.
 _INSERT_BULK_SIZE = max(1, int(os.environ.get("GRAPHRAG_INSERT_BULK_SIZE", 64)))
-_INSERT_CONCURRENCY = max(1, int(os.environ.get("GRAPHRAG_INSERT_CONCURRENCY", 4)))
+_INSERT_CONCURRENCY = max(1, int(os.environ.get("GRAPHRAG_INSERT_CONCURRENCY", 2)))
 
 
 async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, label="Insert chunks"):
@@ -880,7 +880,7 @@ async def _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label):
             missed_texts.append(embed_text)
 
     if missed_texts:
-        batch_size = 32
+        batch_size = 64
         total = len(missed_texts)
 
         async def _embed_one_batch(i):
