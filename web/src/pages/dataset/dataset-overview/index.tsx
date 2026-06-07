@@ -17,7 +17,11 @@ import { useTranslation } from 'react-i18next';
 import { RunningStatus } from '../dataset/constant';
 import { LogTabs } from './dataset-common';
 import { DatasetFilter } from './dataset-filter';
-import { useFetchFileLogList, useFetchOverviewTotal } from './hook';
+import {
+  useFetchDatasetChunkCount,
+  useFetchFileLogList,
+  useFetchOverviewTotal,
+} from './hook';
 import { DocumentLog, IFileLogItem } from './interface';
 import FileLogsTable from './overview-table';
 
@@ -134,6 +138,7 @@ const FileLogsPage: FC = () => {
     },
   });
   const { data: topData } = useFetchOverviewTotal();
+  const { data: chunkTotal } = useFetchDatasetChunkCount();
   const {
     pagination: { total: fileTotal },
   } = useFetchDocumentList(false);
@@ -259,7 +264,7 @@ const FileLogsPage: FC = () => {
       flex flex-col overflow-y-auto scrollbar-auto"
     >
       {/* Stats Cards */}
-      <div className="grid grid-cols-3 md:grid-cols-3 gap-7 mb-6">
+      <div className="grid grid-cols-4 md:grid-cols-4 gap-7 mb-6">
         <StatCard
           title={t('datasetOverview.totalFiles')}
           value={topAllData.totalFiles.value}
@@ -281,6 +286,17 @@ const FileLogsPage: FC = () => {
             </span>
           </div>
         </StatCard>
+        <StatCard
+          title={t('datasetOverview.totalChunks')}
+          value={chunkTotal ?? 0}
+          icon={
+            isDark ? (
+              <SvgIcon name="data-flow/total-chunks-icon" width={40} />
+            ) : (
+              <SvgIcon name="data-flow/total-chunks-icon-bri" width={40} />
+            )
+          }
+        />
         <StatCard
           title={t('datasetOverview.downloading')}
           value={topAllData.downloads.value}

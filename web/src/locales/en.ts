@@ -2915,6 +2915,7 @@ Important structured information may include: names, dates, locations, events, k
       downloadTip: 'Files being downloaded from data sources. ',
       processingTip: 'Files being processed by ingestion pipeline.',
       totalFiles: 'Total files',
+      totalChunks: 'Total chunks',
       downloading: 'Downloading',
       downloadSuccessTip: 'Total successful downloads',
       downloadFailedTip: 'Total failed downloads',
