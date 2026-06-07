@@ -43,12 +43,19 @@ class GraphRAGConfig:
     USE_ASYNC_KG_PHASES = os.environ.get("USE_ASYNC_KG_PHASES", "0") == "1"
     KG_POSTPROCESS_QUEUE = os.environ.get("KG_POSTPROCESS_QUEUE", "graphrag:postprocess")
 
+    # Phase 5-T4 – Boot-time reconciliation of stuck graphrag tasks
+    RECONCILE_STUCK_ON_BOOT = os.environ.get("RECONCILE_STUCK_ON_BOOT", "0") == "1"
+    STUCK_TASK_GRACE_MINUTES = int(os.environ.get("STUCK_TASK_GRACE_MINUTES", "30"))
+    STUCK_TASK_MIN_NODES = int(os.environ.get("STUCK_TASK_MIN_NODES", "3"))
+    STUCK_TASK_MIN_EDGES = int(os.environ.get("STUCK_TASK_MIN_EDGES", "3"))
+
     @classmethod
     def log_flags(cls):
         logger.info(
             "GraphRAGConfig: incremental_graph=%s incremental_merge=%s "
             "incremental_resolution=%s async_community=%s max_kg_tasks=%d min_kg_tasks=%d adaptive=%s "
-            "adaptive_interval=%d degrade_thr=%d increase_thr=%d es_slow_ms=%d",
+            "adaptive_interval=%d degrade_thr=%d increase_thr=%d es_slow_ms=%d "
+            "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d",
             cls.USE_INCREMENTAL_GRAPH,
             cls.USE_INCREMENTAL_MERGE,
             cls.USE_INCREMENTAL_RESOLUTION,
@@ -60,6 +67,10 @@ class GraphRAGConfig:
             cls.ADAPTIVE_DEGRADE_THRESHOLD,
             cls.ADAPTIVE_INCREASE_THRESHOLD,
             cls.ES_SLOW_THRESHOLD_MS,
+            cls.RECONCILE_STUCK_ON_BOOT,
+            cls.STUCK_TASK_GRACE_MINUTES,
+            cls.STUCK_TASK_MIN_NODES,
+            cls.STUCK_TASK_MIN_EDGES,
         )
 
 

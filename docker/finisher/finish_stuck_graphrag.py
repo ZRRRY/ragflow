@@ -275,12 +275,12 @@ def os_list_ragflow_indices(conf):
         log.warning("_cat/indices 异常: %s", e)
         return []
 
-    # 对每个索引,取 node/edge/total
+    # 对每个索引,取 entity/relation/total
     out = []
     for idx in sorted(names):
         kb_part = idx.replace("ragflow_", "", 1)
-        n_node = os_count(conf, kb_part, "knowledge_graph_kwd:node")
-        n_edge = os_count(conf, kb_part, "knowledge_graph_kwd:edge")
+        n_node = os_count(conf, kb_part, "knowledge_graph_kwd:entity")
+        n_edge = os_count(conf, kb_part, "knowledge_graph_kwd:relation")
         n_total = os_count(conf, kb_part, "*")
         out.append((idx, n_node, n_edge, n_total))
     return out
@@ -336,16 +336,17 @@ def cmd_check(conf, kb_id, os_kb_id):
     log.info("=" * 70)
 
     # 1) OS 里的实体数(os_kb_id)
-    n_nodes = os_count(conf, os_kb_id, "knowledge_graph_kwd:node")
-    n_edges = os_count(conf, os_kb_id, "knowledge_graph_kwd:edge")
+    # 注意:实际 RAGFlow 的取值是 "entity" 和 "relation",不是 "node"/"edge"
+    n_nodes = os_count(conf, os_kb_id, "knowledge_graph_kwd:entity")
+    n_edges = os_count(conf, os_kb_id, "knowledge_graph_kwd:relation")
     n_reports = os_count(conf, os_kb_id, "knowledge_graph_kwd:community_report")
     n_total = os_count(conf, os_kb_id, "*")
 
     log.info("OS  ragflow_%s 索引:", os_kb_id.replace("-", ""))
-    log.info("  - 节点 (knowledge_graph_kwd:node)        : %d", n_nodes)
-    log.info("  - 边   (knowledge_graph_kwd:edge)        : %d", n_edges)
-    log.info("  - 社区报告(knowledge_graph_kwd:community) : %d", n_reports)
-    log.info("  - 文档块总索引(含 node/edge)             : %d", n_total)
+    log.info("  - 实体节点 (knowledge_graph_kwd:entity)  : %d", n_nodes)
+    log.info("  - 关系边   (knowledge_graph_kwd:relation): %d", n_edges)
+    log.info("  - 社区报告(knowledge_graph_kwd:community_report): %d", n_reports)
+    log.info("  - 文档块总索引(含 entity/relation)       : %d", n_total)
 
     # 2) MySQL 卡住的 task(用 kb_id,不是 os_kb_id)
     log.info("-" * 70)
@@ -363,22 +364,23 @@ def cmd_check(conf, kb_id, os_kb_id):
             t["id"], t["doc_id"], t["task_type"], t["progress"], t["progress_msg"],
         )
 
-    # 3) 当 MySQL/OS KB 不一致时,顺手列所有 ragflow_* 索引帮诊断
-    if os_kb_id != kb_id:
-        log.info("-" * 70)
-        log.info("⚠ MySQL task 关联的 KB 跟 OS 索引 KB 不一致,以下为 OS 全部 ragflow_* 索引:")
-        rows = os_list_ragflow_indices(conf)
-        if not rows:
-            log.info("  (没找到任何 ragflow_* 索引)")
+    # 3) 总是列所有 ragflow_* 索引,帮诊断 "OS 里到底有什么"
+    log.info("-" * 70)
+    log.info("OS 全部 ragflow_* 索引(全局视图):")
+    rows = os_list_ragflow_indices(conf)
+    if not rows:
+        log.info("  (没找到任何 ragflow_* 索引,或 _cat/indices 调用失败)")
+    else:
         for idx, n_node, n_edge, n_total_idx in rows:
             marker = ""
             if n_node > 0 or n_edge > 0:
                 marker = "  ← 这里有数据"
+            tag = "  [当前 KB]" if idx == f"ragflow_{os_kb_id.replace('-', '')}" else ""
             log.info(
-                "  - %-50s  node=%-6d edge=%-6d docs=%-7d%s",
-                idx, n_node, n_edge, n_total_idx, marker,
+                "  - %-50s  node=%-6d edge=%-6d docs=%-7d%s%s",
+                idx, n_node, n_edge, n_total_idx, tag, marker,
             )
-        log.info("提示:在 `finish` 时加 --os-kb-id <上面对应索引的 KB ID> 指向真实有数据的索引。")
+    log.info("提示:如果数据不在 `ragflow_<--os-kb-id>` 里,改用 --os-kb-id <上面有数据那个索引对应的 KB ID> 跑 finish。")
 
     log.info("=" * 70)
     log.info("判断:")
@@ -400,8 +402,8 @@ def cmd_finish(conf, kb_id, os_kb_id, dry_run):
     log.info("=" * 70)
 
     # 先读 OS 真实数字(用 os_kb_id)
-    n_nodes = os_count(conf, os_kb_id, "knowledge_graph_kwd:node")
-    n_edges = os_count(conf, os_kb_id, "knowledge_graph_kwd:edge")
+    n_nodes = os_count(conf, os_kb_id, "knowledge_graph_kwd:entity")
+    n_edges = os_count(conf, os_kb_id, "knowledge_graph_kwd:relation")
     if n_nodes < 0 or n_edges < 0:
         log.error("OS 查询失败,拒绝继续,避免误标 task done。")
         return 2

@@ -57,7 +57,7 @@ from common.log_utils import init_root_logger
 from common.config_utils import show_configs
 from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.limiter import AdaptiveConcurrencyLimiter, current_limiter
-from rag.graphrag.phase_markers import PHASE_RESOLUTION, PHASE_COMMUNITY, has_phase_marker, set_phase_marker
+from rag.graphrag.phase_markers import PHASE_RESOLUTION, PHASE_COMMUNITY, has_phase_marker, set_phase_marker, clear_phase_markers
 from rag.graphrag.utils import get_llm_cache, set_llm_cache, get_tags_from_cache, set_tags_to_cache
 from rag.prompts.generator import keyword_extraction, question_proposal, content_tagging, run_toc_from_text, \
     gen_metadata
@@ -214,6 +214,130 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
         logging.warning(f"set_progress({task_id}) got exception DoesNotExist")
     except Exception as e:
         logging.exception(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}, got exception: {e}")
+
+
+async def reconcile_stuck_graphrag_tasks():
+    """启动时一次性扫描:把 OS 已有数据但 MySQL progress 卡在 (0,1) 的
+    graphrag task 标完成。仅当 RECONCILE_STUCK_ON_BOOT=1 时生效。
+
+    修复方向 ③: 兜底 direction ① 未覆盖的崩溃窗口(SIGKILL 落在
+    insert_chunks_bounded 中间、网络瞬断让 set_progress 丢消息等)。
+    """
+    if not GraphRAGConfig.RECONCILE_STUCK_ON_BOOT:
+        logging.info("[reconcile] RECONCILE_STUCK_ON_BOOT=0, skipping")
+        return
+
+    grace_ms = GraphRAGConfig.STUCK_TASK_GRACE_MINUTES * 60 * 1000
+    cutoff_ms = int(time.time() * 1000) - grace_ms
+    min_nodes = GraphRAGConfig.STUCK_TASK_MIN_NODES
+    min_edges = GraphRAGConfig.STUCK_TASK_MIN_EDGES
+    logging.info(
+        "[reconcile] starting: grace=%dmin min_nodes=%d min_edges=%d",
+        GraphRAGConfig.STUCK_TASK_GRACE_MINUTES, min_nodes, min_edges,
+    )
+
+    # 1) 候选 KB:有 graphrag_task_id、finish_at 还是空
+    try:
+        kbs = list(
+            KnowledgebaseService.model.select(
+                KnowledgebaseService.model.id,
+                KnowledgebaseService.model.tenant_id,
+                KnowledgebaseService.model.graphrag_task_id,
+            ).where(
+                (KnowledgebaseService.model.graphrag_task_id.is_null(False))
+                & (KnowledgebaseService.model.graphrag_task_finish_at.is_null())
+            ).dicts()
+        )
+    except Exception:
+        logging.exception("[reconcile] 候选 KB 列表查询失败")
+        return
+    logging.info("[reconcile] 候选 %d 个 KB", len(kbs))
+
+    finalized = skipped = failed = 0
+    for kb in kbs:
+        kb_id = kb["id"]
+        tenant_id = kb["tenant_id"]
+        task_id = kb["graphrag_task_id"]
+        try:
+            # 2) Redis SETNX 抢占(防多 worker 重复)
+            claim = f"graphrag:reconcile:{task_id}"
+            if not REDIS_CONN.set(claim, "1", nx=True, ex=600):
+                logging.info("[reconcile] kb=%s task=%s 已被别的 worker 抢占,skip", kb_id, task_id)
+                continue
+
+            # 3) 加载 task,过滤 progress / update_time
+            task = TaskService.get_task(task_id)
+            if not task:
+                logging.warning("[reconcile] kb=%s task=%s 不存在,skip", kb_id, task_id)
+                REDIS_CONN.delete(claim)
+                continue
+            prog = task.get("progress", 0) or 0
+            update_time = task.get("update_time") or 0
+            if not (0 < prog < 1):
+                logging.info("[reconcile] kb=%s task=%s progress=%.4f 不在 (0,1),skip", kb_id, task_id, prog)
+                REDIS_CONN.delete(claim)
+                continue
+            if update_time > cutoff_ms:
+                logging.info("[reconcile] kb=%s task=%s update_time=%d 距今 < grace,skip", kb_id, task_id, update_time)
+                REDIS_CONN.delete(claim)
+                continue
+
+            # 4) 反查 OS 节点/边数(用 tenant_id 派生索引,见 rag/nlp/search.py:index_name)
+            index = search.index_name(tenant_id)
+            try:
+                n_nodes = await thread_pool_exec(
+                    settings.docStoreConn.count, {"knowledge_graph_kwd": ["entity"]}, index, [kb_id]
+                )
+                n_nodes = int(n_nodes or 0)
+            except Exception:
+                logging.exception("[reconcile] 查 entity 数失败 kb=%s", kb_id)
+                n_nodes = 0
+            try:
+                n_edges = await thread_pool_exec(
+                    settings.docStoreConn.count, {"knowledge_graph_kwd": ["relation"]}, index, [kb_id]
+                )
+                n_edges = int(n_edges or 0)
+            except Exception:
+                logging.exception("[reconcile] 查 relation 数失败 kb=%s", kb_id)
+                n_edges = 0
+
+            if n_nodes < min_nodes or n_edges < min_edges:
+                logging.warning(
+                    "[reconcile] kb=%s task=%s OS 只有 %d nodes / %d edges < 阈值,不动",
+                    kb_id, task_id, n_nodes, n_edges,
+                )
+                REDIS_CONN.delete(claim)
+                skipped += 1
+                continue
+
+            # 5) 标完成 + 写 KB 的 finish_at、清 task 绑定
+            msg = f"Knowledge Graph reconciled ({n_nodes} nodes, {n_edges} edges) [boot]"
+            TaskService.update_progress(task_id, {"progress": 1.0, "progress_msg": msg})
+            KnowledgebaseService.update_by_id(
+                kb_id, {"graphrag_task_finish_at": datetime.now(), "graphrag_task_id": ""}
+            )
+            # 6) 清 Redis 上的 phase marker 和 task 锁,避免下次任务被旧状态阻挡
+            try:
+                clear_phase_markers(kb_id)
+            except Exception:
+                logging.exception("[reconcile] clear_phase_markers 失败 kb=%s", kb_id)
+            try:
+                REDIS_CONN.delete(f"graphrag_task_{kb_id}")
+            except Exception:
+                logging.exception("[reconcile] 删 graphrag_task_%s 失败", kb_id)
+            REDIS_CONN.delete(claim)
+
+            logging.info("[reconcile] FINALIZED kb=%s task=%s (%d nodes, %d edges)", kb_id, task_id, n_nodes, n_edges)
+            finalized += 1
+        except Exception:
+            logging.exception("[reconcile] kb=%s task=%s 失败", kb_id, task_id)
+            failed += 1
+            try:
+                REDIS_CONN.delete(f"graphrag:reconcile:{task_id}")
+            except Exception:
+                pass
+
+    logging.info("[reconcile] 完成:finalized=%d skipped=%d failed=%d (候选 %d)", finalized, skipped, failed, len(kbs))
 
 
 async def collect():
@@ -2070,6 +2194,14 @@ async def main():
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Boot-time reconciliation:把 OS 有数据、MySQL 进度卡住的 task 标完成
+    # 阻塞启动而不是 create_task 是有意为之:扫描期间不消费新任务,避免与刚被恢复的 task 抢资源
+    if TASK_TYPE == "common":
+        try:
+            await reconcile_stuck_graphrag_tasks()
+        except Exception:
+            logging.exception("reconcile_stuck_graphrag_tasks 未捕获异常")
 
     report_task = asyncio.create_task(report_status())
     kg_pp_task = asyncio.create_task(kg_postprocess_consumer())

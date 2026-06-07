@@ -1047,6 +1047,10 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
     now = asyncio.get_running_loop().time()
     if callback:
         callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
+    # FIX ①: data 已落 OS,立即报 1.0,把"OS 完成"和"MySQL 进度"压缩到同一段代码。
+    # 崩溃只可能让 OS 写完、MySQL 没写完 —— 由 task_executor 启动时的 reconciler 兜底。
+    if callback:
+        callback(prog=1.0, msg=f"Knowledge Graph data committed ({len(change.added_updated_nodes)} nodes, {len(change.added_updated_edges)} edges).")
 
 
 async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
@@ -1137,6 +1141,10 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
     now = asyncio.get_running_loop().time()
     if callback:
         callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
+    # FIX ①: data 已落 OS,立即报 1.0,把"OS 完成"和"MySQL 进度"压缩到同一段代码。
+    # 崩溃只可能让 OS 写完、MySQL 没写完 —— 由 task_executor 启动时的 reconciler 兜底。
+    if callback:
+        callback(prog=1.0, msg=f"Knowledge Graph data committed ({len(change.added_updated_nodes)} nodes, {len(change.added_updated_edges)} edges).")
 
 
 async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
