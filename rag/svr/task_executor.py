@@ -175,6 +175,10 @@ else:
 
 stop_event = threading.Event()
 
+# 心跳锁 v2:记录当前正在 set_progress 的 task_id,供后台 _heartbeat_loop 续期
+# 用 GIL 保护单变量读写原子,set_progress 是 sync、_heartbeat_loop 是 async,通信靠这一变量
+current_task_id: Optional[str] = None
+
 def signal_handler(sig, frame):
     logging.info("Received interrupt signal, shutting down...")
     stop_event.set()
@@ -183,7 +187,20 @@ def signal_handler(sig, frame):
 
 
 def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing..."):
+    global current_task_id
     try:
+        # [心跳锁 v2] 首次 SETEX —— 同一 task_id 切换时(worker 接下一个 task)重写
+        if current_task_id != task_id:
+            current_task_id = task_id
+            try:
+                REDIS_CONN.set(
+                    f"graphrag:hb:{task_id}",
+                    f"{socket.gethostname()}:{os.getpid()}",
+                    ex=GraphRAGConfig.HEARTBEAT_TTL,
+                )
+            except Exception:
+                logging.exception("[heartbeat] 首次写锁失败 task=%s", task_id)
+
         if prog is not None and prog < 0:
             msg = "[ERROR]" + msg
         cancel = has_canceled(task_id)
@@ -208,6 +225,14 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
         if cancel:
             raise TaskCanceledException(msg)
         logging.info(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}")
+
+        # [心跳锁 v2] 终态删锁:task 完成(prog=1.0)或失败(prog=-1.0)后清锁
+        if prog is not None and (prog >= 1.0 or prog <= 0):
+            try:
+                REDIS_CONN.delete(f"graphrag:hb:{task_id}")
+            except Exception:
+                logging.exception("[heartbeat] 终态删锁失败 task=%s", task_id)
+            current_task_id = None
     except TaskCanceledException:
         raise
     except DoesNotExist:
@@ -277,8 +302,34 @@ async def reconcile_stuck_graphrag_tasks():
                 logging.info("[reconcile] kb=%s task=%s progress=%.4f 不在 (0,1),skip", kb_id, task_id, prog)
                 REDIS_CONN.delete(claim)
                 continue
+
+            # [v2] 心跳锁优先判定:TTL > 0 视为"真在跑",直接 skip
+            # redis-py:ttl 返回 int 秒;key 不存在返回 -2;存在但无 TTL 返回 -1
+            heartbeat_key = f"graphrag:hb:{task_id}"
+            try:
+                ttl = REDIS_CONN.ttl(heartbeat_key)
+                if ttl is None:
+                    ttl = -2  # 防御:某些版本 redis-py 在 key 不存在时返回 None
+            except Exception:
+                logging.exception("[reconcile] TTL 查询失败 task=%s,降级到 grace 判定", task_id)
+                ttl = -2
+
+            if ttl > 0:
+                logging.info(
+                    "[reconcile] kb=%s task=%s heartbeat 仍活(ttl=%ds),skip reconcile",
+                    kb_id, task_id, ttl,
+                )
+                REDIS_CONN.delete(claim)
+                skipped += 1
+                continue
+
+            # [v2 兜底] 心跳锁缺失或异常时,仍要求 update_time 距今 > STUCK_TASK_GRACE_MINUTES
+            # 覆盖:KB 切换 task 空档 / 心跳锁误删 / 罕见竞态 / Redis 故障
             if update_time > cutoff_ms:
-                logging.info("[reconcile] kb=%s task=%s update_time=%d 距今 < grace,skip", kb_id, task_id, update_time)
+                logging.info(
+                    "[reconcile] kb=%s task=%s heartbeat 缺失但 update_time 距今 < grace,skip",
+                    kb_id, task_id,
+                )
                 REDIS_CONN.delete(claim)
                 continue
 
@@ -313,6 +364,11 @@ async def reconcile_stuck_graphrag_tasks():
             # 5) 标完成 + 写 KB 的 finish_at、清 task 绑定
             msg = f"Knowledge Graph reconciled ({n_nodes} nodes, {n_edges} edges) [boot]"
             TaskService.update_progress(task_id, {"progress": 1.0, "progress_msg": msg})
+            # [v2] 清心跳锁(防御性,理论上 set_progress 终态会清,reconcile 是另一条路径)
+            try:
+                REDIS_CONN.delete(heartbeat_key)
+            except Exception:
+                logging.exception("[reconcile] 清心跳锁失败 task=%s", task_id)
             KnowledgebaseService.update_by_id(
                 kb_id, {"graphrag_task_finish_at": datetime.now(), "graphrag_task_id": ""}
             )
@@ -334,6 +390,11 @@ async def reconcile_stuck_graphrag_tasks():
             failed += 1
             try:
                 REDIS_CONN.delete(f"graphrag:reconcile:{task_id}")
+            except Exception:
+                pass
+            # [v2] 本 task 标失败后清心跳锁,避免下次 reconcile 撞到陈旧锁
+            try:
+                REDIS_CONN.delete(f"graphrag:hb:{task_id}")
             except Exception:
                 pass
 
@@ -1944,6 +2005,27 @@ async def get_server_ip() -> str:
         return 'Unknown'
 
 
+async def _heartbeat_loop():
+    """每 HEARTBEAT_INTERVAL 秒给 current_task_id 对应的 task 续期心跳锁。
+
+    v2 reconcile 用 TTL 判定 task 真在跑 vs 真卡死,所以本协程必须每 <TTL 续期。
+    与 report_status 一样用 while True + sleep 模式,靠 task.cancel() 终止。
+    """
+    interval = GraphRAGConfig.HEARTBEAT_INTERVAL
+    ttl = GraphRAGConfig.HEARTBEAT_TTL
+    value = f"{socket.gethostname()}:{os.getpid()}"
+    while True:
+        await asyncio.sleep(interval)
+        tid = current_task_id
+        if not tid:
+            continue  # 空闲 worker,跳过
+        try:
+            REDIS_CONN.set(f"graphrag:hb:{tid}", value, ex=ttl)
+        except Exception:
+            logging.exception("[heartbeat] 续期失败 task=%s", tid)
+            # 不 break,继续尝试:短时网络抖动不应让心跳彻底停
+
+
 async def report_status():
     """
     Periodically reports the executor's heartbeat
@@ -2205,6 +2287,7 @@ async def main():
 
     report_task = asyncio.create_task(report_status())
     kg_pp_task = asyncio.create_task(kg_postprocess_consumer())
+    heartbeat_task = asyncio.create_task(_heartbeat_loop())
     tasks = []
 
     logging.info(f"RAGFlow ingestion is ready after {time.time() - start_ts}s initialization.")
@@ -2221,7 +2304,8 @@ async def main():
         await asyncio.gather(*tasks, return_exceptions=True)
         report_task.cancel()
         kg_pp_task.cancel()
-        await asyncio.gather(report_task, kg_pp_task, return_exceptions=True)
+        heartbeat_task.cancel()
+        await asyncio.gather(report_task, kg_pp_task, heartbeat_task, return_exceptions=True)
     logging.error("BUG!!! You should not reach here!!!")
 
 

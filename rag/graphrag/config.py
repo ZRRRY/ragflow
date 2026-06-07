@@ -49,13 +49,18 @@ class GraphRAGConfig:
     STUCK_TASK_MIN_NODES = int(os.environ.get("STUCK_TASK_MIN_NODES", "3"))
     STUCK_TASK_MIN_EDGES = int(os.environ.get("STUCK_TASK_MIN_EDGES", "3"))
 
+    # Phase 5-T5 – Per-task heartbeat lock (liveness beacon for reconcile v2)
+    HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
+    HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "90"))
+
     @classmethod
     def log_flags(cls):
         logger.info(
             "GraphRAGConfig: incremental_graph=%s incremental_merge=%s "
             "incremental_resolution=%s async_community=%s max_kg_tasks=%d min_kg_tasks=%d adaptive=%s "
             "adaptive_interval=%d degrade_thr=%d increase_thr=%d es_slow_ms=%d "
-            "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d",
+            "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d "
+            "heartbeat_interval=%ds heartbeat_ttl=%ds",
             cls.USE_INCREMENTAL_GRAPH,
             cls.USE_INCREMENTAL_MERGE,
             cls.USE_INCREMENTAL_RESOLUTION,
@@ -71,6 +76,8 @@ class GraphRAGConfig:
             cls.STUCK_TASK_GRACE_MINUTES,
             cls.STUCK_TASK_MIN_NODES,
             cls.STUCK_TASK_MIN_EDGES,
+            cls.HEARTBEAT_INTERVAL,
+            cls.HEARTBEAT_TTL,
         )
 
 
