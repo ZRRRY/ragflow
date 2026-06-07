@@ -14,6 +14,7 @@
 #  limitations under the License.
 import argparse
 import time
+from typing import Optional
 
 from rag.svr.task_executor_refactor.task_manager import TaskManager
 from rag.svr.task_executor_refactor.recording_context import timed_with_recording, get_recording_context, \
