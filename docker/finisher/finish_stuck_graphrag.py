@@ -232,6 +232,60 @@ def os_count(conf, kb_id, query):
     return -1
 
 
+def _os_hosts_first(conf):
+    """从 conf 里挑第一个 OS host,带协议头。失败返回 None。"""
+    os_cfg = conf.get("os") or conf.get("es") or {}
+    hosts = os_cfg.get("hosts", "http://opensearch01:9201")
+    if isinstance(hosts, str):
+        first = hosts.split(",")[0].strip()
+    else:
+        first = list(hosts)[0]
+    if "://" not in first:
+        first = "http://" + first
+    return first.rstrip("/"), os_cfg
+
+
+def os_list_ragflow_indices(conf):
+    """列 OS 里所有 ragflow_* 索引,以及每个的 node/edge/total 计数。
+
+    返回 list of (index_name, n_node, n_edge, n_total)。失败返回 []。
+    """
+    import requests
+
+    base, os_cfg = _os_hosts_first(conf)
+    if not base:
+        return []
+    username = os_cfg.get("username", "admin")
+    password = os_cfg.get("password", "")
+    verify = bool(os_cfg.get("verify_certs", False))
+    auth = (username, password) if password else None
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+    try:
+        # 用 _cat/indices 列出所有 ragflow_* 索引名
+        r = requests.get(
+            f"{base}/_cat/indices/ragflow_*?h=index&format=json",
+            auth=auth, headers=headers, timeout=10, verify=verify,
+        )
+        if r.status_code != 200:
+            log.warning("_cat/indices 失败: HTTP %d %s", r.status_code, r.text[:200])
+            return []
+        names = [row.get("index") for row in r.json() if row.get("index")]
+    except Exception as e:
+        log.warning("_cat/indices 异常: %s", e)
+        return []
+
+    # 对每个索引,取 node/edge/total
+    out = []
+    for idx in sorted(names):
+        kb_part = idx.replace("ragflow_", "", 1)
+        n_node = os_count(conf, kb_part, "knowledge_graph_kwd:node")
+        n_edge = os_count(conf, kb_part, "knowledge_graph_kwd:edge")
+        n_total = os_count(conf, kb_part, "*")
+        out.append((idx, n_node, n_edge, n_total))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Redis phase marker 清理
 # ---------------------------------------------------------------------------
@@ -271,25 +325,29 @@ def cleanup_redis(conf, kb_id, dry_run=True):
 # ---------------------------------------------------------------------------
 # 子命令
 # ---------------------------------------------------------------------------
-def cmd_check(conf, kb_id):
-    """只读:看 OS 里的数据,看 MySQL 里卡住的 task。"""
+def cmd_check(conf, kb_id, os_kb_id):
+    """只读:看 OS 里的数据,看 MySQL 里卡住的 task。
+
+    当 os_kb_id != kb_id 时,同时列两边的 OS 索引计数,帮用户诊断
+    'task 关联的 KB' 与 'OS 真实写数据的 KB' 不一致的情况。
+    """
     log.info("=" * 70)
-    log.info("[CHECK] KB = %s", kb_id)
+    log.info("[CHECK] MySQL KB = %s  |  OS KB = %s", kb_id, os_kb_id)
     log.info("=" * 70)
 
-    # 1) OS 里的实体数
-    n_nodes = os_count(conf, kb_id, "knowledge_graph_kwd:node")
-    n_edges = os_count(conf, kb_id, "knowledge_graph_kwd:edge")
-    n_reports = os_count(conf, kb_id, "knowledge_graph_kwd:community_report")
-    n_total = os_count(conf, kb_id, "*")
+    # 1) OS 里的实体数(os_kb_id)
+    n_nodes = os_count(conf, os_kb_id, "knowledge_graph_kwd:node")
+    n_edges = os_count(conf, os_kb_id, "knowledge_graph_kwd:edge")
+    n_reports = os_count(conf, os_kb_id, "knowledge_graph_kwd:community_report")
+    n_total = os_count(conf, os_kb_id, "*")
 
-    log.info("OS  ragflow_%s 索引:", kb_id.replace("-", ""))
+    log.info("OS  ragflow_%s 索引:", os_kb_id.replace("-", ""))
     log.info("  - 节点 (knowledge_graph_kwd:node)        : %d", n_nodes)
     log.info("  - 边   (knowledge_graph_kwd:edge)        : %d", n_edges)
     log.info("  - 社区报告(knowledge_graph_kwd:community) : %d", n_reports)
     log.info("  - 文档块总索引(含 node/edge)             : %d", n_total)
 
-    # 2) MySQL 卡住的 task
+    # 2) MySQL 卡住的 task(用 kb_id,不是 os_kb_id)
     log.info("-" * 70)
     log.info("MySQL  task 表中 progress ∈ (0, 1) 的任务:")
     try:
@@ -305,6 +363,23 @@ def cmd_check(conf, kb_id):
             t["id"], t["doc_id"], t["task_type"], t["progress"], t["progress_msg"],
         )
 
+    # 3) 当 MySQL/OS KB 不一致时,顺手列所有 ragflow_* 索引帮诊断
+    if os_kb_id != kb_id:
+        log.info("-" * 70)
+        log.info("⚠ MySQL task 关联的 KB 跟 OS 索引 KB 不一致,以下为 OS 全部 ragflow_* 索引:")
+        rows = os_list_ragflow_indices(conf)
+        if not rows:
+            log.info("  (没找到任何 ragflow_* 索引)")
+        for idx, n_node, n_edge, n_total_idx in rows:
+            marker = ""
+            if n_node > 0 or n_edge > 0:
+                marker = "  ← 这里有数据"
+            log.info(
+                "  - %-50s  node=%-6d edge=%-6d docs=%-7d%s",
+                idx, n_node, n_edge, n_total_idx, marker,
+            )
+        log.info("提示:在 `finish` 时加 --os-kb-id <上面对应索引的 KB ID> 指向真实有数据的索引。")
+
     log.info("=" * 70)
     log.info("判断:")
     if n_nodes > 0 and n_edges > 0:
@@ -317,15 +392,16 @@ def cmd_check(conf, kb_id):
     return 0
 
 
-def cmd_finish(conf, kb_id, dry_run):
+def cmd_finish(conf, kb_id, os_kb_id, dry_run):
     """把卡住的 task 标 done,默认 dry-run。"""
     log.info("=" * 70)
-    log.info("[FINISH] KB = %s  dry_run = %s", kb_id, dry_run)
+    log.info("[FINISH] MySQL KB = %s  |  OS KB = %s  |  dry_run = %s",
+             kb_id, os_kb_id, dry_run)
     log.info("=" * 70)
 
-    # 先读 OS 真实数字
-    n_nodes = os_count(conf, kb_id, "knowledge_graph_kwd:node")
-    n_edges = os_count(conf, kb_id, "knowledge_graph_kwd:edge")
+    # 先读 OS 真实数字(用 os_kb_id)
+    n_nodes = os_count(conf, os_kb_id, "knowledge_graph_kwd:node")
+    n_edges = os_count(conf, os_kb_id, "knowledge_graph_kwd:edge")
     if n_nodes < 0 or n_edges < 0:
         log.error("OS 查询失败,拒绝继续,避免误标 task done。")
         return 2
@@ -359,7 +435,7 @@ def cmd_finish(conf, kb_id, dry_run):
                     log.error("     UPDATE 失败: %s", e)
                     return 1
 
-    # 顺便清 phase marker
+    # 顺便清 phase marker(用 kb_id,跟 MySQL 保持一致)
     log.info("-" * 70)
     log.info("顺手清 Redis phase marker:")
     try:
@@ -406,23 +482,44 @@ def main():
         "--apply", action="store_true",
         help="真正写库/清 Redis;不加此参数,所有写操作都是 dry-run",
     )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="显式声明 dry-run(默认就是 dry-run,加这个只是显式;跟 --apply 互斥)",
+    )
+    p.add_argument(
+        "--os-kb-id",
+        help="OpenSearch 索引对应的 KB ID(默认等于 --kb-id)。"
+             "当 MySQL 里 task 关联的 KB 跟 OS 真实写数据的索引对应 KB 不一致时,"
+             "用这个参数指向 OS 那边真实有数据的 KB,典型场景:KB 重建/迁移过。",
+    )
     args = p.parse_args()
+
+    if args.apply and args.dry_run:
+        p.error("--apply 和 --dry-run 互斥,只能选一个")
+    dry_run = not args.apply
+
+    os_kb_id = args.os_kb_id or args.kb_id
+    if args.os_kb_id and args.os_kb_id != args.kb_id:
+        log.warning("=" * 70)
+        log.warning("  --os-kb-id 与 --kb-id 不同:")
+        log.warning("    MySQL task 过滤用 --kb-id   = %s", args.kb_id)
+        log.warning("    OpenSearch 索引用 --os-kb-id = %s", os_kb_id)
+        log.warning("=" * 70)
 
     conf = load_service_conf()
     if not conf:
         log.error("加载 service_conf 失败,退出。")
         return 1
 
-    dry_run = not args.apply
     if not dry_run:
         log.warning("=" * 70)
         log.warning("  --apply 已设置,操作将真正写入。")
         log.warning("=" * 70)
 
     if args.action == "check":
-        return cmd_check(conf, args.kb_id)
+        return cmd_check(conf, args.kb_id, os_kb_id)
     if args.action == "finish":
-        return cmd_finish(conf, args.kb_id, dry_run=dry_run)
+        return cmd_finish(conf, args.kb_id, os_kb_id, dry_run=dry_run)
     if args.action == "cleanup":
         return cmd_cleanup(conf, args.kb_id, dry_run=dry_run)
     return 0
