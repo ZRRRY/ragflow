@@ -9,18 +9,23 @@ finisher / finish_stuck_graphrag.py
   1. 只读 + 幂等,任何一步出错不破坏已有数据。
   2. 默认 dry-run,加 --apply 才真正写库。
   3. 复用容器内的 service_conf.yaml 拿连接信息,不依赖外部传参。
+  4. 三个外部依赖全部直连(pymysql/requests/redis),不引入 RAGFlow 自己的
+     settings.BaseDataBase / ElasticSearchConnectionPool,避开:
+       - elasticsearch-py 8.x 默认 Content-Type 在 OpenSearch 2.x 报 406
+       - api.db.db 不存在、common.settings 需要 import 时机正确 等坑
+     容器内只需要 pymysql / requests / redis / pyyaml 四个包,都在 RAGFlow venv 里。
 
 典型场景:任务在 set_graph 写完 1526 nodes / 4266 edges / 5792 chunks 之后,
 callback 链路或 Redis 锁释放卡住,task_executor 被 SIGKILL 后无法续跑。
 这时 OS 里数据完好,MySQL task 表 progress 永远停在 4.43%。
 本脚本:校验数据 -> 改 task.progress=1.0 -> 清 Redis phase marker。
 
-用法(在 ragflow-cpu 容器内):
+用法(在 docker-ragflow-cpu-1 容器内,实际容器名以 `docker ps` 输出为准):
   # 1) 先看现状(不改任何东西)
   python3 finish_stuck_graphrag.py --kb-id <KB_ID> check
 
   # 2) 干跑,看会改哪些 task
-  python3 finish_stuck_graphrag.py --kb-id <KB_ID> finish --dry-run
+  python3 finish_stuck_graphrag.py --kb-id <KB_ID> finish
 
   # 3) 真正执行
   python3 finish_stuck_graphrag.py --kb-id <KB_ID> finish --apply
@@ -29,14 +34,15 @@ callback 链路或 Redis 锁释放卡住,task_executor 被 SIGKILL 后无法续�
   python3 finish_stuck_graphrag.py --kb-id <KB_ID> cleanup --apply
 """
 import argparse
-import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
-# 让脚本在容器内能找到 ragflow 的包
+# 让脚本在容器内能找到 ragflow 的包(虽然脚本主体不依赖 ragflow,留着方便 import 调试)
 sys.path.insert(0, "/ragflow")
 
 logging.basicConfig(
@@ -52,16 +58,18 @@ log = logging.getLogger("finisher")
 # ---------------------------------------------------------------------------
 def load_service_conf():
     """从 /ragflow/conf/service_conf.yaml 读连接配置。"""
-    import yaml
+    try:
+        import yaml
+    except ImportError:
+        log.error("缺少 PyYAML,请在容器内装:pip install pyyaml")
+        return None
     conf_path = Path("/ragflow/conf/service_conf.yaml")
     if not conf_path.exists():
-        log.warning("service_conf.yaml 不存在,fallback 到环境变量")
-        return {}
+        log.error("service_conf.yaml 不存在: %s", conf_path)
+        return None
     with open(conf_path, "r", encoding="utf-8") as f:
-        # 模板里是 ${VAR:-default} 形式,需要手动展开
         raw = f.read()
-    # 简单做一次 ${VAR:-default} 展开
-    import re
+    # 模板里是 ${VAR:-default} 形式,需要手动展开
     def _sub(m):
         var = m.group(1)
         default = m.group(2)
@@ -71,89 +79,157 @@ def load_service_conf():
 
 
 # ---------------------------------------------------------------------------
-# OpenSearch 校验:确认实体/边/chunk 都在
+# 连接帮助函数:解析 conf 里的 host:port 形式
 # ---------------------------------------------------------------------------
-def os_count(conf, kb_id, query, auth=None):
-    """对 KB 的 chunk 索引做一次 _count。"""
-    from elasticsearch import Elasticsearch
+def _split_host_port(value, default_port):
+    """'mysql:3306' 或 'mysql' -> (host, port)。"""
+    if value is None:
+        return None, default_port
+    s = str(value).strip()
+    if "://" in s:
+        u = urlparse(s)
+        return u.hostname, u.port or default_port
+    if ":" in s:
+        h, p = s.rsplit(":", 1)
+        try:
+            return h, int(p)
+        except ValueError:
+            return s, default_port
+    return s, default_port
 
-    os_cfg = conf.get("os") or conf.get("es") or {}
-    hosts = os_cfg.get("hosts", "http://opensearch01:9201")
-    username = os_cfg.get("username", "admin")
-    password = os_cfg.get("password", "")
 
-    es = Elasticsearch(
-        hosts=[hosts],
-        basic_auth=(username, password) if password else None,
-        verify_certs=False,
-        request_timeout=10,
+# ---------------------------------------------------------------------------
+# MySQL 直连
+# ---------------------------------------------------------------------------
+def mysql_connect(conf):
+    import pymysql
+    m = conf.get("mysql") or {}
+    host, port = _split_host_port(m.get("host"), 3306)
+    return pymysql.connect(
+        host=host,
+        port=port,
+        user=m.get("user", "root"),
+        password=m.get("password", ""),
+        database=m.get("name", "rag_flow"),
+        charset="utf8mb4",
+        autocommit=False,
+        connect_timeout=10,
+        read_timeout=10,
+        write_timeout=10,
     )
 
-    # KB 的 chunk 索引命名规则:ragflow_<kb_id> 去掉横杠
-    index = f"ragflow_{kb_id.replace('-', '')}"
-    body = {"query": {"bool": {"must": [{"query_string": {"query": query}}]}}}
-    try:
-        resp = es.count(index=index, body=body)
-        return resp.get("count", 0)
-    except Exception as e:
-        log.error("OS count 失败: index=%s query=%s err=%s", index, query, e)
-        return -1
 
-
-# ---------------------------------------------------------------------------
-# MySQL task 表:列出 / 标记 完成
-# ---------------------------------------------------------------------------
 def list_stuck_tasks(conf, kb_id):
-    """找出 progress ∈ (0, 1) 的 graphrag 任务。"""
-    from api.db.db_models import Task
-    from api.db.db import DB
+    """找出 progress ∈ (0, 1) 的 graphrag 任务。
 
-    DB.init(conf.get("mysql", {}))
-    rows = (
-        Task.select()
-        .where(
-            (Task.kb_id == kb_id)
-            & (Task.progress > 0)
-            & (Task.progress < 1)
-        )
-        .order_by(Task.create_time.desc())
-    )
+    Task 表本身没有 kb_id 字段,关联走反查:
+    knowledgebase.graphrag_task_id -> task.id
+    """
+    conn = mysql_connect(conf)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.id, t.doc_id, t.task_type, t.progress, t.progress_msg,
+                       t.create_time, t.update_time
+                FROM knowledgebase k
+                JOIN task t ON t.id = k.graphrag_task_id
+                WHERE k.id = %s
+                  AND t.progress > 0
+                  AND t.progress < 1
+                ORDER BY t.create_time DESC
+                """,
+                (kb_id,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
     out = []
     for r in rows:
         out.append(
             {
-                "id": r.id,
-                "doc_id": r.doc_id,
-                "progress": r.progress,
-                "progress_msg": (r.progress_msg or "")[:120],
-                "create_time": r.create_time,
-                "update_time": r.update_time,
-                "task_type": r.task_type,
+                "id": r[0],
+                "doc_id": r[1],
+                "task_type": r[2],
+                "progress": float(r[3]) if r[3] is not None else 0.0,
+                "progress_msg": (r[4] or "")[:120],
+                "create_time": r[5],
+                "update_time": r[6],
             }
         )
-    DB.close()
     return out
 
 
 def mark_task_done(conf, task_id, progress_msg):
     """把 task.progress 改成 1.0。"""
-    from api.db.db_models import Task
-    from api.db.db import DB
-
-    DB.init(conf.get("mysql", {}))
+    conn = mysql_connect(conf)
+    n = 0
     try:
-        n = (
-            Task.update(
-                progress=1.0,
-                progress_msg=progress_msg,
-                update_time=int(time.time() * 1000),
+        with conn.cursor() as cur:
+            n = cur.execute(
+                """
+                UPDATE task
+                SET progress = 1.0,
+                    progress_msg = %s,
+                    update_time = %s
+                WHERE id = %s
+                """,
+                (progress_msg, int(time.time() * 1000), task_id),
             )
-            .where(Task.id == task_id)
-            .execute()
-        )
+        conn.commit()
     finally:
-        DB.close()
+        conn.close()
     return n
+
+
+# ---------------------------------------------------------------------------
+# OpenSearch 直连:用 requests,避开 ES 8.x 客户端 406 Content-Type 问题
+# ---------------------------------------------------------------------------
+def os_count(conf, kb_id, query):
+    """对 KB 的 chunk 索引做一次 _count,失败返回 -1。"""
+    import requests
+
+    os_cfg = conf.get("os") or conf.get("es") or {}
+    hosts = os_cfg.get("hosts", "http://opensearch01:9201")
+    if isinstance(hosts, str):
+        host_list = [h.strip() for h in hosts.split(",") if h.strip()]
+    else:
+        host_list = list(hosts)
+
+    username = os_cfg.get("username", "admin")
+    password = os_cfg.get("password", "")
+    verify = bool(os_cfg.get("verify_certs", False))
+
+    index = f"ragflow_{kb_id.replace('-', '')}"
+    body = {"query": {"query_string": {"query": query}}}
+
+    last_err = None
+    for host in host_list:
+        # 容错:有时是 http://x:9200,有时是裸 x:9200
+        if "://" not in host:
+            host = "http://" + host
+        url = f"{host.rstrip('/')}/{index}/_count"
+        try:
+            resp = requests.post(
+                url,
+                auth=(username, password) if password else None,
+                json=body,
+                timeout=10,
+                verify=verify,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+            )
+            if resp.status_code == 200:
+                return resp.json().get("count", 0)
+            if resp.status_code == 404:
+                # 索引不存在 = 0
+                return 0
+            last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:
+            last_err = repr(e)
+            continue
+    log.error("OS count 失败: index=%s query=%s err=%s", index, query, last_err)
+    return -1
 
 
 # ---------------------------------------------------------------------------
@@ -164,15 +240,16 @@ def cleanup_redis(conf, kb_id, dry_run=True):
     import redis
 
     r_cfg = conf.get("redis", {})
+    host, port = _split_host_port(r_cfg.get("host"), 6379)
     db = int(r_cfg.get("db", 1))
     password = r_cfg.get("password") or None
-    host = r_cfg.get("host", "redis:6379").split(":")[0]
-    port = int(r_cfg.get("host", "redis:6379").split(":")[1])
     username = r_cfg.get("username") or None
 
     r = redis.Redis(
-        host=host, port=port, db=db, password=password, username=username,
+        host=host, port=port, db=db,
+        password=password, username=username,
         decode_responses=True,
+        socket_timeout=5,
     )
 
     patterns = [f"graphrag:phase:{kb_id}:*", f"graphrag_task_{kb_id}"]
@@ -215,7 +292,11 @@ def cmd_check(conf, kb_id):
     # 2) MySQL 卡住的 task
     log.info("-" * 70)
     log.info("MySQL  task 表中 progress ∈ (0, 1) 的任务:")
-    tasks = list_stuck_tasks(conf, kb_id)
+    try:
+        tasks = list_stuck_tasks(conf, kb_id)
+    except Exception as e:
+        log.error("读 MySQL 失败: %s", e)
+        return 1
     if not tasks:
         log.info("  (无)")
     for t in tasks:
@@ -233,6 +314,7 @@ def cmd_check(conf, kb_id):
     if not tasks:
         log.info("  - MySQL 没有卡住的 task,无需 finish。")
     log.info("=" * 70)
+    return 0
 
 
 def cmd_finish(conf, kb_id, dry_run):
@@ -254,26 +336,37 @@ def cmd_finish(conf, kb_id, dry_run):
     progress_msg = f"Knowledge Graph done ({n_nodes} nodes, {n_edges} edges) [manually finalized]"
     log.info("将把 task.progress 设为 1.0,progress_msg = %r", progress_msg)
 
-    tasks = list_stuck_tasks(conf, kb_id)
+    try:
+        tasks = list_stuck_tasks(conf, kb_id)
+    except Exception as e:
+        log.error("读 MySQL 失败: %s", e)
+        return 1
     if not tasks:
         log.info("没有 progress ∈ (0,1) 的 task,无需 finish。")
-        return 0
-
-    for t in tasks:
-        log.info(
-            "  -> task id=%s doc=%s progress=%.4f -> 1.0",
-            t["id"], t["doc_id"], t["progress"],
-        )
-        if dry_run:
-            log.info("     [dry-run] 跳过 UPDATE")
-        else:
-            n = mark_task_done(conf, t["id"], progress_msg)
-            log.info("     UPDATE 影响行数: %d", n)
+    else:
+        for t in tasks:
+            log.info(
+                "  -> task id=%s doc=%s progress=%.4f -> 1.0",
+                t["id"], t["doc_id"], t["progress"],
+            )
+            if dry_run:
+                log.info("     [dry-run] 跳过 UPDATE")
+            else:
+                try:
+                    n = mark_task_done(conf, t["id"], progress_msg)
+                    log.info("     UPDATE 影响行数: %d", n)
+                except Exception as e:
+                    log.error("     UPDATE 失败: %s", e)
+                    return 1
 
     # 顺便清 phase marker
     log.info("-" * 70)
     log.info("顺手清 Redis phase marker:")
-    keys = cleanup_redis(conf, kb_id, dry_run=dry_run)
+    try:
+        keys = cleanup_redis(conf, kb_id, dry_run=dry_run)
+    except Exception as e:
+        log.error("清理 Redis 失败: %s", e)
+        keys = []
     log.info("  共 %d 个 key, dry_run=%s", len(keys), dry_run)
     for k in keys:
         log.info("    - %s", k)
@@ -284,7 +377,11 @@ def cmd_finish(conf, kb_id, dry_run):
 
 def cmd_cleanup(conf, kb_id, dry_run):
     log.info("[CLEANUP] KB = %s  dry_run = %s", kb_id, dry_run)
-    keys = cleanup_redis(conf, kb_id, dry_run=dry_run)
+    try:
+        keys = cleanup_redis(conf, kb_id, dry_run=dry_run)
+    except Exception as e:
+        log.error("清理 Redis 失败: %s", e)
+        return 1
     log.info("共 %d 个 key", len(keys))
     for k in keys:
         log.info("  - %s", k)
@@ -308,10 +405,6 @@ def main():
     p.add_argument(
         "--apply", action="store_true",
         help="真正写库/清 Redis;不加此参数,所有写操作都是 dry-run",
-    )
-    p.add_argument(
-        "--yes", action="store_true",
-        help="非交互确认(本脚本不交互,留着以备扩展)",
     )
     args = p.parse_args()
 

@@ -12,14 +12,17 @@
 
 ## 准备
 
-确认 `ragflow-cpu` 容器已起,且 OS / MySQL / Redis 三个依赖都健康。
+确认 `docker-ragflow-cpu-1` 容器已起,且 OS / MySQL / Redis 三个依赖都健康。
+> 本机 `docker compose up -d` 默认会用目录名作前缀,在 `docker/` 目录下起服务,所以容器名前缀都是 `docker-`(完整名:`docker-ragflow-cpu-1`、`docker-mysql-1`、`docker-opensearch01-1`、`docker-redis-1`、`docker-minio-1`)。如果你是用 `docker compose -p <别的名字> up -d` 起的,把所有 `docker-` 前缀替换成你自定义的项目名。
 
-把脚本目录挂进容器(可选,只在容器内没有该目录时需要)。`docker/finisher/` 已经在仓库内,你可以临时把它 `docker cp` 进去,或者把它挂成 volume。最简单的做法是 `docker cp`:
+把脚本拷进容器(在 `docker/` 目录下执行):
 
 ```bash
-docker cp docker/finisher/finish_stuck_graphrag.py ragflow-cpu:/ragflow/finish_stuck_graphrag.py
-docker exec -it ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py --help
+docker cp ./finisher/finish_stuck_graphrag.py docker-ragflow-cpu-1:/ragflow/finish_stuck_graphrag.py
+docker exec -it docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py --help
 ```
+
+> 如果你的当前目录不是 `docker/`,把 `./finisher/...` 换成对应相对路径,或用绝对路径如 `C:\Users\zry1127\ragflow\docker\finisher\finish_stuck_graphrag.py`。
 
 ## 用法
 
@@ -28,8 +31,7 @@ docker exec -it ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py --help
 ### Step 1:只读检查(不动任何东西)
 
 ```bash
-docker exec ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py \
-  --kb-id <KB_ID> check
+docker exec docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py --kb-id 97425e9e5d7411f1a78133e9dd471f84 check
 ```
 
 输出会显示:
@@ -40,8 +42,7 @@ docker exec ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py \
 ### Step 2:dry-run 看会改哪些 task
 
 ```bash
-docker exec ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py \
-  --kb-id <KB_ID> finish --dry-run
+docker exec docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py --kb-id 97425e9e5d7411f1a78133e9dd471f84 finish --dry-run
 ```
 
 注意:不传 `--apply` 时,`finish` 默认就是 dry-run。这一步让你确认**会改哪些 task、不会改哪些**。
@@ -49,8 +50,7 @@ docker exec ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py \
 ### Step 3:真正执行
 
 ```bash
-docker exec ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py \
-  --kb-id <KB_ID> finish --apply
+docker exec docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py --kb-id 97425e9e5d7411f1a78133e9dd471f84 finish --apply
 ```
 
 执行后会:
@@ -61,7 +61,7 @@ docker exec ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py \
 ### Step 4(可选):只清 Redis,不碰 MySQL
 
 ```bash
-docker exec ragflow-cpu python3 /ragflow/finish_stuck_graphrag.py \
+docker exec docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py \
   --kb-id <KB_ID> cleanup --apply
 ```
 
