@@ -112,7 +112,7 @@ class TaskHandler:
                     logging.exception(
                         f"Remove doc({task_doc_id}) from docStore failed when task({task_id}) canceled, exception: {e}")
 
-    @timeout(60 * 60 * 3, 1)
+    @timeout(None)
     async def handle(self) -> None:
         """Handle a document processing task."""
         ctx = self._task_context

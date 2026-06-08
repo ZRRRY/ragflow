@@ -1594,7 +1594,7 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
     return True
 
 
-@timeout(60 * 60 * 3, 1)
+@timeout(None)
 async def do_handle_task(task):
     task_type = task.get("task_type", "")
 

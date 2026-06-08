@@ -294,7 +294,7 @@ async def run_graphrag_for_kb(
     *,
     with_resolution: bool = True,
     with_community: bool = True,
-    max_parallel_docs: int = 4,
+    max_parallel_docs: int = 16,
 ) -> dict:
     tenant_id, kb_id = row["tenant_id"], row["kb_id"]
     task_id = row["id"]
@@ -1168,7 +1168,7 @@ async def merge_subgraph_incremental(
     return delta_graph
 
 
-@timeout(60 * 3)
+@timeout(None)
 async def merge_subgraph(
     tenant_id: str,
     kb_id: str,
@@ -1382,7 +1382,7 @@ async def resolve_entities_incremental(
     logging.info("[P3] incremental resolution done in %.2fs.", now - start)
 
 
-@timeout(60 * 30, 1)
+@timeout(None)
 async def resolve_entities(
     graph,
     subgraph_nodes: set[str],
