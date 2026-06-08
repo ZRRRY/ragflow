@@ -177,8 +177,33 @@ else:
 stop_event = threading.Event()
 
 # 心跳锁 v2:记录当前正在 set_progress 的 task_id,供后台 _heartbeat_loop 续期
-# 用 GIL 保护单变量读写原子,set_progress 是 sync、_heartbeat_loop 是 async,通信靠这一变量
-current_task_id: Optional[str] = None
+# Phase 4.1: 用 threading.Lock 保护多线程 set_progress 并发写 + asyncio loop 读。
+# 之前 GIL 只保证单变量赋值原子，但多个 set_progress 交错时
+# current_task_id 会被切到 B 的 task_id 但 graphrag:hb:{A} 锁已建立，
+# reconcile 看到两个 tid 都"活着"误判为正常。
+_current_task_id_lock = threading.Lock()
+_current_task_id_state: dict[str, Optional[str]] = {"tid": None}
+
+
+def _get_current_task_id() -> Optional[str]:
+    """线程安全读 current_task_id。"""
+    with _current_task_id_lock:
+        return _current_task_id_state["tid"]
+
+
+def _set_current_task_id(tid: Optional[str]) -> Optional[str]:
+    """线程安全写 current_task_id，返回旧值。"""
+    with _current_task_id_lock:
+        old = _current_task_id_state["tid"]
+        _current_task_id_state["tid"] = tid
+        return old
+
+
+# 兼容旧代码：保留模块级 current_task_id 名字，但读写都加锁
+def __getattr__(name):
+    if name == "current_task_id":
+        return _get_current_task_id()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 def signal_handler(sig, frame):
     logging.info("Received interrupt signal, shutting down...")
@@ -188,16 +213,17 @@ def signal_handler(sig, frame):
 
 
 def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing..."):
-    global current_task_id
     try:
         # [心跳锁 v2] 首次 SETEX —— 同一 task_id 切换时(worker 接下一个 task)重写
-        if current_task_id != task_id:
-            current_task_id = task_id
+        # Phase 4.1: 用线程安全读写替代裸 global 变量
+        prev_tid = _get_current_task_id()
+        if prev_tid != task_id:
+            _set_current_task_id(task_id)
             try:
                 REDIS_CONN.set(
                     f"graphrag:hb:{task_id}",
                     f"{socket.gethostname()}:{os.getpid()}",
-                    ex=GraphRAGConfig.HEARTBEAT_TTL,
+                    exp=GraphRAGConfig.HEARTBEAT_TTL,
                 )
             except Exception:
                 logging.exception("[heartbeat] 首次写锁失败 task=%s", task_id)
@@ -233,7 +259,8 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
                 REDIS_CONN.delete(f"graphrag:hb:{task_id}")
             except Exception:
                 logging.exception("[heartbeat] 终态删锁失败 task=%s", task_id)
-            current_task_id = None
+            # Phase 4.1: 线程安全写
+            _set_current_task_id(None)
     except TaskCanceledException:
         raise
     except DoesNotExist:
@@ -287,7 +314,7 @@ async def reconcile_stuck_graphrag_tasks():
         try:
             # 2) Redis SETNX 抢占(防多 worker 重复)
             claim = f"graphrag:reconcile:{task_id}"
-            if not REDIS_CONN.set(claim, "1", nx=True, ex=600):
+            if not REDIS_CONN.REDIS.set(claim, "1", ex=600, nx=True):
                 logging.info("[reconcile] kb=%s task=%s 已被别的 worker 抢占,skip", kb_id, task_id)
                 continue
 
@@ -2017,11 +2044,12 @@ async def _heartbeat_loop():
     value = f"{socket.gethostname()}:{os.getpid()}"
     while True:
         await asyncio.sleep(interval)
-        tid = current_task_id
+        # Phase 4.1: 线程安全读
+        tid = _get_current_task_id()
         if not tid:
             continue  # 空闲 worker,跳过
         try:
-            REDIS_CONN.set(f"graphrag:hb:{tid}", value, ex=ttl)
+            REDIS_CONN.set(f"graphrag:hb:{tid}", value, exp=ttl)
         except Exception:
             logging.exception("[heartbeat] 续期失败 task=%s", tid)
             # 不 break,继续尝试:短时网络抖动不应让心跳彻底停
@@ -2280,11 +2308,54 @@ async def main():
 
     # Boot-time reconciliation:把 OS 有数据、MySQL 进度卡住的 task 标完成
     # 阻塞启动而不是 create_task 是有意为之:扫描期间不消费新任务,避免与刚被恢复的 task 抢资源
+    # Phase 4.2: 用 Redis SETNX 做 leader 选举，确保 N 个 worker 同时启动时只有
+    # 1 个跑 reconcile，其他等它跑完（或等锁 TTL 过期）
     if TASK_TYPE == "common":
+        _reconcile_leader_key = "graphrag:reconcile:leader"
+        _reconcile_leader_ttl = 600  # 10 分钟，最坏情况覆盖一次完整扫描
+        _leader_token = f"{socket.gethostname()}:{os.getpid()}:{time.time()}"
+        _is_leader = False
         try:
-            await reconcile_stuck_graphrag_tasks()
+            _is_leader = bool(
+                REDIS_CONN.REDIS.set(_reconcile_leader_key, _leader_token, ex=_reconcile_leader_ttl, nx=True)
+            )
         except Exception:
-            logging.exception("reconcile_stuck_graphrag_tasks 未捕获异常")
+            logging.exception("reconcile leader 选举失败，回退到本地判断（所有 worker 都会跑）")
+            _is_leader = True
+
+        if _is_leader:
+            try:
+                await reconcile_stuck_graphrag_tasks()
+            except Exception:
+                logging.exception("reconcile_stuck_graphrag_tasks 未捕获异常")
+            finally:
+                try:
+                    # 释放 leader 锁（用 token 防误删别人的锁）
+                    if REDIS_CONN.REDIS is not None:
+                        REDIS_CONN.REDIS.eval(
+                            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                            1,
+                            _reconcile_leader_key,
+                            _leader_token,
+                        )
+                except Exception:
+                    logging.exception("reconcile leader 释放失败（依赖 TTL 自动过期）")
+        else:
+            logging.info("[reconcile] 非 leader worker，跳过本次 reconcile（等 leader 跑完或 TTL 过期）")
+            # 非 leader 也阻塞一小段时间，等 leader 完成，避免和 leader 抢 task_manager 资源
+            try:
+                wait_deadline = time.time() + _reconcile_leader_ttl
+                while time.time() < wait_deadline and not stop_event.is_set():
+                    val = None
+                    try:
+                        val = REDIS_CONN.REDIS.get(_reconcile_leader_key) if REDIS_CONN.REDIS else None
+                    except Exception:
+                        pass
+                    if val is None:
+                        break  # leader 跑完了
+                    await asyncio.sleep(2)
+            except Exception:
+                logging.exception("[reconcile] 等待 leader 完成时异常（不影响后续流程）")
 
     report_task = asyncio.create_task(report_status())
     kg_pp_task = asyncio.create_task(kg_postprocess_consumer())

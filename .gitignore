@@ -189,3 +189,6 @@ docker/launch_backend_service_windows.sh
 .claude/settings.local.json
 # 忽略本地的 mydocs 目录
 /mydocs
+
+#远程检索测试脚本（本地用，不入仓库）
+/test_retrieval_remote.py

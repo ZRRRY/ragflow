@@ -34,6 +34,12 @@ from rag.utils.redis_conn import REDIS_CONN
 from common import settings
 from common.doc_store.doc_store_base import OrderByExpr
 from rag.graphrag.config import GraphRAGConfig
+# Phase 2.3: search_after 分页，避免 size=10000 硬截断
+from rag.graphrag.utils_pagination import (
+    collect_all as _collect_all_search_after,
+    search_all_by_search_after as _search_all_by_search_after,
+    supports_search_after as _supports_search_after,
+)
 
 GRAPH_FIELD_SEP = "<SEP>"
 
@@ -478,17 +484,68 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
 
     ``edge_pairs`` is a list of ``(from_node, to_node)`` tuples.
     Returns a dict mapping ``(from, to) -> doc fields``.
+
+    Phase 2.3: 用 search_after 分页代替 ``size: 10000`` 硬卡，绕开 OS / ES
+    的 max_result_window 截断。后端不支持 search_after 时回退到旧路径。
     """
     if not edge_pairs:
         return {}
 
-    BATCH_SIZE = 50
-    existing = {}
+    conn = settings.docStoreConn
+    if not _supports_search_after(conn):
+        # Fallback: 旧 size 截断路径
+        return await _query_existing_relations_legacy(tenant_id, kb_id, edge_pairs)
 
+    BATCH_SIZE = 50
+    index_name = search.index_name(tenant_id)
+    existing: dict = {}
+
+    # 每个 batch 单独发 search_after 翻页查询，filter 与旧实现保持一致
+    # (from_entity_kwd ∈ batch_nodes AND to_entity_kwd ∈ batch_nodes)
     for i in range(0, len(edge_pairs), BATCH_SIZE):
         batch = edge_pairs[i:i + BATCH_SIZE]
         all_nodes = list(set(u for u, v in batch) | set(v for u, v in batch))
 
+        filters = {
+            "knowledge_graph_kwd": ["relation"],
+            "from_entity_kwd": all_nodes,
+            "to_entity_kwd": all_nodes,
+        }
+        try:
+            hits = await _collect_all_search_after(
+                filters=filters,
+                index_name=index_name,
+                kb_id=kb_id,
+                fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+                sort_field="from_entity_kwd",
+                page_size=1000,
+            )
+        except Exception as e:
+            logging.warning("query_existing_relations batch %d search_after failed: %s", i, e)
+            continue
+
+        for fields in hits:
+            # search_after 返回的 doc 不一定带 id（取决于 _source 投影），从 fields 中取
+            from_node = fields.get("from_entity_kwd")
+            to_node = fields.get("to_entity_kwd")
+            if isinstance(from_node, list):
+                from_node = from_node[0]
+            if isinstance(to_node, list):
+                to_node = to_node[0]
+            if from_node and to_node:
+                key = get_from_to(from_node, to_node)
+                existing[key] = fields
+
+    return existing
+
+
+async def _query_existing_relations_legacy(tenant_id, kb_id, edge_pairs):
+    """Phase 2.3: 不支持 search_after 的后端（旧 Infinity 等）走 size=10000 fallback。"""
+    BATCH_SIZE = 50
+    existing = {}
+    for i in range(0, len(edge_pairs), BATCH_SIZE):
+        batch = edge_pairs[i:i + BATCH_SIZE]
+        all_nodes = list(set(u for u, v in batch) | set(v for u, v in batch))
         conds = {
             "fields": ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
             "size": min(len(batch) * 10, 10000),
@@ -496,7 +553,6 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
             "from_entity_kwd": all_nodes,
             "to_entity_kwd": all_nodes,
         }
-
         try:
             es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
             for id in es_res.ids:
@@ -511,8 +567,7 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
                     key = get_from_to(from_node, to_node)
                     existing[key] = fields
         except Exception as e:
-            logging.warning("query_existing_relations batch %d failed: %s", i, e)
-
+            logging.warning("query_existing_relations_legacy batch %d failed: %s", i, e)
     return existing
 
 
@@ -520,65 +575,105 @@ async def query_node_relations(tenant_id, kb_id, node_names):
     """Query all relation documents where at least one endpoint is in ``node_names``.
 
     Returns a list of doc field dicts (deduplicated).
+
+    Phase 2.3: 用 search_after 翻页拉全量（绕过 10000 上限），后端不支持时
+    回退到 size=10000 旧路径。
     """
     if not node_names:
         return []
 
+    conn = settings.docStoreConn
+    if not _supports_search_after(conn):
+        return await _query_node_relations_legacy(tenant_id, kb_id, node_names)
+
+    BATCH_SIZE = 100
+    index_name = search.index_name(tenant_id)
+    all_fields: list[dict] = []
+    seen: set = set()
+
+    for i in range(0, len(node_names), BATCH_SIZE):
+        batch = node_names[i:i + BATCH_SIZE]
+
+        # Query by from_entity_kwd
+        try:
+            from_hits = await _collect_all_search_after(
+                filters={
+                    "knowledge_graph_kwd": ["relation"],
+                    "from_entity_kwd": batch,
+                },
+                index_name=index_name,
+                kb_id=kb_id,
+                fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+                sort_field="from_entity_kwd",
+                page_size=1000,
+            )
+        except Exception as e:
+            logging.warning("query_node_relations from-batch %d search_after failed: %s", i, e)
+            from_hits = []
+
+        # Query by to_entity_kwd
+        try:
+            to_hits = await _collect_all_search_after(
+                filters={
+                    "knowledge_graph_kwd": ["relation"],
+                    "to_entity_kwd": batch,
+                },
+                index_name=index_name,
+                kb_id=kb_id,
+                fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+                sort_field="to_entity_kwd",
+                page_size=1000,
+            )
+        except Exception as e:
+            logging.warning("query_node_relations to-batch %d search_after failed: %s", i, e)
+            to_hits = []
+
+        for fields in from_hits + to_hits:
+            from_node = fields.get("from_entity_kwd")
+            to_node = fields.get("to_entity_kwd")
+            if isinstance(from_node, list):
+                from_node = from_node[0]
+            if isinstance(to_node, list):
+                to_node = to_node[0]
+            key = get_from_to(from_node, to_node)
+            if key not in seen:
+                seen.add(key)
+                all_fields.append(fields)
+
+    return all_fields
+
+
+async def _query_node_relations_legacy(tenant_id, kb_id, node_names):
+    """Phase 2.3: 不支持 search_after 的后端走 size=10000 fallback。"""
     BATCH_SIZE = 100
     all_fields = []
     seen = set()
 
     for i in range(0, len(node_names), BATCH_SIZE):
         batch = node_names[i:i + BATCH_SIZE]
-
-        # Query by from_entity_kwd
-        conds = {
-            "fields": ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
-            "size": 10000,
-            "knowledge_graph_kwd": ["relation"],
-            "from_entity_kwd": batch,
-        }
-        try:
-            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
-            for id in es_res.ids:
-                fields = es_res.field[id]
-                from_node = fields.get("from_entity_kwd")
-                to_node = fields.get("to_entity_kwd")
-                if isinstance(from_node, list):
-                    from_node = from_node[0]
-                if isinstance(to_node, list):
-                    to_node = to_node[0]
-                key = get_from_to(from_node, to_node)
-                if key not in seen:
-                    seen.add(key)
-                    all_fields.append(fields)
-        except Exception as e:
-            logging.warning("query_node_relations from-batch %d failed: %s", i, e)
-
-        # Query by to_entity_kwd
-        conds = {
-            "fields": ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
-            "size": 10000,
-            "knowledge_graph_kwd": ["relation"],
-            "to_entity_kwd": batch,
-        }
-        try:
-            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
-            for id in es_res.ids:
-                fields = es_res.field[id]
-                from_node = fields.get("from_entity_kwd")
-                to_node = fields.get("to_entity_kwd")
-                if isinstance(from_node, list):
-                    from_node = from_node[0]
-                if isinstance(to_node, list):
-                    to_node = to_node[0]
-                key = get_from_to(from_node, to_node)
-                if key not in seen:
-                    seen.add(key)
-                    all_fields.append(fields)
-        except Exception as e:
-            logging.warning("query_node_relations to-batch %d failed: %s", i, e)
-
+        for endpoint in ("from_entity_kwd", "to_entity_kwd"):
+            conds = {
+                "fields": ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+                "size": 10000,
+                "knowledge_graph_kwd": ["relation"],
+                endpoint: batch,
+            }
+            try:
+                es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+                for id in es_res.ids:
+                    fields = es_res.field[id]
+                    from_node = fields.get("from_entity_kwd")
+                    to_node = fields.get("to_entity_kwd")
+                    if isinstance(from_node, list):
+                        from_node = from_node[0]
+                    if isinstance(to_node, list):
+                        to_node = to_node[0]
+                    key = get_from_to(from_node, to_node)
+                    if key not in seen:
+                        seen.add(key)
+                        all_fields.append(fields)
+            except Exception as e:
+                logging.warning("query_node_relations_legacy %s-batch %d failed: %s", endpoint, i, e)
     return all_fields
 
 
@@ -1004,35 +1099,51 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
             )
 
     if change.removed_edges:
+        # Phase 2.4: 把"一对一边"删除改成"按 from_node 分组批量 + terms filter"。
+        # 旧实现每条边触发一次 delete_by_query（OpenSearch 单 slice 单线程扫描），
+        # 几十万条边在大 KB 下耗时几十小时；新实现按 from_node 分桶，
+        # 每桶用 terms 一次 delete_by_query，IO 减少 100-1000 倍。
+        from collections import defaultdict
+        from_buckets: dict[str, list[str]] = defaultdict(list)
+        for from_node, to_node in change.removed_edges:
+            from_buckets[from_node].append(to_node)
 
-        async def del_edges(from_node, to_node):
+        async def del_edges_bulk(from_node: str, to_nodes: list[str]):
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     async with chat_limiter:
                         await thread_pool_exec(
                             settings.docStoreConn.delete,
-                            {"knowledge_graph_kwd": ["relation"], "from_entity_kwd": from_node, "to_entity_kwd": to_node},
+                            {
+                                "knowledge_graph_kwd": ["relation"],
+                                "from_entity_kwd": from_node,
+                                "to_entity_kwd": to_nodes,
+                            },
                             search.index_name(tenant_id),
-                            kb_id
+                            kb_id,
                         )
                     return
                 except Exception as e:
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
-                        logging.warning("del_edges(%s, %s) attempt %d failed: %s, retrying in %ds", from_node, to_node, attempt + 1, e, wait)
+                        logging.warning(
+                            "del_edges_bulk(from=%s, n_to=%d) attempt %d failed: %s, retrying in %ds",
+                            from_node, len(to_nodes), attempt + 1, e, wait,
+                        )
                         await asyncio.sleep(wait)
                     else:
                         raise
 
-        tasks = []
-        for from_node, to_node in change.removed_edges:
-            tasks.append(asyncio.create_task(del_edges(from_node, to_node)))
+        tasks = [
+            asyncio.create_task(del_edges_bulk(from_node, to_nodes))
+            for from_node, to_nodes in from_buckets.items()
+        ]
 
         try:
             await asyncio.gather(*tasks, return_exceptions=False)
         except Exception as e:
-            logging.error("Error while deleting edges: %s", e)
+            logging.error("Error while bulk-deleting edges: %s", e)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1044,6 +1155,14 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
     start = del_now
 
     await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert chunks")
+    # Phase 2.1: 全部 batch 写完后主动 refresh 一次。
+    if chunks:
+        try:
+            refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
+            if refresh_fn is not None:
+                await thread_pool_exec(refresh_fn, search.index_name(tenant_id))
+        except Exception:
+            logging.exception("post-insert refresh_idx failed (will rely on default refresh_interval)")
     now = asyncio.get_running_loop().time()
     if callback:
         callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
@@ -1100,33 +1219,47 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
             )
 
     if change.removed_edges:
-        async def del_edges(from_node, to_node):
+        # Phase 2.4: 同样改批量（与 set_graph_delta 一致）
+        from collections import defaultdict
+        from_buckets: dict[str, list[str]] = defaultdict(list)
+        for from_node, to_node in change.removed_edges:
+            from_buckets[from_node].append(to_node)
+
+        async def del_edges_bulk(from_node: str, to_nodes: list[str]):
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     async with chat_limiter:
                         await thread_pool_exec(
                             settings.docStoreConn.delete,
-                            {"knowledge_graph_kwd": ["relation"], "from_entity_kwd": from_node, "to_entity_kwd": to_node},
+                            {
+                                "knowledge_graph_kwd": ["relation"],
+                                "from_entity_kwd": from_node,
+                                "to_entity_kwd": to_nodes,
+                            },
                             search.index_name(tenant_id),
-                            kb_id
+                            kb_id,
                         )
                     return
                 except Exception as e:
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
-                        logging.warning("del_edges(%s, %s) attempt %d failed: %s, retrying in %ds", from_node, to_node, attempt + 1, e, wait)
+                        logging.warning(
+                            "del_edges_bulk(from=%s, n_to=%d) attempt %d failed: %s, retrying in %ds",
+                            from_node, len(to_nodes), attempt + 1, e, wait,
+                        )
                         await asyncio.sleep(wait)
                     else:
                         raise
 
-        tasks = []
-        for from_node, to_node in change.removed_edges:
-            tasks.append(asyncio.create_task(del_edges(from_node, to_node)))
+        tasks = [
+            asyncio.create_task(del_edges_bulk(from_node, to_nodes))
+            for from_node, to_nodes in from_buckets.items()
+        ]
         try:
             await asyncio.gather(*tasks, return_exceptions=False)
         except Exception as e:
-            logging.error("Error while deleting edges: %s", e)
+            logging.error("Error while bulk-deleting edges: %s", e)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1138,6 +1271,20 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
     start = del_now
 
     await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert chunks")
+    # Phase 2.1: 全部 batch 写完后主动 refresh 一次。
+    # insert 内部已经改 refresh="false"，避免 per-batch 等 1-2s。
+    # 这里 refresh 让后续 query（resolution / community 阶段读图）能立刻看到新数据。
+    if chunks:
+        try:
+            refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
+            if refresh_fn is not None:
+                await thread_pool_exec(refresh_fn, search.index_name(tenant_id))
+            else:
+                # 兜底：Infinity 等其他 doc store 可能没有 refresh_idx 接口
+                # 退而依赖默认 refresh_interval
+                logging.debug("docStoreConn has no refresh_idx; relying on default refresh_interval")
+        except Exception:
+            logging.exception("post-insert refresh_idx failed (will rely on default refresh_interval)")
     now = asyncio.get_running_loop().time()
     if callback:
         callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")

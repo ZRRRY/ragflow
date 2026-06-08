@@ -147,6 +147,34 @@ def _has_cancel_and_exit(task_id: str, message: str, callback=None) -> None:
     raise TaskCanceledException(f"Task {task_id} was cancelled")
 
 
+# Phase 4.3: 把 GraphRAG 锁的持锁 / 等待时长写到一个 Redis hash，
+# 方便外部 Prometheus / OTel exporter 抓取。
+#   HSET graphrag:lock_metrics:{kb_id} {lock_name} "{waited_seconds},{held_seconds},{timestamp}"
+#   EXPIRE 3600
+_LOCK_METRICS_KEY_TMPL = "graphrag:lock_metrics:{}"
+_LOCK_METRICS_TTL = 3600
+
+
+def _record_lock_metric(
+    kb_id: str,
+    lock_name: str,
+    *,
+    waited_seconds: float | None = None,
+    held_seconds: float | None = None,
+) -> None:
+    """记录一个锁事件到 Redis hash。失败不影响主流程。"""
+    try:
+        import time
+        from rag.utils.redis_conn import REDIS_CONN
+        key = _LOCK_METRICS_KEY_TMPL.format(kb_id)
+        value = f"{waited_seconds or 0:.3f},{held_seconds or 0:.3f},{time.time():.0f}"
+        if REDIS_CONN.REDIS is not None:
+            REDIS_CONN.REDIS.hset(key, lock_name, value)
+            REDIS_CONN.REDIS.expire(key, _LOCK_METRICS_TTL)
+    except Exception:
+        logging.exception("record_lock_metric write failed (non-fatal)")
+
+
 async def _run_with_retry(
     label: str,
     coro_factory,
@@ -273,6 +301,8 @@ async def run_graphrag_for_kb(
     start = asyncio.get_running_loop().time()
     fields_for_chunks = ["content_with_weight", "doc_id"]
     graphrag_config = kb_parser_config.get("graphrag", {})
+    # Phase 1.5: 提取 entity_types 用于 resolution 阶段的 excluded types 构造
+    kb_entity_types = graphrag_config.get("entity_types", []) or []
     batch_chunk_token_size = _batch_chunk_token_size_config(graphrag_config, "batch_chunk_token_size", DEFAULT_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE)
     retry_attempts = _bounded_int_config(graphrag_config, "retry_attempts", DEFAULT_GRAPHRAG_RETRY_ATTEMPTS, 1, 10)
     retry_backoff_seconds = _bounded_float_config(graphrag_config, "retry_backoff_seconds", DEFAULT_GRAPHRAG_RETRY_BACKOFF_SECONDS, 0.0, 600.0)
@@ -325,6 +355,23 @@ async def run_graphrag_for_kb(
     def load_doc_chunks(doc_id: str) -> list[str]:
         from common.token_utils import num_tokens_from_string
 
+        # Phase 4.5: 用 Redis 缓存 batched chunks。doc_id + (batch_chunk_token_size,
+        # tenant_id, kb_id, extractor_type) 作为 cache key。同一 doc 重提时
+        # 直接命中缓存，跳过 ES scroll + token 重新分桶。
+        cache_key = (
+            f"graphrag:doc_chunks:{tenant_id}:{kb_id}:{doc_id}:"
+            f"{_select_extractor_type(graphrag_config)}:{batch_chunk_token_size}"
+        )
+        try:
+            cached = REDIS_CONN.get(cache_key)
+            if cached:
+                import json as _json
+                chunks = _json.loads(cached)
+                callback(msg=f"[GraphRAG] chunk cache HIT for doc:{doc_id} ({len(chunks)} chunks)")
+                return chunks
+        except Exception:
+            logging.exception("doc_chunks cache read failed (non-fatal) for doc %s", doc_id)
+
         chunks = []
         current_chunk = ""
 
@@ -342,23 +389,29 @@ async def run_graphrag_for_kb(
         contents = [content for chunk in raw_chunks if (content := chunk.get("content_with_weight", ""))]
         # For NER-based extraction, no need to batch extract entity and relation
         if _select_extractor_type(graphrag_config) == "ner":
-            return contents
+            chunks = contents
+        else:
+            for content in contents:
+                # FIX: add newline separator when merging chunks so Markdown headers (e.g. ##) stay at line start
+                separator = "\n" if current_chunk and not current_chunk.endswith("\n") else ""
+                proposed = current_chunk + separator + content
+                if num_tokens_from_string(proposed) < batch_chunk_token_size:
+                    current_chunk = proposed
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                    current_chunk = content
 
-        for content in contents:
-            # FIX: add newline separator when merging chunks so Markdown headers (e.g. ##) stay at line start
-            separator = "\n" if current_chunk and not current_chunk.endswith("\n") else ""
-            proposed = current_chunk + separator + content
-            if num_tokens_from_string(proposed) < batch_chunk_token_size:
-                current_chunk = proposed
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = content
-
-        if current_chunk:
-            chunks.append(current_chunk)
+            if current_chunk:
+                chunks.append(current_chunk)
 
         callback(msg=f"[GraphRAG] chunk_list combine {len(raw_chunks)} raw chunks to {len(chunks)} chunks for LLM extraction for doc:{doc_id}")
+        # 写入缓存（1 天 TTL）
+        try:
+            import json as _json
+            REDIS_CONN.set(cache_key, _json.dumps(chunks, ensure_ascii=False), 24 * 3600)
+        except Exception:
+            logging.exception("doc_chunks cache write failed (non-fatal) for doc %s", doc_id)
         return chunks
 
     total_chunks = 0
@@ -487,7 +540,18 @@ async def run_graphrag_for_kb(
 
     kb_lock = RedisDistributedLock(f"graphrag_task_{kb_id}", lock_value=f"batch_merge:{task_id}", timeout=1200)
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before acquiring merge lock.", callback)
+    # Phase 4.3: 记录锁等待/持锁时长到 Redis hash，方便 dashboard 抓
+    lock_acquire_t0 = asyncio.get_running_loop().time()
     await _acquire_lock(kb_lock, "merge lock", lock_acquire_timeout_seconds, callback, task_id)
+    lock_held_t0 = asyncio.get_running_loop().time()
+    try:
+        _record_lock_metric(
+            kb_id=kb_id, lock_name="batch_merge",
+            waited_seconds=lock_held_t0 - lock_acquire_t0,
+            held_seconds=None,  # 在 finally 里更新
+        )
+    except Exception:
+        logging.exception("record_lock_metric failed (non-fatal)")
     callback(msg=f"[GraphRAG] dataset:{kb_id} merge lock acquired")
 
     try:
@@ -546,6 +610,16 @@ async def run_graphrag_for_kb(
             community_pending = with_community
             callback(msg=f"[GraphRAG] dataset:{kb_id} cleared phase markers after merge.")
     finally:
+        # Phase 4.3: 记录持锁时长
+        try:
+            _held = asyncio.get_running_loop().time() - lock_held_t0
+            _record_lock_metric(
+                kb_id=kb_id, lock_name="batch_merge",
+                waited_seconds=None,
+                held_seconds=_held,
+            )
+        except Exception:
+            logging.exception("record_lock_metric(held) failed (non-fatal)")
         kb_lock.release()
 
     if not with_resolution and not with_community:
@@ -611,6 +685,31 @@ async def run_graphrag_for_kb(
         # all graph nodes so candidate pairing actually finds something.
         if not subgraph_nodes:
             subgraph_nodes = set(final_graph.nodes())
+            # Phase 1.4: 纯 resume 路径上，subgraph_nodes 退化为全图节点后会触发
+            # EntityResolution.__call__ 的 O(n^2) itertools.combinations + nx.pagerank，
+            # 大 KB 下必 OOM 或 30min+ 卡死。加一个硬上限，超过则 fail-fast 并要求用户
+            # 重新走增量提交，让 EntityResolution 走 incremental 路径（按 type 分块，
+            # candidate 量从 O(n^2) 降到 O(new × type_existing)）。
+            max_safe_resume_nodes = int(
+                os.environ.get("KG_MAX_SAFE_RESUME_NODES", "5000")
+            )
+            if len(subgraph_nodes) > max_safe_resume_nodes:
+                callback(
+                    msg=(
+                        f"[GraphRAG] dataset:{kb_id} resume path would load "
+                        f"{len(subgraph_nodes)} nodes for resolution, "
+                        f"exceeds KG_MAX_SAFE_RESUME_NODES={max_safe_resume_nodes}. "
+                        f"Please resubmit the task with all docs merged instead of resuming."
+                    )
+                )
+                now = asyncio.get_running_loop().time()
+                return {
+                    "ok_docs": ok_docs,
+                    "failed_docs": failed_docs,
+                    "total_docs": len(doc_ids),
+                    "total_chunks": total_chunks,
+                    "seconds": now - start,
+                }
 
         if resolution_pending:
             _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before entity resolution.", callback)
@@ -627,6 +726,7 @@ async def run_graphrag_for_kb(
                     embedding_model,
                     callback,
                     task_id=task_id,
+                    entity_types=kb_entity_types,
                 )
                 return graph_for_resolution
 
@@ -1086,9 +1186,15 @@ async def merge_subgraph(
                 tenant_id, kb_id, doc_id, subgraph, embedding_model, callback
             )
         except Exception as exc:
-            logging.error("merge_subgraph_incremental failed, falling back to monolithic merge: %s", exc, exc_info=True)
-            logging.warning("[P2] incremental merge failed, falling back to monolithic merge: %s", exc)
-            # fall through to monolithic path
+            # Phase 1.2: incremental 失败时不再 fallback 到 monolithic。
+            # monolithic 路径会触发 get_graph + 全图 PageRank + 一次性 set_graph，
+            # 在大 KB 下是 OOM/30min 卡死的直接原因。让 incremental 失败快速上抛，
+            # 由上层 _run_with_retry 做指数退避重试；若仍失败，task 直接 fail。
+            logging.exception(
+                "[P2] incremental merge failed for doc %s, will NOT fallback to monolithic: %s",
+                doc_id, exc,
+            )
+            raise
 
     old_graph = await get_graph(tenant_id, kb_id, subgraph.graph["source_id"])
     if old_graph is not None:
@@ -1124,6 +1230,7 @@ async def resolve_entities_incremental(
     embed_bdl,
     callback,
     task_id: str = "",
+    entity_types: list[str] | None = None,
 ):
     """Incremental entity resolution without loading the global graph.
 
@@ -1131,10 +1238,16 @@ async def resolve_entities_incremental(
     entities of the same type from the doc store, builds a local subgraph
     (including all neighbours so edge-redirects are not lost), and runs
     :class:`EntityResolution` on that local view only.
+
+    Phase 1.5: 新增 entity_types 参数，让调用方注入 kb_parser_config 里的
+    entity_types 用于 build_excluded_types()。None 时回退到 EXCLUDED_RESOLUTION_TYPES。
     """
     from collections import defaultdict
+    from rag.graphrag.entity_resolution import build_excluded_types
 
     start = asyncio.get_running_loop().time()
+
+    excluded_types = build_excluded_types(entity_types)
 
     if not subgraph_nodes:
         logging.info("[P3] No subgraph nodes, skipping resolution.")
@@ -1162,12 +1275,12 @@ async def resolve_entities_incremental(
         logging.info("[P3] No valid new nodes with types, skipping resolution.")
         return
 
-    er = EntityResolution(llm_bdl)
+    er = EntityResolution(llm_bdl, excluded_types=excluded_types, embed_bdl=embed_bdl)
     overall_change = GraphChange()
     all_local_graphs = []
 
     for ent_type, new_nodes in new_nodes_by_type.items():
-        if not new_nodes or ent_type in EXCLUDED_RESOLUTION_TYPES:
+        if not new_nodes or ent_type in excluded_types:
             continue
 
         # 3. Query existing nodes of the same type
@@ -1280,6 +1393,7 @@ async def resolve_entities(
     embed_bdl,
     callback,
     task_id: str = "",
+    entity_types: list[str] | None = None,
 ):
     # Check if task has been canceled before resolution
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled during entity resolution.", callback)
@@ -1289,18 +1403,28 @@ async def resolve_entities(
     if GraphRAGConfig.USE_INCREMENTAL_RESOLUTION:
         try:
             await resolve_entities_incremental(
-                tenant_id, kb_id, subgraph_nodes, llm_bdl, embed_bdl, callback, task_id=task_id
+                tenant_id, kb_id, subgraph_nodes, llm_bdl, embed_bdl, callback,
+                task_id=task_id, entity_types=entity_types,
             )
             now = asyncio.get_running_loop().time()
             callback(msg=f"Graph resolution done in {now - start:.2f}s.")
             return
         except Exception as exc:
-            logging.error("resolve_entities_incremental failed, falling back to monolithic: %s", exc, exc_info=True)
-            logging.warning("[P3] incremental resolution failed, falling back to monolithic: %s", exc)
-            # fall through to monolithic path
+            # Phase 1.3: incremental resolution 失败时不再 fallback 到 monolithic。
+            # monolithic 路径会跑 EntityResolution.__call__ 的 O(n^2) itertools.combinations
+            # + 装全图 + 跑全图 PageRank，大 KB 下必 OOM 或卡 30min+。快速失败由
+            # _run_with_retry 做指数退避重试；彻底失败时 task fail-fast 暴露根因。
+            logging.exception(
+                "[P3] incremental resolution failed, will NOT fallback to monolithic: %s",
+                exc,
+            )
+            raise
 
+    from rag.graphrag.entity_resolution import build_excluded_types
     er = EntityResolution(
         llm_bdl,
+        excluded_types=build_excluded_types(entity_types),
+        embed_bdl=embed_bdl,
     )
     reso = await er(graph, subgraph_nodes, callback=callback, task_id=task_id)
     graph = reso.graph

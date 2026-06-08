@@ -50,10 +50,13 @@ def timeout(seconds: float | int | str = None, attempts: int = 2, *, exception: 
 
             for a in range(attempts):
                 try:
+                    # Phase 1.1: 始终应用 result_queue.get 的 timeout 兜底；
+                    # 不再依赖 ENABLE_TIMEOUT_ASSERTION。线程本身不被中断（daemon
+                    # 会在主进程退出时清理），但调用方会拿到 TimeoutError 而非无限阻塞。
                     if os.environ.get("ENABLE_TIMEOUT_ASSERTION"):
-                        result = result_queue.get(timeout=seconds)
+                        result = result_queue.get(timeout=min(seconds, 5.0))
                     else:
-                        result = result_queue.get()
+                        result = result_queue.get(timeout=seconds)
                     if isinstance(result, Exception):
                         raise result
                     return result
@@ -68,10 +71,16 @@ def timeout(seconds: float | int | str = None, attempts: int = 2, *, exception: 
 
             for a in range(attempts):
                 try:
+                    # Phase 1.1: 始终应用 asyncio.wait_for 兜底超时；不再依赖
+                    # ENABLE_TIMEOUT_ASSERTION 环境变量。ENABLE_TIMEOUT_ASSERTION
+                    # 仅用于在测试中"快进"超时触发。
                     if os.environ.get("ENABLE_TIMEOUT_ASSERTION"):
-                        return await asyncio.wait_for(func(*args, **kwargs), timeout=seconds)
-                    else:
-                        return await func(*args, **kwargs)
+                        # 测试模式：尽量短的 timeout 让断言快速触发（保持向后兼容）
+                        return await asyncio.wait_for(
+                            func(*args, **kwargs),
+                            timeout=min(seconds, 5.0),
+                        )
+                    return await asyncio.wait_for(func(*args, **kwargs), timeout=seconds)
                 except asyncio.TimeoutError:
                     if a < attempts - 1:
                         continue

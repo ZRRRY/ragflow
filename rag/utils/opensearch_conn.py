@@ -475,8 +475,13 @@ class OSConnection(DocStoreConnection):
         for _ in range(ATTEMPT_TIME):
             try:
                 res = []
+                # Phase 2.1: refresh="wait_for" → "false"
+                # OpenSearch 默认 refresh_interval=1s，每批 bulk 等 1-2s refresh
+                # 在 100w+ chunks 的 KB 上浪费 4-8 小时。改 false 后由调用方在
+                # 全部 batch 写完时主动 refresh 一次（见 set_graph_delta/set_graph_monolithic）。
+                # 中间查询的 stale 风险靠 OpenSearch 默认 1s 自然 refresh 兜底。
                 r = self.os.bulk(index=(indexName), body=operations,
-                                 refresh="wait_for", timeout=60)
+                                 refresh="false", timeout=60)
                 if re.search(r"False", str(r["errors"]), re.IGNORECASE):
                     return res
 

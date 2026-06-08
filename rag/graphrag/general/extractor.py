@@ -26,6 +26,7 @@ import networkx as nx
 from api.db.services.task_service import has_canceled
 from common.token_utils import truncate
 from rag.graphrag.general.graph_prompt import SUMMARIZE_DESCRIPTIONS_PROMPT
+from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.utils import (
     GraphChange,
     chat_limiter,
@@ -207,8 +208,37 @@ class Extractor:
         if task_id and has_canceled(task_id):
             raise TaskCanceledException(f"Task {task_id} was cancelled before nodes merging")
 
+        # Phase 4.4: 预计算 batched summary。条件：
+        #   1) USE_BATCHED_SUMMARIZATION=1
+        #   2) description_list 长度 > 12（短描述无需 LLM summarize）
+        # 把 entity 和 edge 一起做 batched summarize，共享同一份 cache。
+        summary_cache: dict[str, str] = {}
+        if GraphRAGConfig.USE_BATCHED_SUMMARIZATION:
+            items_to_summarize: list[tuple[str, str]] = []
+            for en_nm, ents in maybe_nodes.items():
+                desc = GRAPH_FIELD_SEP.join(sorted(set([dp["description"] for dp in ents])))
+                if len(desc.split(GRAPH_FIELD_SEP)) > 12:
+                    items_to_summarize.append((en_nm, desc))
+            for (src, tgt), rels in maybe_edges.items():
+                desc = GRAPH_FIELD_SEP.join(sorted(set([e["description"] for e in rels])))
+                if len(desc.split(GRAPH_FIELD_SEP)) > 12:
+                    items_to_summarize.append((f"{src} -> {tgt}", desc))
+            if items_to_summarize:
+                logging.info(
+                    "Phase 4.4: batched summarizing %d items in groups of %d",
+                    len(items_to_summarize), GraphRAGConfig.ENTITY_SUMMARY_BATCH_SIZE,
+                )
+                summary_cache = await self._batched_summarize(items_to_summarize, task_id=task_id)
+                if self.callback:
+                    self.callback(
+                        msg=f"Phase 4.4 batched summary: requested={len(items_to_summarize)} "
+                            f"got={len(summary_cache)}"
+                    )
+
         tasks = [
-            asyncio.create_task(self._merge_nodes(en_nm, ents, all_entities_data, task_id))
+            asyncio.create_task(
+                self._merge_nodes(en_nm, ents, all_entities_data, task_id, summary_cache=summary_cache)
+            )
             for en_nm, ents in maybe_nodes.items()
         ]
         try:
@@ -238,7 +268,7 @@ class Extractor:
         for (src, tgt), rels in maybe_edges.items():
             tasks.append(
                 asyncio.create_task(
-                    self._merge_edges(src, tgt, rels, all_relationships_data, task_id)
+                    self._merge_edges(src, tgt, rels, all_relationships_data, task_id, summary_cache=summary_cache)
                 )
             )
         try:
@@ -267,7 +297,7 @@ class Extractor:
 
         return all_entities_data, all_relationships_data
 
-    async def _merge_nodes(self, entity_name: str, entities: list[dict], all_relationships_data, task_id=""):
+    async def _merge_nodes(self, entity_name: str, entities: list[dict], all_relationships_data, task_id="", summary_cache: dict | None = None):
         if task_id and has_canceled(task_id):
             raise TaskCanceledException(f"Task {task_id} was cancelled during merge nodes")
 
@@ -280,7 +310,11 @@ class Extractor:
         )[0][0]
         description = GRAPH_FIELD_SEP.join(sorted(set([dp["description"] for dp in entities])))
         already_source_ids = flat_uniq_list(entities, "source_id")
-        description = await self._handle_entity_relation_summary(entity_name, description, task_id=task_id)
+        # Phase 4.4: 优先用 batched summary 缓存
+        if summary_cache and entity_name in summary_cache:
+            description = summary_cache[entity_name]
+        else:
+            description = await self._handle_entity_relation_summary(entity_name, description, task_id=task_id)
         node_data = dict(
             entity_type=entity_type,
             description=description,
@@ -289,16 +323,106 @@ class Extractor:
         node_data["entity_name"] = entity_name
         all_relationships_data.append(node_data)
 
-    async def _merge_edges(self, src_id: str, tgt_id: str, edges_data: list[dict], all_relationships_data=None, task_id=""):
+    async def _merge_edges(self, src_id: str, tgt_id: str, edges_data: list[dict], all_relationships_data=None, task_id="", summary_cache: dict | None = None):
         if not edges_data:
             return
         weight = sum([edge["weight"] for edge in edges_data])
         description = GRAPH_FIELD_SEP.join(sorted(set([edge["description"] for edge in edges_data])))
-        description = await self._handle_entity_relation_summary(f"{src_id} -> {tgt_id}", description, task_id=task_id)
+        edge_key = f"{src_id} -> {tgt_id}"
+        # Phase 4.4: 优先用 batched summary 缓存
+        if summary_cache and edge_key in summary_cache:
+            description = summary_cache[edge_key]
+        else:
+            description = await self._handle_entity_relation_summary(edge_key, description, task_id=task_id)
         keywords = flat_uniq_list(edges_data, "keywords")
         source_id = flat_uniq_list(edges_data, "source_id")
         edge_data = dict(src_id=src_id, tgt_id=tgt_id, description=description, keywords=keywords, weight=weight, source_id=source_id)
         all_relationships_data.append(edge_data)
+
+    async def _batched_summarize(
+        self,
+        items: list[tuple[str, str]],
+        task_id: str = "",
+    ) -> dict[str, str]:
+        """Phase 4.4: 批量 summarize。items: [(name, full_description), ...]。
+
+        把最多 ENTITY_SUMMARY_BATCH_SIZE 个 entity/edge 的 description
+        拼到一次 LLM call 里（structured 输出），减少 LLM round-trip 50-100x。
+        返回 {name: summarized_description}。
+        """
+        if not items:
+            return {}
+
+        batch_size = GraphRAGConfig.ENTITY_SUMMARY_BATCH_SIZE
+        result: dict[str, str] = {}
+
+        for s in range(0, len(items), batch_size):
+            batch = items[s : s + batch_size]
+            # 构造多 entity prompt
+            entity_sections = []
+            for name, desc in batch:
+                desc_truncated = truncate(desc, 512)
+                desc_list = desc_truncated.split(GRAPH_FIELD_SEP)
+                entity_sections.append(
+                    f"=== ENTITY: {name} ===\n"
+                    f"Description List:\n" + "\n".join(f"- {d}" for d in desc_list) + "\n"
+                )
+            use_prompt = (
+                "You are a helpful assistant. For each entity below, write a single comprehensive "
+                "third-person summary that includes information from all listed descriptions. "
+                f"Use {self._language} as output language.\n\n"
+                "Output format (strict):\n"
+                "=== ENTITY: <entity_name> ===\n"
+                "<summary>\n"
+                "=== END ===\n\n"
+                + "\n".join(entity_sections)
+            )
+
+            if task_id and has_canceled(task_id):
+                raise TaskCanceledException(f"Task {task_id} was cancelled during batched summary")
+
+            try:
+                async with chat_limiter:
+                    response = await self._async_chat(
+                        "", [{"role": "user", "content": use_prompt}], {}, task_id
+                    )
+            except Exception as exc:
+                # 失败时回退到 per-entity 调用
+                logging.warning(
+                    "batched_summarize LLM call failed (batch_size=%d, offset=%d): %s; "
+                    "falling back to per-entity summarization",
+                    len(batch), s, exc,
+                )
+                for name, desc in batch:
+                    try:
+                        result[name] = await self._handle_entity_relation_summary(
+                            name, desc, task_id=task_id
+                        )
+                    except Exception:
+                        logging.exception("per-entity summarize fallback failed for %s", name)
+                continue
+
+            # 解析 === ENTITY: name === ... === END === 格式
+            cur_name: str | None = None
+            cur_buf: list[str] = []
+            for line in response.splitlines():
+                if line.startswith("=== ENTITY: "):
+                    if cur_name is not None and cur_buf:
+                        result[cur_name] = "\n".join(cur_buf).strip()
+                    cur_name = line[len("=== ENTITY: ") :].rstrip(" =").strip()
+                    cur_buf = []
+                elif line.strip() == "=== END ===":
+                    if cur_name is not None and cur_buf:
+                        result[cur_name] = "\n".join(cur_buf).strip()
+                    cur_name = None
+                    cur_buf = []
+                elif cur_name is not None:
+                    cur_buf.append(line)
+            # 兜底：最后一个未关闭的 entity
+            if cur_name is not None and cur_buf:
+                result[cur_name] = "\n".join(cur_buf).strip()
+
+        return result
 
     async def _merge_graph_nodes(self, graph: nx.Graph, nodes: list[str], change: GraphChange, task_id=""):
         if task_id and has_canceled(task_id):
