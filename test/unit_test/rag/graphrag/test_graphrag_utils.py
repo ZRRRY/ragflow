@@ -29,6 +29,7 @@ from rag.graphrag.utils import (
     handle_single_entity_extraction,
     handle_single_relationship_extraction,
     is_continuous_subsequence,
+    is_doc_merged,
     is_float_regex,
     merge_tuples,
     pack_user_ass_to_openai_messages,
@@ -530,3 +531,114 @@ class TestFlatUniqList:
         arr = [{"k": [1, 2]}, {"k": 3}]
         result = flat_uniq_list(arr, "k")
         assert set(result) == {1, 2, 3}
+
+
+class TestIsDocMerged:
+    """Tests for is_doc_merged point-query idempotency check."""
+
+    @pytest.mark.asyncio
+    async def test_monolithic_mode_merged(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", False)
+
+        graph = nx.Graph()
+        graph.graph["source_id"] = ["doc_123"]
+        async def mock_get_graph(t, k):
+            return graph
+        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
+
+        assert await is_doc_merged("t1", "kb1", "doc_123") is True
+
+    @pytest.mark.asyncio
+    async def test_monolithic_mode_not_merged(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", False)
+
+        graph = nx.Graph()
+        graph.graph["source_id"] = ["doc_456"]
+        async def mock_get_graph(t, k):
+            return graph
+        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
+
+        assert await is_doc_merged("t1", "kb1", "doc_123") is False
+
+    @pytest.mark.asyncio
+    async def test_monolithic_mode_no_graph(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", False)
+        async def mock_get_graph(t, k):
+            return None
+        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
+
+        assert await is_doc_merged("t1", "kb1", "doc_123") is False
+
+    @pytest.mark.asyncio
+    async def test_incremental_mode_merged(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
+
+        mock_result = type("SearchResult", (), {"total": 1})()
+
+        async def mock_search(*a, **k):
+            return mock_result
+
+        monkeypatch.setattr(_utils.settings.retriever, "search", mock_search)
+
+        assert await is_doc_merged("t1", "kb1", "doc_123") is True
+
+    @pytest.mark.asyncio
+    async def test_incremental_mode_not_merged(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
+
+        mock_result = type("SearchResult", (), {"total": 0})()
+
+        async def mock_search(*a, **k):
+            return mock_result
+
+        monkeypatch.setattr(_utils.settings.retriever, "search", mock_search)
+
+        assert await is_doc_merged("t1", "kb1", "doc_123") is False
+
+    @pytest.mark.asyncio
+    async def test_incremental_mode_fallback_on_exception(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
+
+        async def failing_search(*a, **k):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(_utils.settings.retriever, "search", failing_search)
+
+        graph = nx.Graph()
+        graph.graph["source_id"] = ["doc_123"]
+        async def mock_get_graph(t, k):
+            return graph
+        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
+
+        assert await is_doc_merged("t1", "kb1", "doc_123") is True
+
+    @pytest.mark.asyncio
+    async def test_incremental_mode_fallback_not_merged(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
+
+        async def failing_search(*a, **k):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(_utils.settings.retriever, "search", failing_search)
+
+        graph = nx.Graph()
+        graph.graph["source_id"] = ["doc_456"]
+        async def mock_get_graph(t, k):
+            return graph
+        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
+
+        assert await is_doc_merged("t1", "kb1", "doc_123") is False

@@ -445,6 +445,33 @@ async def get_relation(tenant_id, kb_id, from_ent_name, to_ent_name, size=1):
     return res
 
 
+async def is_doc_merged(tenant_id, kb_id, doc_id):
+    """Check whether a document has already been merged into the global graph.
+
+    In incremental storage mode this uses a lightweight point query (size=1)
+    against entity chunks instead of loading the full graph.
+    In monolithic mode it falls back to ``get_graph()`` because that path
+    already loads a single JSON blob and is not expensive.
+    """
+    if not GraphRAGConfig.USE_INCREMENTAL_GRAPH:
+        graph = await get_graph(tenant_id, kb_id)
+        return graph is not None and doc_id in graph.graph.get("source_id", [])
+
+    conds = {
+        "fields": ["source_id"],
+        "size": 1,
+        "knowledge_graph_kwd": ["entity"],
+        "source_id": [doc_id],
+    }
+    try:
+        res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+        return res.total > 0
+    except Exception as e:
+        logging.warning("is_doc_merged point query failed for doc %s: %s", doc_id, e)
+        graph = await get_graph(tenant_id, kb_id)
+        return graph is not None and doc_id in graph.graph.get("source_id", [])
+
+
 async def query_existing_entities(tenant_id, kb_id, node_names):
     """Batch-query existing entity documents from the doc store by name.
 

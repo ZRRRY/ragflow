@@ -48,6 +48,7 @@ from rag.graphrag.utils import (
     get_graph,
     graph_merge,
     insert_chunks_bounded,
+    is_doc_merged,
     query_existing_entities,
     query_existing_relations,
     query_node_relations,
@@ -566,10 +567,9 @@ async def run_graphrag_for_kb(
 
             try:
                 async def merge_subgraph_attempt():
-                    current_graph = await get_graph(tenant_id, kb_id)
-                    if current_graph and doc_id in current_graph.graph.get("source_id", []):
+                    if await is_doc_merged(tenant_id, kb_id, doc_id):
                         callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} already merged, skipping retry.")
-                        return current_graph
+                        return None
                     return await merge_subgraph(
                         tenant_id,
                         kb_id,
