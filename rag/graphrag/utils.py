@@ -1076,8 +1076,22 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
         }
     ]
 
-    # generate updated subgraphs
+    # 延迟导入避免循环引用
+    from rag.graphrag.general.index import load_subgraph_from_store
+
+    # 查询哪些文档的 subgraph 已存在于存储中（由 generate_subgraph 写入）
+    existing_sg_doc_ids = set()
     for source in graph.graph["source_id"]:
+        existing_sg = await load_subgraph_from_store(tenant_id, kb_id, source)
+        if existing_sg:
+            existing_sg_doc_ids.add(source)
+
+    # generate updated subgraphs (only for docs without existing checkpoint)
+    for source in graph.graph["source_id"]:
+        if source in existing_sg_doc_ids:
+            if callback:
+                callback(msg=f"[GraphRAG] doc:{source} subgraph checkpoint exists, skipping monolithic rewrite.")
+            continue
         subgraph = graph.subgraph([n for n in graph.nodes if source in graph.nodes[n]["source_id"]]).copy()
         subgraph.graph["source_id"] = [source]
         for n in subgraph.nodes:
@@ -1108,7 +1122,7 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
     # generation above does not destroy the old graph/subgraph checkpoints.
     await thread_pool_exec(
         settings.docStoreConn.delete,
-        {"knowledge_graph_kwd": ["graph", "subgraph"]},
+        {"knowledge_graph_kwd": ["graph"]},
         search.index_name(tenant_id),
         kb_id
     )
