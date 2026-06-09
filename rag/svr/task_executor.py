@@ -2010,16 +2010,25 @@ async def handle_task():
             pass
         logging.exception(f"handle_task got exception for task {json.dumps(task)}")
     finally:
-        if not task.get("dataflow_id", ""):
-            referred_document_id = None
-            if task_type in ["graphrag", "raptor", "mindmap"]:
-                referred_document_id = task["doc_ids"][0]
-            ret = PipelineOperationLogService.record_pipeline_operation(document_id=task["doc_id"], pipeline_id="",
-                                                                  task_type=pipeline_task_type,
-                                                                  task_id=task_id, referred_document_id=referred_document_id)
-            get_recording_context().save_func_return_value("PipelineOperationLogService.record_pipeline_operation", ret)
-
-    redis_msg.ack()
+        try:
+            if not task.get("dataflow_id", ""):
+                referred_document_id = None
+                if task_type in ["graphrag", "raptor", "mindmap"]:
+                    doc_ids = task.get("doc_ids", [])
+                    if doc_ids:
+                        referred_document_id = doc_ids[0]
+                ret = PipelineOperationLogService.record_pipeline_operation(document_id=task["doc_id"], pipeline_id="",
+                                                                      task_type=pipeline_task_type,
+                                                                      task_id=task_id, referred_document_id=referred_document_id)
+                get_recording_context().save_func_return_value("PipelineOperationLogService.record_pipeline_operation", ret)
+        except Exception:
+            logging.exception(
+                f"PipelineOperationLogService failed for task {task_id}, "
+                "continuing to ack Redis message")
+        try:
+            redis_msg.ack()
+        except Exception:
+            logging.exception(f"Redis ack failed for task {task_id}")
 
 
 async def get_server_ip() -> str:

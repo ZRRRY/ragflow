@@ -88,7 +88,7 @@ class TaskService(CommonService):
                  Returns None if task is not found or has exceeded retry limit.
         """
         doc_id = cls.model.doc_id
-        if doc_id == CANVAS_DEBUG_DOC_ID and doc_ids:
+        if doc_ids:
             doc_id = doc_ids[0]
 
         fields = [
