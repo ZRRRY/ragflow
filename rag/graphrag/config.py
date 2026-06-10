@@ -65,6 +65,11 @@ class GraphRAGConfig:
     USE_BATCHED_SUMMARIZATION = os.environ.get("USE_BATCHED_SUMMARIZATION", "0") == "1"
     ENTITY_SUMMARY_BATCH_SIZE = int(os.environ.get("ENTITY_SUMMARY_BATCH_SIZE", "20"))
 
+    # Phase 6 – Rerun control (1=keep/reuse, 0=clear/rerun)
+    KEEP_SUBGRAPH = os.environ.get("GRAPHRAG_KEEP_SUBGRAPH", "1") == "1"
+    KEEP_MERGE = os.environ.get("GRAPHRAG_KEEP_MERGE", "1") == "1"
+    KEEP_RESOLUTION = os.environ.get("GRAPHRAG_KEEP_RESOLUTION", "0") == "1"
+
     @classmethod
     def log_flags(cls):
         logger.info(
@@ -74,7 +79,8 @@ class GraphRAGConfig:
             "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d "
             "heartbeat_interval=%ds heartbeat_ttl=%ds "
             "resolution_ann=%s ann_top_k=%d ann_sim_thr=%.2f "
-            "batched_summarization=%s summary_batch_size=%d",
+            "batched_summarization=%s summary_batch_size=%d "
+            "keep_subgraph=%s keep_merge=%s keep_resolution=%s",
             cls.USE_INCREMENTAL_GRAPH,
             cls.USE_INCREMENTAL_MERGE,
             cls.USE_INCREMENTAL_RESOLUTION,
@@ -97,6 +103,9 @@ class GraphRAGConfig:
             cls.ENTITY_RESOLUTION_ANN_SIM_THRESHOLD,
             cls.USE_BATCHED_SUMMARIZATION,
             cls.ENTITY_SUMMARY_BATCH_SIZE,
+            cls.KEEP_SUBGRAPH,
+            cls.KEEP_MERGE,
+            cls.KEEP_RESOLUTION,
         )
 
 
