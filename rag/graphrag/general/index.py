@@ -353,6 +353,18 @@ async def run_graphrag_for_kb(
     else:
         callback(msg=f"[GraphRAG] dataset:{kb_id} has {len(doc_ids)} documents to process.")
 
+    # 重新生成时清理旧的全量产物，保留 per-doc subgraph checkpoint
+    try:
+        await thread_pool_exec(
+            settings.docStoreConn.delete,
+            {"kb_id": kb_id, "knowledge_graph_kwd": ["graph", "entity", "relation", "community_report"]},
+            search.index_name(tenant_id),
+            kb_id,
+        )
+        callback(msg=f"[GraphRAG] Cleared previous graph/entity/relation/community_report for dataset:{kb_id}")
+    except Exception as e:
+        logging.warning("[GraphRAG] Failed to clear previous graph data for dataset %s: %s", kb_id, e)
+
     def load_doc_chunks(doc_id: str) -> list[str]:
         from common.token_utils import num_tokens_from_string
 

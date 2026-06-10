@@ -1120,9 +1120,10 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
     # All new chunks are ready.  Now delete old data and insert the new data.
     # Deleting only after chunks are built ensures that a crash during embedding
     # generation above does not destroy the old graph/subgraph checkpoints.
+    # 保留 subgraph checkpoint（per-doc），清理其余全量产物以便重新生成。
     await thread_pool_exec(
         settings.docStoreConn.delete,
-        {"knowledge_graph_kwd": ["graph"]},
+        {"knowledge_graph_kwd": ["graph", "entity", "relation", "community_report"], "kb_id": kb_id},
         search.index_name(tenant_id),
         kb_id
     )

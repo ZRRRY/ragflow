@@ -498,20 +498,27 @@ class DocumentService(CommonService):
         # Cleanup knowledge graph references (non-critical, log and continue)
         try:
             if chunk_index_exists:
+                # 1. 无条件删除该文档的 subgraph（无论是否已合并到全局图）
+                settings.docStoreConn.delete(
+                    {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["subgraph"], "source_id": doc.id},
+                    chunk_index_name,
+                    doc.kb_id,
+                )
+                # 2. 若文档已被合并到全局图，清理 entity/relation/graph/community_report 中的 source_id 引用
                 graph_source = settings.docStoreConn.get_fields(
                     settings.docStoreConn.search(["source_id"], [], {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, [], OrderByExpr(), 0, 1, chunk_index_name, [doc.kb_id]),
                     ["source_id"],
                 )
                 if len(graph_source) > 0 and doc.id in list(graph_source.values())[0]["source_id"]:
                     settings.docStoreConn.update(
-                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "source_id": doc.id},
+                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "community_report"], "source_id": doc.id},
                         {"remove": {"source_id": doc.id}},
                         chunk_index_name,
                         doc.kb_id,
                     )
                     settings.docStoreConn.update({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
                     settings.docStoreConn.delete(
-                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "must_not": {"exists": "source_id"}},
+                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "community_report"], "must_not": {"exists": "source_id"}},
                         chunk_index_name,
                         doc.kb_id,
                     )
