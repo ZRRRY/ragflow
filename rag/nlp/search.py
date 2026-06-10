@@ -124,9 +124,15 @@ class Dealer:
                 condition[field] = req[key]
         # TODO(yzc): `available_int` is nullable however infinity doesn't support nullable columns.
         for key in ["knowledge_graph_kwd", "available_int", "entity_kwd", "from_entity_kwd", "to_entity_kwd",
-                    "removed_kwd"]:
+                    "removed_kwd", "entity_type_kwd"]:
             if key in req and req[key] is not None:
                 condition[key] = req[key]
+        # P5: debug logging for silently dropped filter keys
+        control_keys = {"fields", "size", "page", "topk", "sort", "question", "similarity",
+                        "kb_ids", "doc_ids", "emb_mdl", "highlight", "rank_feature"}
+        dropped = [k for k in req if k not in condition and k not in control_keys]
+        if dropped:
+            logging.debug("Dealer.get_filters dropped non-whitelisted keys: %s", dropped)
         return condition
 
     async def search(self, req, idx_names: str | list[str],

@@ -457,15 +457,20 @@ async def is_doc_merged(tenant_id, kb_id, doc_id):
         graph = await get_graph(tenant_id, kb_id)
         return graph is not None and doc_id in graph.graph.get("source_id", [])
 
-    conds = {
-        "fields": ["source_id"],
-        "size": 1,
+    # 增量模式：直连 docStoreConn 绕过 Dealer.get_filters() 白名单，
+    # 避免 source_id 条件被静默丢弃导致误判（详见 GraphRAG pipeline 文档）。
+    condition = {
         "knowledge_graph_kwd": ["entity"],
         "source_id": [doc_id],
     }
     try:
-        res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
-        return res.total > 0
+        res = await thread_pool_exec(
+            settings.docStoreConn.search,
+            ["source_id"], [], condition, [], OrderByExpr(),
+            0, 1, search.index_name(tenant_id), [kb_id],
+        )
+        fields = settings.docStoreConn.get_fields(res, ["source_id"])
+        return len(fields) > 0
     except Exception as e:
         logging.warning("is_doc_merged point query failed for doc %s: %s", doc_id, e)
         graph = await get_graph(tenant_id, kb_id)

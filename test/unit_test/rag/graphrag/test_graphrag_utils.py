@@ -581,12 +581,16 @@ class TestIsDocMerged:
 
         monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
 
-        mock_result = type("SearchResult", (), {"total": 1})()
+        def mock_search(*a, **k):
+            return "raw_res"
 
-        async def mock_search(*a, **k):
-            return mock_result
+        def mock_get_fields(res, fields):
+            if res == "raw_res":
+                return {"chunk_1": {"source_id": ["doc_123"]}}
+            return {}
 
-        monkeypatch.setattr(_utils.settings.retriever, "search", mock_search)
+        monkeypatch.setattr(_utils.settings.docStoreConn, "search", mock_search)
+        monkeypatch.setattr(_utils.settings.docStoreConn, "get_fields", mock_get_fields)
 
         assert await is_doc_merged("t1", "kb1", "doc_123") is True
 
@@ -596,12 +600,14 @@ class TestIsDocMerged:
 
         monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
 
-        mock_result = type("SearchResult", (), {"total": 0})()
+        def mock_search(*a, **k):
+            return "raw_res"
 
-        async def mock_search(*a, **k):
-            return mock_result
+        def mock_get_fields(res, fields):
+            return {}
 
-        monkeypatch.setattr(_utils.settings.retriever, "search", mock_search)
+        monkeypatch.setattr(_utils.settings.docStoreConn, "search", mock_search)
+        monkeypatch.setattr(_utils.settings.docStoreConn, "get_fields", mock_get_fields)
 
         assert await is_doc_merged("t1", "kb1", "doc_123") is False
 
@@ -611,10 +617,10 @@ class TestIsDocMerged:
 
         monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
 
-        async def failing_search(*a, **k):
+        def failing_search(*a, **k):
             raise RuntimeError("db down")
 
-        monkeypatch.setattr(_utils.settings.retriever, "search", failing_search)
+        monkeypatch.setattr(_utils.settings.docStoreConn, "search", failing_search)
 
         graph = nx.Graph()
         graph.graph["source_id"] = ["doc_123"]
@@ -630,10 +636,10 @@ class TestIsDocMerged:
 
         monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
 
-        async def failing_search(*a, **k):
+        def failing_search(*a, **k):
             raise RuntimeError("db down")
 
-        monkeypatch.setattr(_utils.settings.retriever, "search", failing_search)
+        monkeypatch.setattr(_utils.settings.docStoreConn, "search", failing_search)
 
         graph = nx.Graph()
         graph.graph["source_id"] = ["doc_456"]
