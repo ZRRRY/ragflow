@@ -701,7 +701,18 @@ async def run_graphrag_for_kb(
 
         # Resume path: no docs were merged this round but pending phases
         # require the previously-persisted graph. Load it from the doc store.
-        if final_graph is None:
+        # Only preload the full graph when a downstream phase truly needs it
+        # and cannot load it itself (legacy non-incremental resolution or
+        # non-async community).  When incremental resolution + async community
+        # are enabled this preload is skipped entirely.
+        need_preload_full_graph = (
+            final_graph is None
+            and (
+                (resolution_pending and not GraphRAGConfig.USE_INCREMENTAL_RESOLUTION)
+                or (community_pending and not GraphRAGConfig.USE_ASYNC_COMMUNITY)
+            )
+        )
+        if need_preload_full_graph:
             final_graph = await get_graph(tenant_id, kb_id)
             if final_graph is None:
                 callback(msg=f"[GraphRAG] dataset:{kb_id} no persisted graph found; cannot run resolution/community.")
