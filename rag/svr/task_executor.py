@@ -2204,6 +2204,17 @@ async def kg_postprocess_consumer():
             embd_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.EMBEDDING)
             embedding_model = LLMBundle(tenant_id, embd_model_config, lang=task_language)
 
+            # Load KB parser_config for entity_types
+            try:
+                from api.db.services.knowledgebase_service import KnowledgebaseService
+                kb = KnowledgebaseService.get_detail(kb_id)
+                kb_parser_config = kb.get("parser_config", {}) if kb else {}
+                graphrag_config = kb_parser_config.get("graphrag", {})
+                entity_types = graphrag_config.get("entity_types", []) or []
+            except Exception:
+                logging.exception("[KG-PP] Failed to load KB parser_config for kb=%s", kb_id)
+                entity_types = []
+
             # Load persisted graph
             from rag.graphrag.utils import get_graph
             final_graph = await get_graph(tenant_id, kb_id)
@@ -2248,6 +2259,7 @@ async def kg_postprocess_consumer():
                             embedding_model,
                             pp_callback,
                             task_id=task_id,
+                            entity_types=entity_types,
                         )
                         set_phase_marker(kb_id, PHASE_RESOLUTION)
                         logging.info("[KG-PP] kb=%s resolution done", kb_id)

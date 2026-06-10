@@ -511,6 +511,42 @@ async def query_existing_entities(tenant_id, kb_id, node_names):
     return existing
 
 
+async def fetch_node_vectors(tenant_id, kb_id, node_names, vector_dim):
+    """Batch-read node vectors (``q_{vector_dim}_vec``) from the doc store.
+
+    Returns a dict mapping ``entity_name -> vector``.
+    """
+    if not node_names:
+        return {}
+
+    vector_field = f"q_{vector_dim}_vec"
+    BATCH_SIZE = 100
+    existing = {}
+
+    for i in range(0, len(node_names), BATCH_SIZE):
+        batch = node_names[i:i + BATCH_SIZE]
+        conds = {
+            "fields": ["entity_kwd", vector_field],
+            "size": len(batch),
+            "knowledge_graph_kwd": ["entity"],
+            "entity_kwd": batch,
+        }
+        try:
+            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+            for id in es_res.ids:
+                fields = es_res.field[id]
+                ent_name = fields.get("entity_kwd")
+                if isinstance(ent_name, list):
+                    ent_name = ent_name[0]
+                vec = fields.get(vector_field)
+                if ent_name and vec is not None:
+                    existing[ent_name] = vec
+        except Exception as e:
+            logging.warning("fetch_node_vectors batch %d failed: %s", i, e)
+
+    return existing
+
+
 async def query_existing_relations(tenant_id, kb_id, edge_pairs):
     """Batch-query existing relation documents from the doc store.
 

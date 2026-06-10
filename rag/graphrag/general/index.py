@@ -750,7 +750,7 @@ async def run_graphrag_for_kb(
                 graph_for_resolution = final_graph.copy()
                 await resolve_entities(
                     graph_for_resolution,
-                    subgraph_nodes,
+                    union_nodes,
                     tenant_id,
                     kb_id,
                     None,
@@ -1257,41 +1257,42 @@ async def merge_subgraph(
 async def resolve_entities_incremental(
     tenant_id: str,
     kb_id: str,
-    subgraph_nodes: set[str],
+    union_nodes: set[str],
     llm_bdl,
     embed_bdl,
     callback,
     task_id: str = "",
     entity_types: list[str] | None = None,
 ):
-    """Incremental entity resolution without loading the global graph.
+    """Incremental entity resolution via OpenSearch KNN.
 
-    For each entity type present in ``subgraph_nodes``, queries existing
-    entities of the same type from the doc store, builds a local subgraph
-    (including all neighbours so edge-redirects are not lost), and runs
-    :class:`EntityResolution` on that local view only.
-
-    Phase 1.5: 新增 entity_types 参数，让调用方注入 kb_parser_config 里的
-    entity_types 用于 build_excluded_types()。None 时回退到 EXCLUDED_RESOLUTION_TYPES。
+    1. Read new-node attributes and vectors from the doc store.
+    2. Group new nodes by entity_type.
+    3. For each type, run concurrent KNN queries (filter by type + min_score)
+       to recall candidate pairs.
+    4. Fetch attributes of candidate neighbours.
+    5. Build a trimmed local graph (new nodes + candidate neighbours + relations).
+    6. Inject candidates into EntityResolution (skip internal ANN/O(n²)).
+    7. Persist merged results via set_graph.
     """
     from collections import defaultdict
-    from rag.graphrag.entity_resolution import build_excluded_types
+    from rag.graphrag.entity_resolution import build_excluded_types, EntityResolution, is_similarity_str
+    from rag.graphrag.utils import fetch_node_vectors
 
     start = asyncio.get_running_loop().time()
-
     excluded_types = build_excluded_types(entity_types)
 
-    if not subgraph_nodes:
-        logging.info("[P3] No subgraph nodes, skipping resolution.")
+    if not union_nodes:
+        logging.info("[P3] No new nodes, skipping resolution.")
         return
 
     # 1. Query attributes of new nodes
-    new_node_fields = await query_existing_entities(tenant_id, kb_id, list(subgraph_nodes))
+    new_node_fields = await query_existing_entities(tenant_id, kb_id, list(union_nodes))
 
     # 2. Group new nodes by type
     new_nodes_by_type = defaultdict(list)
     node_attrs = {}
-    for node_name in subgraph_nodes:
+    for node_name in union_nodes:
         fields = new_node_fields.get(node_name)
         if not fields:
             continue
@@ -1307,109 +1308,231 @@ async def resolve_entities_incremental(
         logging.info("[P3] No valid new nodes with types, skipping resolution.")
         return
 
-    er = EntityResolution(llm_bdl, excluded_types=excluded_types, embed_bdl=embed_bdl)
-    overall_change = GraphChange()
-    all_local_graphs = []
+    candidate_pairs: set[tuple[str, str]] = set()
+    candidate_neighbors: set[str] = set()
 
-    for ent_type, new_nodes in new_nodes_by_type.items():
-        if not new_nodes or ent_type in excluded_types:
-            continue
-
-        # 3. Query existing nodes of the same type
-        conds = {
-            "fields": ["entity_kwd", "content_with_weight"],
-            "size": 10000,
-            "knowledge_graph_kwd": ["entity"],
-            "entity_type_kwd": ent_type,
+    async def _fetch_existing_names_by_type(tenant_id, kb_id, ent_type):
+        """Fetch all existing entity names of a given type via scroll."""
+        index_name = search.index_name(tenant_id)
+        query_body = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"terms": {"kb_id": [kb_id]}},
+                        {"terms": {"knowledge_graph_kwd": ["entity"]}},
+                        {"term": {"entity_type_kwd": ent_type}},
+                    ]
+                }
+            }
         }
-        existing_node_attrs = {}
         try:
-            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
-            for id in es_res.ids:
-                fields = es_res.field[id]
-                ent_name = fields.get("entity_kwd")
-                if isinstance(ent_name, list):
-                    ent_name = ent_name[0]
-                if ent_name and ent_name not in subgraph_nodes:
-                    try:
-                        meta = json.loads(fields["content_with_weight"])
-                    except Exception:
-                        meta = {}
-                    existing_node_attrs[ent_name] = meta
+            res = await thread_pool_exec(
+                settings.docStoreConn.search_with_scroll,
+                index_name,
+                query_body,
+                ["entity_kwd"],
+            )
+            fields_map = settings.docStoreConn.get_fields(res, ["entity_kwd"])
+            names = set()
+            for cid, row in fields_map.items():
+                name = row.get("entity_kwd")
+                if isinstance(name, list):
+                    name = name[0]
+                if name:
+                    names.add(name)
+            return names
         except Exception as e:
-            logging.warning("P3: failed to query existing %s entities: %s", ent_type, e)
-            continue
+            logging.warning("[P3] Failed to fetch existing names for type %s: %s", ent_type, e)
+            return set()
 
-        if not existing_node_attrs:
-            continue
+    if GraphRAGConfig.USE_KNN_FOR_RESOLUTION:
+        # 3. KNN path: read vectors from OpenSearch and run concurrent KNN queries
+        vector_dim = getattr(embed_bdl, "dimension", None)
+        if vector_dim is None:
+            try:
+                test_emb, _ = await asyncio.get_running_loop().run_in_executor(
+                    None, embed_bdl.encode, ["DIM_CHECK"]
+                )
+                vector_dim = len(test_emb[0])
+            except Exception as e:
+                logging.warning("[P3] Failed to detect embedding dimension: %s", e)
+                return
 
-        # 4. Build local graph with new + existing nodes of this type
-        local_graph = nx.Graph()
-        for node_name in new_nodes:
-            if node_name in node_attrs:
-                local_graph.add_node(node_name, **node_attrs[node_name])
-        for ent_name, meta in existing_node_attrs.items():
-            local_graph.add_node(ent_name, **meta)
+        new_node_vectors = await fetch_node_vectors(tenant_id, kb_id, list(union_nodes), vector_dim)
+        if not new_node_vectors:
+            logging.info("[P3] No vectors found for new nodes, skipping resolution.")
+            return
 
-        # 5. Pull all relations touching any node in the local graph
-        #    (including neighbours of other types) so _merge_graph_nodes
-        #    can redirect every edge correctly.
-        all_node_names = list(local_graph.nodes())
-        rel_fields = await query_node_relations(tenant_id, kb_id, all_node_names)
-        for fields in rel_fields:
-            from_node = fields.get("from_entity_kwd")
-            to_node = fields.get("to_entity_kwd")
-            if isinstance(from_node, list):
-                from_node = from_node[0]
-            if isinstance(to_node, list):
-                to_node = to_node[0]
-            if from_node and to_node:
+        vector_field = f"q_{vector_dim}_vec"
+        knn_semaphore = asyncio.Semaphore(8)
+
+        async def _knn_one(node_name, vector, ent_type):
+            async with knn_semaphore:
                 try:
-                    meta = json.loads(fields["content_with_weight"])
-                except Exception:
-                    meta = {}
-                local_graph.add_edge(from_node, to_node, **meta)
+                    res = await thread_pool_exec(
+                        settings.docStoreConn.knn_search_entities,
+                        [search.index_name(tenant_id)],
+                        [kb_id],
+                        vector,
+                        vector_field,
+                        GraphRAGConfig.ENTITY_RESOLUTION_TOP_K,
+                        GraphRAGConfig.ENTITY_RESOLUTION_SIM_THRESHOLD,
+                        entity_type=ent_type,
+                        exclude_name=node_name,
+                    )
+                    fields_map = settings.docStoreConn.get_fields(res, ["entity_kwd"])
+                    neighbors = []
+                    for cid, row in fields_map.items():
+                        neighbor_name = row.get("entity_kwd")
+                        if isinstance(neighbor_name, list):
+                            neighbor_name = neighbor_name[0]
+                        if not neighbor_name or neighbor_name == node_name:
+                            continue
+                        if not is_similarity_str(node_name, neighbor_name):
+                            continue
+                        neighbors.append(neighbor_name)
+                    return node_name, neighbors
+                except Exception as e:
+                    logging.warning("KNN search failed for node %s: %s", node_name, e)
+                    return node_name, []
 
-        logging.info(
-            "[P3] Type '%s': %d new vs %d existing, %d relations, %d nodes in local graph.",
-            ent_type, len(new_nodes), len(existing_node_attrs), len(rel_fields), local_graph.number_of_nodes(),
-        )
+        for ent_type, new_nodes in new_nodes_by_type.items():
+            if not new_nodes or ent_type in excluded_types:
+                continue
 
-        # 6. Run EntityResolution on the local graph
-        try:
-            reso = await er(local_graph, set(new_nodes), callback=callback, task_id=task_id)
-        except Exception as e:
-            logging.warning("P3: EntityResolution failed for type %s: %s", ent_type, e)
-            continue
+            tasks = []
+            for node_name in new_nodes:
+                vector = new_node_vectors.get(node_name)
+                if not vector:
+                    continue
+                tasks.append(asyncio.create_task(_knn_one(node_name, vector, ent_type)))
 
-        change = reso.change
-        overall_change.removed_nodes.update(change.removed_nodes)
-        overall_change.added_updated_nodes.update(change.added_updated_nodes)
-        overall_change.removed_edges.update(change.removed_edges)
-        overall_change.added_updated_edges.update(change.added_updated_edges)
-        all_local_graphs.append(reso.graph)
+            if not tasks:
+                continue
 
-    if not all_local_graphs:
-        logging.info("[P3] No resolution performed (no existing candidates).")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    logging.warning("KNN task exception: %s", res)
+                    continue
+                node_name, neighbors = res
+                for neighbor_name in neighbors:
+                    a, b = (node_name, neighbor_name) if node_name < neighbor_name else (neighbor_name, node_name)
+                    candidate_pairs.add((a, b))
+                    candidate_neighbors.add(neighbor_name)
+    else:
+        # 3. Char-level filtering fallback: fetch existing names by type,
+        # then do O(new × existing) is_similarity_str checks (no ANN, no embedding).
+        logging.info("[P3] KNN disabled, falling back to char-level filtering.")
+        for ent_type, new_nodes in new_nodes_by_type.items():
+            if not new_nodes or ent_type in excluded_types:
+                continue
+
+            existing_names = await _fetch_existing_names_by_type(tenant_id, kb_id, ent_type)
+            existing_names = existing_names - set(new_nodes)
+
+            for node_name in new_nodes:
+                for existing_name in existing_names:
+                    if is_similarity_str(node_name, existing_name):
+                        a, b = (
+                            (node_name, existing_name)
+                            if node_name < existing_name
+                            else (existing_name, node_name)
+                        )
+                        candidate_pairs.add((a, b))
+                        candidate_neighbors.add(existing_name)
+
+    if not candidate_pairs:
+        logging.info("[P3] No candidates found, skipping resolution.")
         return
 
-    # 7. Build combined graph from all local graphs so set_graph can read attrs
-    combined_graph = nx.Graph()
-    for g in all_local_graphs:
-        for node_name, attrs in g.nodes(data=True):
-            combined_graph.add_node(node_name, **attrs)
-        for u, v, attrs in g.edges(data=True):
-            combined_graph.add_edge(u, v, **attrs)
-        if g.graph.get("source_id"):
-            combined_graph.graph.setdefault("source_id", []).extend(g.graph["source_id"])
-    combined_graph.graph["source_id"] = list(set(combined_graph.graph.get("source_id", [])))
+    # 5. Fetch attributes of candidate neighbours
+    neighbor_attrs = await query_existing_entities(tenant_id, kb_id, list(candidate_neighbors))
+
+    # 6. Organise candidates by type for external injection
+    candidate_resolution = defaultdict(list)
+    for a, b in candidate_pairs:
+        # a/b 中至少一个是新节点；从 node_attrs 或 neighbor_attrs 读取类型
+        type_a = node_attrs.get(a, {}).get("entity_type")
+        if type_a is None and a in neighbor_attrs:
+            try:
+                meta = json.loads(neighbor_attrs[a]["content_with_weight"])
+                type_a = meta.get("entity_type", "-")
+            except Exception:
+                type_a = "-"
+        type_b = node_attrs.get(b, {}).get("entity_type")
+        if type_b is None and b in neighbor_attrs:
+            try:
+                meta = json.loads(neighbor_attrs[b]["content_with_weight"])
+                type_b = meta.get("entity_type", "-")
+            except Exception:
+                type_b = "-"
+        if type_a == type_b and type_a not in excluded_types:
+            candidate_resolution[type_a].append((a, b))
+
+    if not candidate_resolution:
+        logging.info("[P3] No valid candidates after type validation, skipping resolution.")
+        return
+
+    # 7. Build trimmed local graph
+    local_graph = nx.Graph()
+    for node_name in union_nodes:
+        if node_name in node_attrs:
+            local_graph.add_node(node_name, **node_attrs[node_name])
+    for node_name, fields in neighbor_attrs.items():
+        try:
+            meta = json.loads(fields["content_with_weight"])
+        except Exception:
+            meta = {}
+        local_graph.add_node(node_name, **meta)
+
+    all_local_nodes = list(local_graph.nodes())
+    rel_fields = await query_node_relations(tenant_id, kb_id, all_local_nodes)
+    for fields in rel_fields:
+        from_node = fields.get("from_entity_kwd")
+        to_node = fields.get("to_entity_kwd")
+        if isinstance(from_node, list):
+            from_node = from_node[0]
+        if isinstance(to_node, list):
+            to_node = to_node[0]
+        if from_node and to_node:
+            try:
+                meta = json.loads(fields["content_with_weight"])
+            except Exception:
+                meta = {}
+            local_graph.add_edge(from_node, to_node, **meta)
 
     logging.info(
-        "[P3] Overall resolution removed %d nodes and %d edges.",
-        len(overall_change.removed_nodes), len(overall_change.removed_edges),
+        "[P3] KNN recalled %d candidates, local graph: %d nodes, %d edges.",
+        len(candidate_pairs), local_graph.number_of_nodes(), local_graph.number_of_edges(),
     )
 
-    await set_graph(tenant_id, kb_id, embed_bdl, combined_graph, overall_change, callback)
+    # 8. EntityResolution with external candidates (no internal ANN)
+    er = EntityResolution(
+        llm_bdl,
+        excluded_types=excluded_types,
+        embed_bdl=None,
+        use_ann_prefilter=False,
+    )
+    try:
+        reso = await er(
+            local_graph,
+            set(union_nodes),
+            callback=callback,
+            task_id=task_id,
+            candidate_resolution=dict(candidate_resolution),
+        )
+    except Exception as e:
+        logging.warning("P3: EntityResolution failed: %s", e)
+        raise
+
+    change = reso.change
+    logging.info(
+        "[P3] Resolution removed %d nodes and %d edges.",
+        len(change.removed_nodes), len(change.removed_edges),
+    )
+
+    await set_graph(tenant_id, kb_id, embed_bdl, reso.graph, change, callback)
     now = asyncio.get_running_loop().time()
     logging.info("[P3] incremental resolution done in %.2fs.", now - start)
 

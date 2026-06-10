@@ -396,6 +396,71 @@ class OSConnection(DocStoreConnection):
         logger.error(f"OSConnection.search timeout for {ATTEMPT_TIME} times!")
         raise Exception("OSConnection.search timeout.")
 
+    def knn_search_entities(
+        self,
+        index_names: str | list[str],
+        knowledgebase_ids: list[str],
+        vector: list[float],
+        vector_column_name: str,
+        k: int,
+        min_score: float | None = None,
+        entity_type: str | None = None,
+        exclude_name: str | None = None,
+    ) -> dict:
+        """OpenSearch KNN query for entity chunks.
+
+        Returns the raw OpenSearch response so callers can use
+        ``get_fields()`` / ``get_scores()`` on it.
+        """
+        if isinstance(index_names, str):
+            index_names = index_names.split(",")
+
+        filter_must = [
+            {"terms": {"kb_id": knowledgebase_ids}},
+            {"terms": {"knowledge_graph_kwd": ["entity"]}},
+        ]
+        if entity_type:
+            filter_must.append({"term": {"entity_type_kwd": entity_type}})
+
+        knn_body = {
+            "query": {
+                "knn": {
+                    vector_column_name: {
+                        "vector": list(vector),
+                        "k": k,
+                        "filter": {"bool": {"must": filter_must}},
+                    }
+                }
+            }
+        }
+        if min_score is not None:
+            knn_body["query"]["knn"][vector_column_name]["min_score"] = min_score
+        if exclude_name:
+            knn_body["query"]["knn"][vector_column_name]["filter"]["bool"]["must_not"] = [
+                {"term": {"entity_kwd": exclude_name}}
+            ]
+
+        for i in range(ATTEMPT_TIME):
+            try:
+                res = self.os.search(
+                    index=index_names,
+                    body=knn_body,
+                    timeout=600,
+                    track_total_hits=True,
+                    _source=True,
+                )
+                logger.debug(f"OSConnection.knn_search_entities {str(index_names)} res: " + str(res))
+                return res
+            except Exception as e:
+                logger.exception(
+                    f"OSConnection.knn_search_entities {str(index_names)} query: " + str(knn_body)
+                )
+                if str(e).find("Timeout") > 0:
+                    continue
+                raise e
+        logger.error(f"OSConnection.knn_search_entities timeout for {ATTEMPT_TIME} times!")
+        raise Exception("OSConnection.knn_search_entities timeout.")
+
     def search_with_scroll(self, index_names, query_body: dict, fields: list[str], scroll_timeout="2m", batch_size=1000):
         """Use OpenSearch scroll API to fetch all results safely.
 

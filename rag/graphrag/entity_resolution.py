@@ -49,11 +49,41 @@ DEFAULT_RESOLUTION_RESULT_DELIMITER = "&&"
 # intentionally kept separate even if they share names across documents).
 EXCLUDED_RESOLUTION_TYPES = {"书籍", "章节"}
 
-# Phase 3.1: ANN 预筛的默认参数（直接读 GraphRAGConfig，避免双源）
-DEFAULT_ANN_TOP_K = GraphRAGConfig.ENTITY_RESOLUTION_ANN_TOP_K
-DEFAULT_ANN_SIMILARITY_THRESHOLD = GraphRAGConfig.ENTITY_RESOLUTION_ANN_SIM_THRESHOLD
+# Phase 3.1: candidate recall 默认参数（直接读 GraphRAGConfig，避免双源）
+DEFAULT_RESOLUTION_TOP_K = GraphRAGConfig.ENTITY_RESOLUTION_TOP_K
+DEFAULT_RESOLUTION_SIMILARITY_THRESHOLD = GraphRAGConfig.ENTITY_RESOLUTION_SIM_THRESHOLD
 
 
+def _has_digit_in_2gram_diff(a, b):
+    def to_2gram_set(s):
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+
+    set_a = to_2gram_set(a)
+    set_b = to_2gram_set(b)
+    diff = set_a ^ set_b
+    return any(any(c.isdigit() for c in pair) for pair in diff)
+
+
+def is_similarity_str(a, b):
+    """模块级字符级相似度判断（不依赖 EntityResolution 实例）。"""
+    if _has_digit_in_2gram_diff(a, b):
+        return False
+
+    if is_english(a) and is_english(b):
+        if editdistance.eval(a, b) <= min(len(a), len(b)) // 2:
+            return True
+        return False
+
+    a, b = set(a), set(b)
+    max_l = max(len(a), len(b))
+    if max_l < 4:
+        return len(a & b) > 1
+
+    return len(a & b) * 1.0 / max_l >= 0.8
+
+
+# DEPRECATED: 内存 ANN 路径已被 OpenSearch KNN 替代。
+# 保留以兼容 USE_INCREMENTAL_RESOLUTION=0 的全量消解路径。
 async def _resolve_entity_embeddings(
     entity_names: list[str], embed_bdl, batch_size: int = 64
 ) -> list[np.ndarray | None]:
@@ -109,12 +139,14 @@ async def _resolve_entity_embeddings(
     return embeddings
 
 
+# DEPRECATED: 内存 ANN 路径已被 OpenSearch KNN 替代。
+# 保留以兼容 USE_INCREMENTAL_RESOLUTION=0 的全量消解路径。
 async def build_ann_candidate_pairs(
     entity_names: list[str],
     embed_bdl,
     *,
-    top_k: int = DEFAULT_ANN_TOP_K,
-    similarity_threshold: float = DEFAULT_ANN_SIMILARITY_THRESHOLD,
+    top_k: int = DEFAULT_RESOLUTION_TOP_K,
+    similarity_threshold: float = DEFAULT_RESOLUTION_SIMILARITY_THRESHOLD,
 ) -> set[tuple[str, str]]:
     """Phase 3.1: 用 embedding cosine 相似度做 ANN 预筛，返回 candidate pairs 集合。
 
@@ -254,16 +286,18 @@ class EntityResolution(Extractor):
         self._excluded_types = excluded_types if excluded_types is not None else EXCLUDED_RESOLUTION_TYPES
         # Phase 3.1: embed_bdl 用于 ANN 预筛
         self._embed_bdl = embed_bdl
-        # use_ann_prefilter=None 时回退到 GraphRAGConfig.USE_ENTITY_RESOLUTION_ANN
+        # use_ann_prefilter=None 时默认 False（内存 ANN 已废弃，全量路径也禁用）
         if use_ann_prefilter is None:
-            use_ann_prefilter = GraphRAGConfig.USE_ENTITY_RESOLUTION_ANN
+            use_ann_prefilter = False
         self._use_ann_prefilter = use_ann_prefilter and embed_bdl is not None
 
     async def __call__(self, graph: nx.Graph,
                        subgraph_nodes: set[str],
                        prompt_variables: dict[str, Any] | None = None,
                        callback: Callable | None = None,
-                       task_id: str = "") -> EntityResolutionResult:
+                       task_id: str = "",
+                       candidate_resolution: dict[str, list[tuple[str, str]]] | None = None,
+                       ) -> EntityResolutionResult:
         """Call method definition."""
         if prompt_variables is None:
             prompt_variables = {}
@@ -294,25 +328,33 @@ class EntityResolution(Extractor):
             if ent_type not in excluded:
                 node_clusters[ent_type].append(node)
 
-        candidate_resolution = {entity_type: [] for entity_type in entity_types}
-        if self._use_ann_prefilter:
-            # Phase 3.1: ANN 预筛路径。每个 type 独立做 embedding 召回 top-K，
-            # 把 candidate 从 O(n^2) 降到 O(n * top_k)。1 万 person 类型节点
-            # 旧路径 = 5000 万对，ANN 后 ≈ 20 万对（top_k=20）。
-            for k, v in node_clusters.items():
-                ann_pairs = await build_ann_candidate_pairs(v, self._embed_bdl)
-                # 仍保留 (in subgraph_nodes) 过滤 + 字符级 is_similarity 二次筛
-                candidate_resolution[k] = [
-                    (a, b) for (a, b) in ann_pairs
-                    if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)
-                ]
+        if candidate_resolution is not None:
+            # KNN 路径：外部注入 candidate pairs，跳过内部生成。
+            # 仅做 excluded_types 过滤防御。
+            candidate_resolution = {
+                k: v for k, v in candidate_resolution.items()
+                if k not in excluded
+            }
         else:
-            # 旧路径：O(n^2) itertools.combinations。USE_ENTITY_RESOLUTION_ANN=0 时走这里。
-            for k, v in node_clusters.items():
-                candidate_resolution[k] = [
-                    (a, b) for a, b in itertools.combinations(v, 2)
-                    if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)
-                ]
+            candidate_resolution = {entity_type: [] for entity_type in entity_types}
+            if self._use_ann_prefilter:
+                # Phase 3.1: ANN 预筛路径。每个 type 独立做 embedding 召回 top-K，
+                # 把 candidate 从 O(n^2) 降到 O(n * top_k)。1 万 person 类型节点
+                # 旧路径 = 5000 万对，ANN 后 ≈ 20 万对（top_k=20）。
+                for k, v in node_clusters.items():
+                    ann_pairs = await build_ann_candidate_pairs(v, self._embed_bdl)
+                    # 仍保留 (in subgraph_nodes) 过滤 + 字符级 is_similarity 二次筛
+                    candidate_resolution[k] = [
+                        (a, b) for (a, b) in ann_pairs
+                        if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)
+                    ]
+            else:
+                # 旧路径：O(n^2) itertools.combinations（内存 ANN 已废弃，默认不走）。
+                for k, v in node_clusters.items():
+                    candidate_resolution[k] = [
+                        (a, b) for a, b in itertools.combinations(v, 2)
+                        if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)
+                    ]
         num_candidates = sum([len(candidates) for _, candidates in candidate_resolution.items()])
         callback(msg=f"Identified {num_candidates} candidate pairs")
         remain_candidates_to_resolve = num_candidates
@@ -521,28 +563,8 @@ class EntityResolution(Extractor):
         return ans_list
 
     def _has_digit_in_2gram_diff(self, a, b):
-        def to_2gram_set(s):
-            return {s[i:i+2] for i in range(len(s) - 1)}
-
-        set_a = to_2gram_set(a)
-        set_b = to_2gram_set(b)
-        diff = set_a ^ set_b
-
-        return any(any(c.isdigit() for c in pair) for pair in diff)
+        return _has_digit_in_2gram_diff(a, b)
 
     def is_similarity(self, a, b):
-        if self._has_digit_in_2gram_diff(a, b):
-            return False
-
-        if is_english(a) and is_english(b):
-            if editdistance.eval(a, b) <= min(len(a), len(b)) // 2:
-                return True
-            return False
-
-        a, b = set(a), set(b)
-        max_l = max(len(a), len(b))
-        if max_l < 4:
-            return len(a & b) > 1
-
-        return len(a & b)*1./max_l >= 0.8
+        return is_similarity_str(a, b)
 

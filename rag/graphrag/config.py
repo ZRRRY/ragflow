@@ -53,11 +53,15 @@ class GraphRAGConfig:
     HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
     HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "90"))
 
-    # Phase 3.1 – Entity resolution ANN prefilter (replace O(n^2) itertools.combinations)
-    USE_ENTITY_RESOLUTION_ANN = os.environ.get("USE_ENTITY_RESOLUTION_ANN", "1") == "1"
-    ENTITY_RESOLUTION_ANN_TOP_K = int(os.environ.get("ENTITY_RESOLUTION_ANN_TOP_K", "20"))
-    ENTITY_RESOLUTION_ANN_SIM_THRESHOLD = float(
-        os.environ.get("ENTITY_RESOLUTION_ANN_SIM_THRESHOLD", "0.7")
+    # Phase 3.1 – Entity resolution candidate recall parameters.
+    # When USE_INCREMENTAL_RESOLUTION=1:
+    #   USE_KNN_FOR_RESOLUTION=1 → OpenSearch KNN (recommended for large KBs)
+    #   USE_KNN_FOR_RESOLUTION=0 → char-level filtering only (no ANN, no embedding)
+    # When USE_INCREMENTAL_RESOLUTION=0: no effect (full-graph path is deprecated).
+    USE_KNN_FOR_RESOLUTION = os.environ.get("USE_KNN_FOR_RESOLUTION", "1") == "1"
+    ENTITY_RESOLUTION_TOP_K = int(os.environ.get("ENTITY_RESOLUTION_TOP_K", "20"))
+    ENTITY_RESOLUTION_SIM_THRESHOLD = float(
+        os.environ.get("ENTITY_RESOLUTION_SIM_THRESHOLD", "0.7")
     )
 
     # Phase 4.4 – Batched entity/edge summarization
@@ -78,7 +82,7 @@ class GraphRAGConfig:
             "adaptive_interval=%d degrade_thr=%d increase_thr=%d es_slow_ms=%d "
             "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d "
             "heartbeat_interval=%ds heartbeat_ttl=%ds "
-            "resolution_ann=%s ann_top_k=%d ann_sim_thr=%.2f "
+            "knn_resolution=%s resolution_top_k=%d resolution_sim_thr=%.2f "
             "batched_summarization=%s summary_batch_size=%d "
             "keep_subgraph=%s keep_merge=%s keep_resolution=%s",
             cls.USE_INCREMENTAL_GRAPH,
@@ -98,9 +102,9 @@ class GraphRAGConfig:
             cls.STUCK_TASK_MIN_EDGES,
             cls.HEARTBEAT_INTERVAL,
             cls.HEARTBEAT_TTL,
-            cls.USE_ENTITY_RESOLUTION_ANN,
-            cls.ENTITY_RESOLUTION_ANN_TOP_K,
-            cls.ENTITY_RESOLUTION_ANN_SIM_THRESHOLD,
+            cls.USE_KNN_FOR_RESOLUTION,
+            cls.ENTITY_RESOLUTION_TOP_K,
+            cls.ENTITY_RESOLUTION_SIM_THRESHOLD,
             cls.USE_BATCHED_SUMMARIZATION,
             cls.ENTITY_SUMMARY_BATCH_SIZE,
             cls.KEEP_SUBGRAPH,
