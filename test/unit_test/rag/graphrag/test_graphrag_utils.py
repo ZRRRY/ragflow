@@ -533,60 +533,19 @@ class TestFlatUniqList:
         assert set(result) == {1, 2, 3}
 
 
-class TestIsDocMerged:
-    """Tests for is_doc_merged point-query idempotency check."""
+class TestMergeState:
+    """Tests for write_merge_state / query_merge_state / is_doc_merged."""
 
     @pytest.mark.asyncio
-    async def test_monolithic_mode_merged(self, monkeypatch):
+    async def test_is_doc_merged_when_merged(self, monkeypatch):
         from rag.graphrag import utils as _utils
-
-        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", False)
-
-        graph = nx.Graph()
-        graph.graph["source_id"] = ["doc_123"]
-        async def mock_get_graph(t, k):
-            return graph
-        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
-
-        assert await is_doc_merged("t1", "kb1", "doc_123") is True
-
-    @pytest.mark.asyncio
-    async def test_monolithic_mode_not_merged(self, monkeypatch):
-        from rag.graphrag import utils as _utils
-
-        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", False)
-
-        graph = nx.Graph()
-        graph.graph["source_id"] = ["doc_456"]
-        async def mock_get_graph(t, k):
-            return graph
-        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
-
-        assert await is_doc_merged("t1", "kb1", "doc_123") is False
-
-    @pytest.mark.asyncio
-    async def test_monolithic_mode_no_graph(self, monkeypatch):
-        from rag.graphrag import utils as _utils
-
-        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", False)
-        async def mock_get_graph(t, k):
-            return None
-        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
-
-        assert await is_doc_merged("t1", "kb1", "doc_123") is False
-
-    @pytest.mark.asyncio
-    async def test_incremental_mode_merged(self, monkeypatch):
-        from rag.graphrag import utils as _utils
-
-        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
 
         def mock_search(*a, **k):
             return "raw_res"
 
         def mock_get_fields(res, fields):
             if res == "raw_res":
-                return {"chunk_1": {"source_id": ["doc_123"]}}
+                return {"chunk_1": {"content_with_weight": '{"state": "merged"}'}}
             return {}
 
         monkeypatch.setattr(_utils.settings.docStoreConn, "search", mock_search)
@@ -595,10 +554,25 @@ class TestIsDocMerged:
         assert await is_doc_merged("t1", "kb1", "doc_123") is True
 
     @pytest.mark.asyncio
-    async def test_incremental_mode_not_merged(self, monkeypatch):
+    async def test_is_doc_merged_when_merging(self, monkeypatch):
         from rag.graphrag import utils as _utils
 
-        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
+        def mock_search(*a, **k):
+            return "raw_res"
+
+        def mock_get_fields(res, fields):
+            if res == "raw_res":
+                return {"chunk_1": {"content_with_weight": '{"state": "merging"}'}}
+            return {}
+
+        monkeypatch.setattr(_utils.settings.docStoreConn, "search", mock_search)
+        monkeypatch.setattr(_utils.settings.docStoreConn, "get_fields", mock_get_fields)
+
+        assert await is_doc_merged("t1", "kb1", "doc_123") is False
+
+    @pytest.mark.asyncio
+    async def test_is_doc_merged_when_no_record(self, monkeypatch):
+        from rag.graphrag import utils as _utils
 
         def mock_search(*a, **k):
             return "raw_res"
@@ -612,39 +586,77 @@ class TestIsDocMerged:
         assert await is_doc_merged("t1", "kb1", "doc_123") is False
 
     @pytest.mark.asyncio
-    async def test_incremental_mode_fallback_on_exception(self, monkeypatch):
+    async def test_is_doc_merged_on_db_error(self, monkeypatch):
         from rag.graphrag import utils as _utils
-
-        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
 
         def failing_search(*a, **k):
             raise RuntimeError("db down")
 
         monkeypatch.setattr(_utils.settings.docStoreConn, "search", failing_search)
 
-        graph = nx.Graph()
-        graph.graph["source_id"] = ["doc_123"]
-        async def mock_get_graph(t, k):
-            return graph
-        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
+        # DB 异常时视为未合并，不再回退旧逻辑
+        assert await is_doc_merged("t1", "kb1", "doc_123") is False
 
-        assert await is_doc_merged("t1", "kb1", "doc_123") is True
+
+class TestPreDeleteAddedUpdated:
+    """Tests for _pre_delete_added_updated idempotency helper."""
 
     @pytest.mark.asyncio
-    async def test_incremental_mode_fallback_not_merged(self, monkeypatch):
+    async def test_pre_delete_nodes(self, monkeypatch):
         from rag.graphrag import utils as _utils
 
-        monkeypatch.setattr(_utils.GraphRAGConfig, "USE_INCREMENTAL_GRAPH", True)
+        deleted_conditions = []
 
-        def failing_search(*a, **k):
-            raise RuntimeError("db down")
+        def mock_delete(condition, index_name, kb_id):
+            deleted_conditions.append(condition)
+            return None
 
-        monkeypatch.setattr(_utils.settings.docStoreConn, "search", failing_search)
+        monkeypatch.setattr(_utils.settings.docStoreConn, "delete", mock_delete)
 
-        graph = nx.Graph()
-        graph.graph["source_id"] = ["doc_456"]
-        async def mock_get_graph(t, k):
-            return graph
-        monkeypatch.setattr(_utils, "get_graph", mock_get_graph)
+        change = GraphChange()
+        change.added_updated_nodes = {"A", "B", "C"}
 
-        assert await is_doc_merged("t1", "kb1", "doc_123") is False
+        await _utils._pre_delete_added_updated("t1", "kb1", change)
+
+        assert len(deleted_conditions) == 1
+        assert deleted_conditions[0]["knowledge_graph_kwd"] == ["entity"]
+        assert set(deleted_conditions[0]["entity_kwd"]) == {"A", "B", "C"}
+
+    @pytest.mark.asyncio
+    async def test_pre_delete_edges(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        deleted_conditions = []
+
+        def mock_delete(condition, index_name, kb_id):
+            deleted_conditions.append(condition)
+            return None
+
+        monkeypatch.setattr(_utils.settings.docStoreConn, "delete", mock_delete)
+
+        change = GraphChange()
+        change.added_updated_edges = {("A", "B"), ("A", "C")}
+
+        await _utils._pre_delete_added_updated("t1", "kb1", change)
+
+        assert len(deleted_conditions) == 1
+        assert deleted_conditions[0]["knowledge_graph_kwd"] == ["relation"]
+        assert deleted_conditions[0]["from_entity_kwd"] == "A"
+        assert set(deleted_conditions[0]["to_entity_kwd"]) == {"B", "C"}
+
+    @pytest.mark.asyncio
+    async def test_pre_delete_empty_change(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        deleted_conditions = []
+
+        def mock_delete(condition, index_name, kb_id):
+            deleted_conditions.append(condition)
+            return None
+
+        monkeypatch.setattr(_utils.settings.docStoreConn, "delete", mock_delete)
+
+        change = GraphChange()
+        await _utils._pre_delete_added_updated("t1", "kb1", change)
+
+        assert len(deleted_conditions) == 0

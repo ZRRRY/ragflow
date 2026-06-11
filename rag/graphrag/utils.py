@@ -445,36 +445,92 @@ async def get_relation(tenant_id, kb_id, from_ent_name, to_ent_name, size=1):
     return res
 
 
-async def is_doc_merged(tenant_id, kb_id, doc_id):
-    """Check whether a document has already been merged into the global graph.
+async def write_merge_state(
+    tenant_id: str,
+    kb_id: str,
+    doc_id: str,
+    state: str,
+    expected_nodes: int = 0,
+    expected_edges: int = 0,
+    extra: dict | None = None,
+):
+    """写入文档的合并状态。同一 doc_id 的旧记录会被删除后再写入新记录。"""
+    # 清理旧记录
+    try:
+        await thread_pool_exec(
+            settings.docStoreConn.delete,
+            {
+                "knowledge_graph_kwd": ["merge_state"],
+                "source_id": [doc_id],
+                "kb_id": kb_id,
+            },
+            search.index_name(tenant_id),
+            kb_id,
+        )
+    except Exception:
+        logging.exception("Failed to clean old merge_state for doc %s (non-fatal)", doc_id)
 
-    In incremental storage mode this uses a lightweight point query (size=1)
-    against entity chunks instead of loading the full graph.
-    In monolithic mode it falls back to ``get_graph()`` because that path
-    already loads a single JSON blob and is not expensive.
-    """
-    if not GraphRAGConfig.USE_INCREMENTAL_GRAPH:
-        graph = await get_graph(tenant_id, kb_id)
-        return graph is not None and doc_id in graph.graph.get("source_id", [])
+    meta = {
+        "state": state,
+        "expected_nodes": expected_nodes,
+        "expected_edges": expected_edges,
+        "updated_at": time.time(),
+    }
+    if extra:
+        meta.update(extra)
 
-    # 增量模式：直连 docStoreConn 绕过 Dealer.get_filters() 白名单，
-    # 避免 source_id 条件被静默丢弃导致误判（详见 GraphRAG pipeline 文档）。
+    chunk = {
+        "id": get_uuid(),
+        "kb_id": kb_id,
+        "source_id": [doc_id],
+        "knowledge_graph_kwd": "merge_state",
+        "content_with_weight": json.dumps(meta, ensure_ascii=False),
+        "available_int": 0,
+        "removed_kwd": "N",
+    }
+
+    await thread_pool_exec(
+        settings.docStoreConn.insert,
+        [chunk],
+        search.index_name(tenant_id),
+        kb_id,
+    )
+
+
+async def query_merge_state(
+    tenant_id: str,
+    kb_id: str,
+    doc_id: str,
+) -> dict | None:
+    """查询文档的最新合并状态。返回 None 表示无记录。"""
     condition = {
-        "knowledge_graph_kwd": ["entity"],
+        "knowledge_graph_kwd": ["merge_state"],
         "source_id": [doc_id],
     }
     try:
         res = await thread_pool_exec(
             settings.docStoreConn.search,
-            ["source_id"], [], condition, [], OrderByExpr(),
+            ["content_with_weight"], [], condition, [], OrderByExpr(),
             0, 1, search.index_name(tenant_id), [kb_id],
         )
-        fields = settings.docStoreConn.get_fields(res, ["source_id"])
-        return len(fields) > 0
-    except Exception as e:
-        logging.warning("is_doc_merged point query failed for doc %s: %s", doc_id, e)
-        graph = await get_graph(tenant_id, kb_id)
-        return graph is not None and doc_id in graph.graph.get("source_id", [])
+        fields = settings.docStoreConn.get_fields(res, ["content_with_weight"])
+        for row in fields.values():
+            try:
+                return json.loads(row["content_with_weight"])
+            except Exception:
+                continue
+    except Exception:
+        logging.exception("query_merge_state failed for doc %s", doc_id)
+    return None
+
+
+async def is_doc_merged(tenant_id: str, kb_id: str, doc_id: str) -> bool:
+    """Check whether a document has already been merged into the global graph.
+
+    基于 merge_state 精确状态判断。无状态记录视为未合并。
+    """
+    state_meta = await query_merge_state(tenant_id, kb_id, doc_id)
+    return state_meta is not None and state_meta.get("state") == "merged"
 
 
 async def query_existing_entities(tenant_id, kb_id, node_names):
@@ -1232,6 +1288,9 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
+    # 3. Pre-delete old versions of entities/edges that will be re-inserted
+    await _pre_delete_added_updated(tenant_id, kb_id, change, callback)
+
     del_now = asyncio.get_running_loop().time()
     if callback:
         callback(msg=f"set_graph removed {len(change.removed_nodes)} nodes and {len(change.removed_edges)} edges from index in {del_now - start:.2f}s.")
@@ -1253,6 +1312,84 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
     # 崩溃只可能让 OS 写完、MySQL 没写完 —— 由 task_executor 启动时的 reconciler 兜底。
     if callback:
         callback(prog=1.0, msg=f"Knowledge Graph data committed ({len(change.added_updated_nodes)} nodes, {len(change.added_updated_edges)} edges).")
+
+
+async def _pre_delete_added_updated(
+    tenant_id: str,
+    kb_id: str,
+    change: GraphChange,
+    callback=None,
+):
+    """Pre-delete old versions of nodes/edges that will be re-inserted.
+
+    ``_batch_embed_nodes`` / ``_batch_embed_edges`` generate new chunks with
+    random UUIDs.  Without this step, merging the same document again would
+    leave the previous entity/relation documents behind, creating multi-version
+    residue.  Deleting by business key before insert keeps exactly one version
+    per entity/relation in the doc store.
+    """
+    global chat_limiter
+
+    if change.added_updated_nodes:
+        BATCH_SIZE = 100
+        sorted_nodes = sorted(change.added_updated_nodes)
+        for i in range(0, len(sorted_nodes), BATCH_SIZE):
+            batch = sorted_nodes[i:i + BATCH_SIZE]
+            await thread_pool_exec(
+                settings.docStoreConn.delete,
+                {"knowledge_graph_kwd": ["entity"], "entity_kwd": batch},
+                search.index_name(tenant_id),
+                kb_id
+            )
+
+    if change.added_updated_edges:
+        from collections import defaultdict
+        update_buckets: dict[str, list[str]] = defaultdict(list)
+        for from_node, to_node in change.added_updated_edges:
+            update_buckets[from_node].append(to_node)
+
+        async def del_update_edges_bulk(from_node: str, to_nodes: list[str]):
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    async with chat_limiter:
+                        await thread_pool_exec(
+                            settings.docStoreConn.delete,
+                            {
+                                "knowledge_graph_kwd": ["relation"],
+                                "from_entity_kwd": from_node,
+                                "to_entity_kwd": to_nodes,
+                            },
+                            search.index_name(tenant_id),
+                            kb_id,
+                        )
+                    return
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        logging.warning(
+                            "pre-del_update_edges_bulk(from=%s, n_to=%d) attempt %d failed: %s, retrying in %ds",
+                            from_node, len(to_nodes), attempt + 1, e, wait,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+
+        tasks = [
+            asyncio.create_task(del_update_edges_bulk(from_node, to_nodes))
+            for from_node, to_nodes in update_buckets.items()
+        ]
+        try:
+            await asyncio.gather(*tasks, return_exceptions=False)
+        except Exception as e:
+            logging.error("Error while pre-deleting update edges: %s", e)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    if callback and (change.added_updated_nodes or change.added_updated_edges):
+        callback(msg=f"pre-deleted old versions of {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges")
 
 
 async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
@@ -1347,6 +1484,9 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+
+    # 3. Pre-delete old versions of entities/edges that will be re-inserted
+    await _pre_delete_added_updated(tenant_id, kb_id, change, callback)
 
     del_now = asyncio.get_running_loop().time()
     if callback:

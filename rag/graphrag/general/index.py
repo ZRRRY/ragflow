@@ -52,8 +52,10 @@ from rag.graphrag.utils import (
     query_existing_entities,
     query_existing_relations,
     query_node_relations,
+    query_merge_state,
     set_graph,
     tidy_graph,
+    write_merge_state,
 )
 from common.misc_utils import thread_pool_exec
 from rag.nlp import rag_tokenizer, search
@@ -367,16 +369,16 @@ async def run_graphrag_for_kb(
         except Exception as e:
             logging.warning("[GraphRAG] Failed to clear previous subgraph checkpoints for dataset %s: %s", kb_id, e)
 
-    # 2) merge results (graph/entity/relation)
+    # 2) merge results (graph/entity/relation/merge_state)
     if not GraphRAGConfig.KEEP_MERGE:
         try:
             await thread_pool_exec(
                 settings.docStoreConn.delete,
-                {"kb_id": kb_id, "knowledge_graph_kwd": ["graph", "entity", "relation"]},
+                {"kb_id": kb_id, "knowledge_graph_kwd": ["graph", "entity", "relation", "merge_state"]},
                 search.index_name(tenant_id),
                 kb_id,
             )
-            callback(msg=f"[GraphRAG] Cleared previous graph/entity/relation for dataset:{kb_id}")
+            callback(msg=f"[GraphRAG] Cleared previous graph/entity/relation/merge_state for dataset:{kb_id}")
         except Exception as e:
             logging.warning("[GraphRAG] Failed to clear previous merge results for dataset %s: %s", kb_id, e)
 
@@ -597,6 +599,14 @@ async def run_graphrag_for_kb(
             sg = subgraphs[doc_id]
             union_nodes.update(set(sg.nodes()))
 
+            # 标记 merging
+            await write_merge_state(
+                tenant_id, kb_id, doc_id,
+                state="merging",
+                expected_nodes=len(sg.nodes),
+                expected_edges=len(sg.edges),
+            )
+
             try:
                 async def merge_subgraph_attempt():
                     if await is_doc_merged(tenant_id, kb_id, doc_id):
@@ -624,11 +634,27 @@ async def run_graphrag_for_kb(
             except TaskCanceledException:
                 raise
             except Exception as e:
+                # 标记 failed
+                await write_merge_state(
+                    tenant_id, kb_id, doc_id,
+                    state="failed",
+                    expected_nodes=len(sg.nodes),
+                    expected_edges=len(sg.edges),
+                    extra={"error": repr(e)},
+                )
                 failed_docs.append((doc_id, f"merge failed: {e!r}"))
                 callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} FAILED: {e!r}")
                 raise
+
+            # 标记 merged
             if new_graph is not None:
                 final_graph = new_graph
+                await write_merge_state(
+                    tenant_id, kb_id, doc_id,
+                    state="merged",
+                    expected_nodes=len(sg.nodes),
+                    expected_edges=len(sg.edges),
+                )
 
         if ok_docs and final_graph is None:
             callback(msg=f"[GraphRAG] dataset:{kb_id} merge finished (no in-memory graph returned).")
@@ -1083,6 +1109,15 @@ async def generate_subgraph(
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before saving subgraph for doc {doc_id}.", callback)
     await thread_pool_exec(settings.docStoreConn.delete,{"knowledge_graph_kwd": "subgraph", "source_id": doc_id},search.index_name(tenant_id),kb_id,)
     await thread_pool_exec(settings.docStoreConn.insert,[{"id": cid, **chunk}],search.index_name(tenant_id),kb_id,)
+
+    # 标记 pending
+    await write_merge_state(
+        tenant_id, kb_id, doc_id,
+        state="pending",
+        expected_nodes=len(subgraph.nodes),
+        expected_edges=len(subgraph.edges),
+    )
+
     now = asyncio.get_running_loop().time()
     callback(msg=f"generated subgraph for doc {doc_id} in {now - start:.2f} seconds.")
     return subgraph

@@ -586,6 +586,7 @@ def run_index(dataset_id: str, tenant_id: str, index_type: str):
 
     task_type = _INDEX_TYPE_TO_TASK_TYPE[index_type]
     task_id_field = _INDEX_TYPE_TO_TASK_ID_FIELD[index_type]
+    task_finish_at_field = f"{task_id_field.replace('_task_id', '_task_finish_at')}"
     display_name = _INDEX_TYPE_TO_DISPLAY_NAME[index_type]
 
     existing_task_id = getattr(kb, task_id_field, None)
@@ -616,7 +617,7 @@ def run_index(dataset_id: str, tenant_id: str, index_type: str):
 
     task_id = queue_raptor_o_graphrag_tasks(sample_doc=sample_document, ty=task_type, priority=0, fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID, doc_ids=list(document_ids))
 
-    if not KnowledgebaseService.update_by_id(kb.id, {task_id_field: task_id}):
+    if not KnowledgebaseService.update_by_id(kb.id, {task_id_field: task_id, task_finish_at_field: None}):
         logging.warning(f"Cannot save {task_id_field} for Dataset {dataset_id}")
 
     return True, {"task_id": task_id}

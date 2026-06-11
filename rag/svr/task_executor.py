@@ -319,13 +319,13 @@ async def reconcile_stuck_graphrag_tasks():
                 continue
 
             # 3) 加载 task,过滤 progress / update_time
-            task = TaskService.get_task(task_id)
-            if not task:
+            ok, task_obj = TaskService.get_by_id(task_id)
+            if not ok or task_obj is None:
                 logging.warning("[reconcile] kb=%s task=%s 不存在,skip", kb_id, task_id)
                 REDIS_CONN.delete(claim)
                 continue
-            prog = task.get("progress", 0) or 0
-            update_time = task.get("update_time") or 0
+            prog = task_obj.progress or 0
+            update_time = task_obj.update_time or 0
             if not (0 < prog < 1):
                 logging.info("[reconcile] kb=%s task=%s progress=%.4f 不在 (0,1),skip", kb_id, task_id, prog)
                 REDIS_CONN.delete(claim)
@@ -478,6 +478,25 @@ async def collect():
         state = "is unknown" if not task else "has been cancelled"
         FAILED_TASKS += 1
         logging.warning(f"collect task {msg['id']} {state}")
+        # 对 graphrag/raptor/mindmap 的 abandon task 补充 pipeline log，避免操作日志缺失
+        if not task and msg.get("task_type") in ["graphrag", "raptor", "mindmap"]:
+            try:
+                _task_type_map = {
+                    "graphrag": PipelineTaskType.GRAPH_RAG,
+                    "raptor": PipelineTaskType.RAPTOR,
+                    "mindmap": PipelineTaskType.MINDMAP,
+                }
+                _doc_ids = msg.get("doc_ids", [])
+                _ref_doc_id = _doc_ids[0] if _doc_ids else None
+                PipelineOperationLogService.record_pipeline_operation(
+                    document_id=msg.get("doc_id", ""),
+                    pipeline_id="",
+                    task_type=_task_type_map[msg["task_type"]],
+                    task_id=msg["id"],
+                    referred_document_id=_ref_doc_id,
+                )
+            except Exception:
+                logging.exception(f"PipelineOperationLogService failed for abandoned task {msg['id']}")
         redis_msg.ack()
         return None, None
 
