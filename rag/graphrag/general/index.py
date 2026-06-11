@@ -1375,7 +1375,7 @@ async def resolve_entities_incremental(
             return
 
         vector_field = f"q_{vector_dim}_vec"
-        knn_semaphore = asyncio.Semaphore(8)
+        knn_semaphore = asyncio.Semaphore(GraphRAGConfig.ENTITY_RESOLUTION_KNN_CONCURRENCY)
 
         async def _knn_one(node_name, vector, ent_type):
             async with knn_semaphore:

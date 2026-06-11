@@ -63,6 +63,9 @@ class GraphRAGConfig:
     ENTITY_RESOLUTION_SIM_THRESHOLD = float(
         os.environ.get("ENTITY_RESOLUTION_SIM_THRESHOLD", "0.7")
     )
+    ENTITY_RESOLUTION_KNN_CONCURRENCY = int(
+        os.environ.get("ENTITY_RESOLUTION_KNN_CONCURRENCY", "8")
+    )
 
     # Phase 4.4 – Batched entity/edge summarization
     # 默认关闭（"0"），开启后把多个 entity/edge 的 description 拼到一次 LLM call
@@ -83,6 +86,7 @@ class GraphRAGConfig:
             "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d "
             "heartbeat_interval=%ds heartbeat_ttl=%ds "
             "knn_resolution=%s resolution_top_k=%d resolution_sim_thr=%.2f "
+            "knn_concurrency=%d "
             "batched_summarization=%s summary_batch_size=%d "
             "keep_subgraph=%s keep_merge=%s keep_resolution=%s",
             cls.USE_INCREMENTAL_GRAPH,
@@ -105,6 +109,7 @@ class GraphRAGConfig:
             cls.USE_KNN_FOR_RESOLUTION,
             cls.ENTITY_RESOLUTION_TOP_K,
             cls.ENTITY_RESOLUTION_SIM_THRESHOLD,
+            cls.ENTITY_RESOLUTION_KNN_CONCURRENCY,
             cls.USE_BATCHED_SUMMARIZATION,
             cls.ENTITY_SUMMARY_BATCH_SIZE,
             cls.KEEP_SUBGRAPH,
