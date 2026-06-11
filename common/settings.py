@@ -324,6 +324,16 @@ def init_settings():
     else:
         raise Exception(f"Not supported doc engine: {DOC_ENGINE}")
 
+    # Install audit hook on docStoreConn.delete. Every subprocess that
+    # calls init_settings (api server, task executor, admin service, data
+    # sync) goes through this exact line, so a single install here covers
+    # all entry points. See common/doc_store_audit.py for the rationale.
+    try:
+        from common.doc_store_audit import install as install_docstore_audit
+        install_docstore_audit(docStoreConn)
+    except Exception as _audit_exc:
+        logging.warning("Failed to install docStoreConn.delete audit hook: %s", _audit_exc)
+
     global msgStoreConn
     # use the same engine for message store
     if DOC_ENGINE == "elasticsearch":
