@@ -73,7 +73,8 @@ class OSConnection(DocStoreConnection):
                     http_auth=(settings.OS["username"], settings.OS[
                         "password"]) if "username" in settings.OS and "password" in settings.OS else None,
                     verify_certs=False,
-                    timeout=600
+                    timeout=600,
+                    pool_maxsize=32,
                 )
                 if self.os:
                     self.info = self.os.info()
@@ -546,7 +547,7 @@ class OSConnection(DocStoreConnection):
                 # 全部 batch 写完时主动 refresh 一次（见 set_graph_delta/set_graph_monolithic）。
                 # 中间查询的 stale 风险靠 OpenSearch 默认 1s 自然 refresh 兜底。
                 r = self.os.bulk(index=(indexName), body=operations,
-                                 refresh="false", timeout=60)
+                                 refresh="false", timeout=300)
                 if re.search(r"False", str(r["errors"]), re.IGNORECASE):
                     return res
 

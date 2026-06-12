@@ -67,10 +67,10 @@ from common.doc_store.doc_store_base import OrderByExpr
 DEFAULT_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 4096
 MIN_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 512
 MAX_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 8196
-DEFAULT_GRAPHRAG_RETRY_ATTEMPTS = 2
+DEFAULT_GRAPHRAG_RETRY_ATTEMPTS = 3
 DEFAULT_GRAPHRAG_RETRY_BACKOFF_SECONDS = 10.0
 DEFAULT_GRAPHRAG_RETRY_BACKOFF_MAX_SECONDS = 120.0
-DEFAULT_GRAPHRAG_BUILD_SUBGRAPH_TIMEOUT_PER_CHUNK_SECONDS = 300
+DEFAULT_GRAPHRAG_BUILD_SUBGRAPH_TIMEOUT_PER_CHUNK_SECONDS = 600
 DEFAULT_GRAPHRAG_BUILD_SUBGRAPH_MIN_TIMEOUT_SECONDS = 600
 DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = 1800
 DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS = 1800
@@ -297,7 +297,7 @@ async def run_graphrag_for_kb(
     *,
     with_resolution: bool = True,
     with_community: bool = True,
-    max_parallel_docs: int = 16,
+    max_parallel_docs: int = int(os.environ.get("GRAPHRAG_MAX_PARALLEL_DOCS", "8")),
 ) -> dict:
     tenant_id, kb_id = row["tenant_id"], row["kb_id"]
     task_id = row["id"]
@@ -487,6 +487,13 @@ async def run_graphrag_for_kb(
                 msg = f"[GraphRAG] {label}"
                 callback(msg=f"{msg} start (chunks={len(chunks)}, timeout={build_subgraph_timeout_seconds}s, attempts={build_subgraph_retry_attempts})")
 
+                # Use document name as fallback title so books without a Markdown # title still get a 书籍 entity
+                try:
+                    _, doc_obj = DocumentService.get_by_id(doc_id)
+                    fallback_title = os.path.splitext(doc_obj.name or "")[0] if doc_obj else ""
+                except Exception:
+                    fallback_title = ""
+
                 _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before subgraph generation for doc {doc_id}.", callback)
                 try:
                     async def build_subgraph_attempt():
@@ -506,6 +513,7 @@ async def run_graphrag_for_kb(
                             embedding_model,
                             callback,
                             task_id=task_id,
+                            fallback_title=fallback_title,
                         )
 
                     sg = await _run_with_retry(
