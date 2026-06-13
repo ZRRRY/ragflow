@@ -4,7 +4,7 @@
 
 本脚本**不会重跑实体提取**,只做三件事:
 
-1. **校验**:从 OpenSearch `ragflow_<kb_id>` 索引读真实节点/边数。
+1. **校验**:从 OpenSearch `ragflow_<tenant_id>` 索引读真实节点/边数,并通过 `kb_id` 过滤只统计当前 KB。
 2. **收尾**:把 MySQL `task` 表里 `progress ∈ (0, 1)` 的记录改成 `progress=1.0`。
 3. **清理**:删 Redis 上 `graphrag:phase:<kb_id>:*` 和 `graphrag_task_<kb_id>` 键,避免阻挡后续任务。
 
@@ -36,7 +36,7 @@ docker exec docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py --kb-
 
 输出会显示:
 
-- OS 里的节点 / 边 / 社区报告数量
+- OS 里的节点 / 边 / 社区报告数量(已按当前 KB 的 `kb_id` 过滤)
 - MySQL `task` 表里 `progress ∈ (0, 1)` 的所有记录
 
 ### Step 2:dry-run 看会改哪些 task

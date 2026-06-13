@@ -55,6 +55,53 @@ chat_limiter = LoopLocalSemaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)
 _INSERT_BULK_SIZE = max(1, int(os.environ.get("GRAPHRAG_INSERT_BULK_SIZE", 64)))
 _INSERT_CONCURRENCY = max(1, int(os.environ.get("GRAPHRAG_INSERT_CONCURRENCY", 2)))
 
+# OpenSearch / Elasticsearch default limit for the number of terms in a terms
+# query/filter.  Splitting large to_node lists avoids "max_terms_count" errors
+# during bulk edge deletion.
+_MAX_TERMS_COUNT = max(1, int(os.environ.get("GRAPHRAG_DELETE_MAX_TERMS_COUNT", 65536)))
+
+
+async def _delete_relation_edges_bulk(
+    tenant_id: str,
+    kb_id: str,
+    from_node: str,
+    to_nodes: list[str],
+    *,
+    max_retries: int = 3,
+    label: str = "del_edges_bulk",
+) -> None:
+    """Delete relation edges for a single ``from_node`` in ``to_nodes`` batches.
+
+    Each ``to_entity_kwd`` terms list is capped at ``_MAX_TERMS_COUNT`` to stay
+    below the OpenSearch / Elasticsearch ``index.max_terms_count`` default.
+    """
+    for batch_offset in range(0, len(to_nodes), _MAX_TERMS_COUNT):
+        to_batch = to_nodes[batch_offset : batch_offset + _MAX_TERMS_COUNT]
+        for attempt in range(max_retries):
+            try:
+                async with chat_limiter:
+                    await thread_pool_exec(
+                        settings.docStoreConn.delete,
+                        {
+                            "knowledge_graph_kwd": ["relation"],
+                            "from_entity_kwd": from_node,
+                            "to_entity_kwd": to_batch,
+                        },
+                        search.index_name(tenant_id),
+                        kb_id,
+                    )
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logging.warning(
+                        "%s(from=%s, n_to=%d, batch_offset=%d) attempt %d failed: %s, retrying in %ds",
+                        label, from_node, len(to_batch), batch_offset, attempt + 1, e, wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
 
 async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, label="Insert chunks"):
     """Insert ``chunks`` into the doc store in batches with bounded concurrency and retries.
@@ -1247,35 +1294,12 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
         for from_node, to_node in change.removed_edges:
             from_buckets[from_node].append(to_node)
 
-        async def del_edges_bulk(from_node: str, to_nodes: list[str]):
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    async with chat_limiter:
-                        await thread_pool_exec(
-                            settings.docStoreConn.delete,
-                            {
-                                "knowledge_graph_kwd": ["relation"],
-                                "from_entity_kwd": from_node,
-                                "to_entity_kwd": to_nodes,
-                            },
-                            search.index_name(tenant_id),
-                            kb_id,
-                        )
-                    return
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait = 2 ** attempt
-                        logging.warning(
-                            "del_edges_bulk(from=%s, n_to=%d) attempt %d failed: %s, retrying in %ds",
-                            from_node, len(to_nodes), attempt + 1, e, wait,
-                        )
-                        await asyncio.sleep(wait)
-                    else:
-                        raise
-
         tasks = [
-            asyncio.create_task(del_edges_bulk(from_node, to_nodes))
+            asyncio.create_task(
+                _delete_relation_edges_bulk(
+                    tenant_id, kb_id, from_node, to_nodes, label="del_edges_bulk"
+                )
+            )
             for from_node, to_nodes in from_buckets.items()
         ]
 
@@ -1344,35 +1368,12 @@ async def _pre_delete_added_updated(
         for from_node, to_node in change.added_updated_edges:
             update_buckets[from_node].append(to_node)
 
-        async def del_update_edges_bulk(from_node: str, to_nodes: list[str]):
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    async with chat_limiter:
-                        await thread_pool_exec(
-                            settings.docStoreConn.delete,
-                            {
-                                "knowledge_graph_kwd": ["relation"],
-                                "from_entity_kwd": from_node,
-                                "to_entity_kwd": to_nodes,
-                            },
-                            search.index_name(tenant_id),
-                            kb_id,
-                        )
-                    return
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait = 2 ** attempt
-                        logging.warning(
-                            "pre-del_update_edges_bulk(from=%s, n_to=%d) attempt %d failed: %s, retrying in %ds",
-                            from_node, len(to_nodes), attempt + 1, e, wait,
-                        )
-                        await asyncio.sleep(wait)
-                    else:
-                        raise
-
         tasks = [
-            asyncio.create_task(del_update_edges_bulk(from_node, to_nodes))
+            asyncio.create_task(
+                _delete_relation_edges_bulk(
+                    tenant_id, kb_id, from_node, to_nodes, label="pre-del_update_edges_bulk"
+                )
+            )
             for from_node, to_nodes in update_buckets.items()
         ]
         try:
@@ -1441,35 +1442,12 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
         for from_node, to_node in change.removed_edges:
             from_buckets[from_node].append(to_node)
 
-        async def del_edges_bulk(from_node: str, to_nodes: list[str]):
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    async with chat_limiter:
-                        await thread_pool_exec(
-                            settings.docStoreConn.delete,
-                            {
-                                "knowledge_graph_kwd": ["relation"],
-                                "from_entity_kwd": from_node,
-                                "to_entity_kwd": to_nodes,
-                            },
-                            search.index_name(tenant_id),
-                            kb_id,
-                        )
-                    return
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait = 2 ** attempt
-                        logging.warning(
-                            "del_edges_bulk(from=%s, n_to=%d) attempt %d failed: %s, retrying in %ds",
-                            from_node, len(to_nodes), attempt + 1, e, wait,
-                        )
-                        await asyncio.sleep(wait)
-                    else:
-                        raise
-
         tasks = [
-            asyncio.create_task(del_edges_bulk(from_node, to_nodes))
+            asyncio.create_task(
+                _delete_relation_edges_bulk(
+                    tenant_id, kb_id, from_node, to_nodes, label="del_edges_bulk"
+                )
+            )
             for from_node, to_nodes in from_buckets.items()
         ]
         try:

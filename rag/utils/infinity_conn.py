@@ -326,6 +326,53 @@ class InfinityConnection(InfinityConnectionBase):
             chunk["id"] = chunk_id
         return chunk
 
+    def count(self, condition: dict, index_name: str, knowledgebase_ids: list[str]) -> int:
+        assert isinstance(knowledgebase_ids, list)
+        inf_conn = self.connPool.get_conn()
+        try:
+            db_instance = inf_conn.get_database(self.dbName)
+            is_meta_table = index_name.startswith("ragflow_doc_meta_")
+            cond = condition.copy()
+            if not is_meta_table:
+                cond = {k: v for k, v in cond.items() if k != "kb_id"}
+                table_names_to_search = [f"{index_name}_{kb_id}" for kb_id in knowledgebase_ids]
+            else:
+                table_names_to_search = [index_name]
+
+            table_found = False
+            filter_cond = None
+            for table_name in table_names_to_search:
+                try:
+                    table_instance = db_instance.get_table(table_name)
+                    filter_cond = self.equivalent_condition_to_str(cond, table_instance)
+                    table_found = True
+                    break
+                except Exception:
+                    continue
+            if not table_found:
+                self.logger.error(
+                    f"No valid tables found for count indexName {index_name} and knowledgebaseIds {knowledgebase_ids}"
+                )
+                return 0
+
+            total = 0
+            for table_name in table_names_to_search:
+                try:
+                    table_instance = db_instance.get_table(table_name)
+                except Exception:
+                    continue
+                _, extra_result = (
+                    table_instance.output(["id"])
+                    .filter(filter_cond)
+                    .option({"total_hits_count": True})
+                    .to_df()
+                )
+                if extra_result:
+                    total += int(extra_result.get("total_hits_count", 0))
+            return total
+        finally:
+            self.connPool.release_conn(inf_conn)
+
     def insert(self, documents: list[dict], index_name: str, knowledgebase_id: str = None) -> list[str]:
         '''
         # Save input to file to test inserting from file in GO

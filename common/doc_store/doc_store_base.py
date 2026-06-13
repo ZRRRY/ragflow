@@ -235,6 +235,14 @@ class DocStoreConnection(ABC):
         """
         raise NotImplementedError("Not implemented")
 
+    @abstractmethod
+    def count(self, condition: dict, index_name: str, kb_ids: list[str]) -> int:
+        """
+        Count documents matching the given conjunctive condition, scoped to
+        the provided knowledge-base ids.
+        """
+        raise NotImplementedError("Not implemented")
+
     """
     Helper functions for search result
     """

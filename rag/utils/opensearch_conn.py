@@ -548,7 +548,7 @@ class OSConnection(DocStoreConnection):
                 # 中间查询的 stale 风险靠 OpenSearch 默认 1s 自然 refresh 兜底。
                 r = self.os.bulk(index=(indexName), body=operations,
                                  refresh="false", timeout=300)
-                if re.search(r"False", str(r["errors"]), re.IGNORECASE):
+                if not r["errors"]:
                     return res
 
                 for item in r["items"]:
@@ -780,6 +780,51 @@ class OSConnection(DocStoreConnection):
                 if re.search(r"(not_found)", str(e), re.IGNORECASE):
                     return 0
         return 0
+
+    def count(self, condition: dict, indexName: str, knowledgebaseIds: list[str]) -> int:
+        assert "_id" not in condition
+        cond = condition.copy()
+        cond["kb_id"] = knowledgebaseIds
+
+        bqry = Q("bool", must=[])
+        for k, v in cond.items():
+            if k == "available_int":
+                if v == 0:
+                    bqry.filter.append(Q("range", available_int={"lt": 1}))
+                else:
+                    bqry.filter.append(
+                        Q("bool", must_not=Q("range", available_int={"lt": 1})))
+                continue
+            if not v:
+                continue
+            if isinstance(v, list):
+                bqry.filter.append(Q("terms", **{k: v}))
+            elif isinstance(v, str) or isinstance(v, int):
+                bqry.filter.append(Q("term", **{k: v}))
+            else:
+                raise Exception(
+                    f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
+
+        if not bqry.filter and not bqry.must and not bqry.must_not:
+            qry = {"match_all": {}}
+        else:
+            qry = bqry.to_dict()
+        body = {"query": qry}
+        logger.debug(f"OSConnection.count {indexName} query: " + json.dumps(body))
+
+        for i in range(ATTEMPT_TIME):
+            try:
+                res = self.os.count(index=indexName, body=body)
+                return int(res.get("count", 0))
+            except NotFoundError:
+                return 0
+            except Exception as e:
+                logger.exception(f"OSConnection.count {indexName} query: " + json.dumps(body))
+                if str(e).find("Timeout") > 0:
+                    continue
+                raise e
+        logger.error(f"OSConnection.count timeout for {ATTEMPT_TIME} times!")
+        raise Exception("OSConnection.count timeout.")
 
     """
     Helper functions for search result

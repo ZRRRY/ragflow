@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+#  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
 """
 finisher / finish_stuck_graphrag.py
 
@@ -119,6 +134,23 @@ def mysql_connect(conf):
     )
 
 
+def get_kb_tenant_id(conf, kb_id):
+    """根据 KB ID 从 knowledgebase 表查询 tenant_id,用于构造 OS 索引名。"""
+    conn = mysql_connect(conf)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tenant_id FROM knowledgebase WHERE id = %s",
+                (kb_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"knowledgebase id={kb_id} not found")
+            return row[0]
+    finally:
+        conn.close()
+
+
 def list_stuck_tasks(conf, kb_id):
     """找出 progress ∈ (0, 1) 的 graphrag 任务。
 
@@ -186,8 +218,8 @@ def mark_task_done(conf, task_id, progress_msg):
 # ---------------------------------------------------------------------------
 # OpenSearch 直连:用 requests,避开 ES 8.x 客户端 406 Content-Type 问题
 # ---------------------------------------------------------------------------
-def os_count(conf, kb_id, query):
-    """对 KB 的 chunk 索引做一次 _count,失败返回 -1。"""
+def os_count(conf, tenant_id, query, kb_id=None):
+    """对指定 tenant 的 chunk 索引做一次 _count,可按 kb_id 过滤,失败返回 -1。"""
     import requests
 
     os_cfg = conf.get("os") or conf.get("es") or {}
@@ -201,8 +233,11 @@ def os_count(conf, kb_id, query):
     password = os_cfg.get("password", "")
     verify = bool(os_cfg.get("verify_certs", False))
 
-    index = f"ragflow_{kb_id.replace('-', '')}"
-    body = {"query": {"query_string": {"query": query}}}
+    index = f"ragflow_{tenant_id}"
+    must = [{"query_string": {"query": query}}]
+    if kb_id:
+        must.append({"term": {"kb_id": kb_id}})
+    body = {"query": {"bool": {"must": must}}}
 
     last_err = None
     for host in host_list:
@@ -228,7 +263,7 @@ def os_count(conf, kb_id, query):
         except Exception as e:
             last_err = repr(e)
             continue
-    log.error("OS count 失败: index=%s query=%s err=%s", index, query, last_err)
+    log.error("OS count 失败: index=%s query=%s kb_id=%s err=%s", index, query, kb_id, last_err)
     return -1
 
 
@@ -275,13 +310,13 @@ def os_list_ragflow_indices(conf):
         log.warning("_cat/indices 异常: %s", e)
         return []
 
-    # 对每个索引,取 entity/relation/total
+    # 对每个索引,取 entity/relation/total(不限制 kb_id,展示 tenant 级全局视图)
     out = []
     for idx in sorted(names):
-        kb_part = idx.replace("ragflow_", "", 1)
-        n_node = os_count(conf, kb_part, "knowledge_graph_kwd:entity")
-        n_edge = os_count(conf, kb_part, "knowledge_graph_kwd:relation")
-        n_total = os_count(conf, kb_part, "*")
+        tenant_id = idx.replace("ragflow_", "", 1)
+        n_node = os_count(conf, tenant_id, "knowledge_graph_kwd:entity")
+        n_edge = os_count(conf, tenant_id, "knowledge_graph_kwd:relation")
+        n_total = os_count(conf, tenant_id, "*")
         out.append((idx, n_node, n_edge, n_total))
     return out
 
@@ -328,27 +363,34 @@ def cleanup_redis(conf, kb_id, dry_run=True):
 def cmd_check(conf, kb_id, os_kb_id):
     """只读:看 OS 里的数据,看 MySQL 里卡住的 task。
 
-    当 os_kb_id != kb_id 时,同时列两边的 OS 索引计数,帮用户诊断
-    'task 关联的 KB' 与 'OS 真实写数据的 KB' 不一致的情况。
+    当 os_kb_id != tenant_id 时,同时列两边的 OS 索引计数,帮用户诊断
+    'task 关联的 KB' 与 'OS 真实写数据的 tenant 索引' 不一致的情况。
     """
+    try:
+        tenant_id = get_kb_tenant_id(conf, kb_id)
+    except Exception as e:
+        log.error("查询 knowledgebase.tenant_id 失败: %s", e)
+        return 1
+    os_tenant_id = os_kb_id or tenant_id
+
     log.info("=" * 70)
-    log.info("[CHECK] MySQL KB = %s  |  OS KB = %s", kb_id, os_kb_id)
+    log.info("[CHECK] MySQL KB = %s  |  OS tenant = %s", kb_id, os_tenant_id)
     log.info("=" * 70)
 
-    # 1) OS 里的实体数(os_kb_id)
+    # 1) OS 里的实体数(按 kb_id 过滤,同一 tenant 下可能有多个 KB)
     # 注意:实际 RAGFlow 的取值是 "entity" 和 "relation",不是 "node"/"edge"
-    n_nodes = os_count(conf, os_kb_id, "knowledge_graph_kwd:entity")
-    n_edges = os_count(conf, os_kb_id, "knowledge_graph_kwd:relation")
-    n_reports = os_count(conf, os_kb_id, "knowledge_graph_kwd:community_report")
-    n_total = os_count(conf, os_kb_id, "*")
+    n_nodes = os_count(conf, os_tenant_id, "knowledge_graph_kwd:entity", kb_id=kb_id)
+    n_edges = os_count(conf, os_tenant_id, "knowledge_graph_kwd:relation", kb_id=kb_id)
+    n_reports = os_count(conf, os_tenant_id, "knowledge_graph_kwd:community_report", kb_id=kb_id)
+    n_total = os_count(conf, os_tenant_id, "*", kb_id=kb_id)
 
-    log.info("OS  ragflow_%s 索引:", os_kb_id.replace("-", ""))
+    log.info("OS  ragflow_%s 索引:", os_tenant_id)
     log.info("  - 实体节点 (knowledge_graph_kwd:entity)  : %d", n_nodes)
     log.info("  - 关系边   (knowledge_graph_kwd:relation): %d", n_edges)
     log.info("  - 社区报告(knowledge_graph_kwd:community_report): %d", n_reports)
     log.info("  - 文档块总索引(含 entity/relation)       : %d", n_total)
 
-    # 2) MySQL 卡住的 task(用 kb_id,不是 os_kb_id)
+    # 2) MySQL 卡住的 task(用 kb_id,不是 os_tenant_id)
     log.info("-" * 70)
     log.info("MySQL  task 表中 progress ∈ (0, 1) 的任务:")
     try:
@@ -375,17 +417,17 @@ def cmd_check(conf, kb_id, os_kb_id):
             marker = ""
             if n_node > 0 or n_edge > 0:
                 marker = "  ← 这里有数据"
-            tag = "  [当前 KB]" if idx == f"ragflow_{os_kb_id.replace('-', '')}" else ""
+            tag = "  [当前 KB]" if idx == f"ragflow_{os_tenant_id}" else ""
             log.info(
                 "  - %-50s  node=%-6d edge=%-6d docs=%-7d%s%s",
                 idx, n_node, n_edge, n_total_idx, tag, marker,
             )
-    log.info("提示:如果数据不在 `ragflow_<--os-kb-id>` 里,改用 --os-kb-id <上面有数据那个索引对应的 KB ID> 跑 finish。")
+    log.info("提示:如果数据不在 `ragflow_<--os-tenant-id>` 里,改用 --os-kb-id <真实 tenant_id> 跑 finish。")
 
     log.info("=" * 70)
     log.info("判断:")
     if n_nodes > 0 and n_edges > 0:
-        log.info("  ✓ OS 里有实体和边,主任务实质完成。可以跑 `finish --apply`。")
+        log.info("  ✓ OS 里有实体和边,主任务实质完成。可以跑 `finish --apply` 。")
     else:
         log.warning("  ✗ OS 里没找到节点/边,主任务其实没做完,finish 会骗前端 —— 不要跑。")
     if not tasks:
@@ -396,14 +438,21 @@ def cmd_check(conf, kb_id, os_kb_id):
 
 def cmd_finish(conf, kb_id, os_kb_id, dry_run):
     """把卡住的 task 标 done,默认 dry-run。"""
+    try:
+        tenant_id = get_kb_tenant_id(conf, kb_id)
+    except Exception as e:
+        log.error("查询 knowledgebase.tenant_id 失败: %s", e)
+        return 1
+    os_tenant_id = os_kb_id or tenant_id
+
     log.info("=" * 70)
-    log.info("[FINISH] MySQL KB = %s  |  OS KB = %s  |  dry_run = %s",
-             kb_id, os_kb_id, dry_run)
+    log.info("[FINISH] MySQL KB = %s  |  OS tenant = %s  |  dry_run = %s",
+             kb_id, os_tenant_id, dry_run)
     log.info("=" * 70)
 
-    # 先读 OS 真实数字(用 os_kb_id)
-    n_nodes = os_count(conf, os_kb_id, "knowledge_graph_kwd:entity")
-    n_edges = os_count(conf, os_kb_id, "knowledge_graph_kwd:relation")
+    # 先读 OS 真实数字(用 os_tenant_id,并按 kb_id 过滤)
+    n_nodes = os_count(conf, os_tenant_id, "knowledge_graph_kwd:entity", kb_id=kb_id)
+    n_edges = os_count(conf, os_tenant_id, "knowledge_graph_kwd:relation", kb_id=kb_id)
     if n_nodes < 0 or n_edges < 0:
         log.error("OS 查询失败,拒绝继续,避免误标 task done。")
         return 2
@@ -490,9 +539,9 @@ def main():
     )
     p.add_argument(
         "--os-kb-id",
-        help="OpenSearch 索引对应的 KB ID(默认等于 --kb-id)。"
-             "当 MySQL 里 task 关联的 KB 跟 OS 真实写数据的索引对应 KB 不一致时,"
-             "用这个参数指向 OS 那边真实有数据的 KB,典型场景:KB 重建/迁移过。",
+        help="OpenSearch 索引对应的 tenant_id(默认根据 --kb-id 查询 knowledgebase 表得到)。"
+             "当 MySQL 里 task 关联的 KB 跟 OS 真实写数据的 tenant 索引不一致时,"
+             "用这个参数指向 OS 那边真实有数据的 tenant_id,典型场景:KB 重建/迁移过。",
     )
     args = p.parse_args()
 
@@ -500,12 +549,12 @@ def main():
         p.error("--apply 和 --dry-run 互斥,只能选一个")
     dry_run = not args.apply
 
-    os_kb_id = args.os_kb_id or args.kb_id
-    if args.os_kb_id and args.os_kb_id != args.kb_id:
+    os_kb_id = args.os_kb_id or None
+    if os_kb_id and os_kb_id != args.kb_id:
         log.warning("=" * 70)
         log.warning("  --os-kb-id 与 --kb-id 不同:")
         log.warning("    MySQL task 过滤用 --kb-id   = %s", args.kb_id)
-        log.warning("    OpenSearch 索引用 --os-kb-id = %s", os_kb_id)
+        log.warning("    OpenSearch tenant 索引用 --os-kb-id = %s", os_kb_id)
         log.warning("=" * 70)
 
     conf = load_service_conf()

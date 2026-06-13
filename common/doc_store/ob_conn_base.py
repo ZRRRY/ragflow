@@ -682,6 +682,23 @@ class OBConnectionBase(DocStoreConnection):
             self.logger.error(f"OBConnection.delete error: {str(e)}")
         return 0
 
+    def count(self, condition: dict, index_name: str, kb_ids: list[str]) -> int:
+        if not self._check_table_exists_cached(index_name):
+            return 0
+        cond = dict(condition)
+        if not index_name.startswith("ragflow_doc_meta_"):
+            cond[self._get_dataset_id_field()] = kb_ids
+        try:
+            filters = self._get_filters(cond)
+            filters_expr = " AND ".join(filters) if filters else "1=1"
+            count_sql = self._build_count_sql(index_name, filters_expr)
+            rows = self.client.perform_raw_text_sql(count_sql)
+            row = rows.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        except Exception as e:
+            self.logger.error(f"OBConnection.count error: {str(e)}")
+        return 0
+
     """
     Abstract CRUD methods that must be implemented by subclasses
     """

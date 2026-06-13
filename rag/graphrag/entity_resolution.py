@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import networkx as nx
-import numpy as np
 
 from rag.graphrag.general.extractor import Extractor
 from rag.nlp import is_english
@@ -34,8 +33,6 @@ from rag.graphrag.utils import (
     perform_variable_replacements,
     chat_limiter,
     GraphChange,
-    get_embed_cache,
-    set_embed_cache,
 )
 from api.db.services.task_service import has_canceled
 from common.exceptions import TaskCanceledException
@@ -48,11 +45,6 @@ DEFAULT_RESOLUTION_RESULT_DELIMITER = "&&"
 # Entity types that should skip resolution (book and chapter nodes are
 # intentionally kept separate even if they share names across documents).
 EXCLUDED_RESOLUTION_TYPES = {"书籍", "章节"}
-
-# Phase 3.1: candidate recall 默认参数（直接读 GraphRAGConfig，避免双源）
-DEFAULT_RESOLUTION_TOP_K = GraphRAGConfig.ENTITY_RESOLUTION_TOP_K
-DEFAULT_RESOLUTION_SIMILARITY_THRESHOLD = GraphRAGConfig.ENTITY_RESOLUTION_SIM_THRESHOLD
-
 
 def _has_digit_in_2gram_diff(a, b):
     def to_2gram_set(s):
@@ -80,132 +72,6 @@ def is_similarity_str(a, b):
         return len(a & b) > 1
 
     return len(a & b) * 1.0 / max_l >= 0.8
-
-
-# DEPRECATED: 内存 ANN 路径已被 OpenSearch KNN 替代。
-# 保留以兼容 USE_INCREMENTAL_RESOLUTION=0 的全量消解路径。
-async def _resolve_entity_embeddings(
-    entity_names: list[str], embed_bdl, batch_size: int = 64
-) -> list[np.ndarray | None]:
-    """对一组 entity_name 求 embedding，先查 Redis cache 再 batch 调 embed_bdl.encode。
-
-    Returns:
-        与 entity_names 等长的 list；失败的槽位为 None（ANN 阶段会跳过这些）。
-    """
-    if not entity_names:
-        return []
-
-    embeddings: list[np.ndarray | None] = [None] * len(entity_names)
-    miss_idx: list[int] = []
-    miss_names: list[str] = []
-
-    for i, name in enumerate(entity_names):
-        emb = get_embed_cache(embed_bdl.llm_name, name)
-        if emb is not None and hasattr(emb, "__len__") and len(emb) > 1:
-            embeddings[i] = emb
-        else:
-            miss_idx.append(i)
-            miss_names.append(name)
-
-    if not miss_names:
-        return embeddings
-
-    for s in range(0, len(miss_names), batch_size):
-        batch_names = miss_names[s : s + batch_size]
-        batch_idx = miss_idx[s : s + batch_size]
-        try:
-            embs_arr, _ = await asyncio.get_running_loop().run_in_executor(
-                None, embed_bdl.encode, batch_names
-            )
-        except Exception:
-            logging.exception(
-                "ANN prefilter: batch embed failed (size=%d), skipping batch", len(batch_names)
-            )
-            continue
-        if embs_arr is None or len(embs_arr) != len(batch_names):
-            logging.warning(
-                "ANN prefilter: embed_bdl.encode returned %d embeds for %d inputs, skipping",
-                0 if embs_arr is None else len(embs_arr),
-                len(batch_names),
-            )
-            continue
-        for j, idx in enumerate(batch_idx):
-            emb = np.asarray(embs_arr[j], dtype=np.float32)
-            embeddings[idx] = emb
-            try:
-                set_embed_cache(embed_bdl.llm_name, entity_names[idx], emb)
-            except Exception:
-                logging.exception("set_embed_cache failed for entity %s", entity_names[idx])
-    return embeddings
-
-
-# DEPRECATED: 内存 ANN 路径已被 OpenSearch KNN 替代。
-# 保留以兼容 USE_INCREMENTAL_RESOLUTION=0 的全量消解路径。
-async def build_ann_candidate_pairs(
-    entity_names: list[str],
-    embed_bdl,
-    *,
-    top_k: int = DEFAULT_RESOLUTION_TOP_K,
-    similarity_threshold: float = DEFAULT_RESOLUTION_SIMILARITY_THRESHOLD,
-) -> set[tuple[str, str]]:
-    """Phase 3.1: 用 embedding cosine 相似度做 ANN 预筛，返回 candidate pairs 集合。
-
-    替代 O(n^2) ``itertools.combinations``，把 candidate 数量从 O(n^2) 降到
-    O(n * top_k)。每个 entity 取 top-K 个最相似的（cosine >= threshold），
-    canonical order (a < b) 后放入 set。
-
-    Args:
-        entity_names: 候选 entity 名称列表
-        embed_bdl: embedding 模型 LLMBundle
-        top_k: 每个 entity 保留的最近邻数（默认 20，环境变量可调）
-        similarity_threshold: cosine 相似度阈值（默认 0.7），低于此不进入 candidate
-
-    Returns:
-        set of (a, b) tuples，a < b 字典序
-    """
-    if not entity_names or len(entity_names) < 2:
-        return set()
-    if embed_bdl is None:
-        return set()
-
-    embeddings = await _resolve_entity_embeddings(entity_names, embed_bdl)
-    valid_pairs: list[tuple[int, np.ndarray]] = []
-    for i, emb in enumerate(embeddings):
-        if emb is None:
-            continue
-        emb = np.asarray(emb, dtype=np.float32).reshape(-1)
-        if emb.size < 2:
-            continue
-        valid_pairs.append((i, emb))
-    if len(valid_pairs) < 2:
-        return set()
-
-    name_arr = [entity_names[i] for i, _ in valid_pairs]
-    emb_matrix = np.stack([e for _, e in valid_pairs], axis=0)
-    # 1) 单位化 → cosine = dot product
-    norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
-    norms[norms == 0.0] = 1.0
-    emb_norm = emb_matrix / norms
-    sim_matrix = emb_norm @ emb_norm.T
-    np.fill_diagonal(sim_matrix, -1.0)  # exclude self
-
-    candidates: set[tuple[str, str]] = set()
-    n = sim_matrix.shape[0]
-    # 2) 每个 entity 选 top-K（用 argpartition 比 argsort 快）
-    if top_k + 1 < n:
-        top_idx = np.argpartition(-sim_matrix, top_k, axis=1)[:, :top_k]
-    else:
-        top_idx = np.tile(np.arange(n), (n, 1))
-    for i in range(n):
-        name_i = name_arr[i]
-        for j in top_idx[i]:
-            if sim_matrix[i, j] < similarity_threshold:
-                continue
-            name_j = name_arr[j]
-            # canonical order
-            a, b = (name_i, name_j) if name_i < name_j else (name_j, name_i)
-            candidates.add((a, b))
-    return candidates
 
 
 # Phase 1.5: 实体类型别名映射。用户的 kb_parser_config["graphrag"]["entity_types"]
@@ -271,8 +137,6 @@ class EntityResolution(Extractor):
             self,
             llm_invoker: CompletionLLM,
             excluded_types: set[str] | None = None,
-            embed_bdl=None,
-            use_ann_prefilter: bool | None = None,
     ):
         super().__init__(llm_invoker)
         """Init method definition."""
@@ -284,12 +148,6 @@ class EntityResolution(Extractor):
         self._input_text_key = "input_text"
         # Phase 1.5: 允许调用方注入 excluded types；缺省回退到全局硬编码
         self._excluded_types = excluded_types if excluded_types is not None else EXCLUDED_RESOLUTION_TYPES
-        # Phase 3.1: embed_bdl 用于 ANN 预筛
-        self._embed_bdl = embed_bdl
-        # use_ann_prefilter=None 时默认 False（内存 ANN 已废弃，全量路径也禁用）
-        if use_ann_prefilter is None:
-            use_ann_prefilter = False
-        self._use_ann_prefilter = use_ann_prefilter and embed_bdl is not None
 
     async def __call__(self, graph: nx.Graph,
                        subgraph_nodes: set[str],
@@ -336,33 +194,21 @@ class EntityResolution(Extractor):
                 if k not in excluded
             }
         else:
+            # Char-level filtering path (no in-memory ANN, no embedding).
             candidate_resolution = {entity_type: [] for entity_type in entity_types}
-            if self._use_ann_prefilter:
-                # Phase 3.1: ANN 预筛路径。每个 type 独立做 embedding 召回 top-K，
-                # 把 candidate 从 O(n^2) 降到 O(n * top_k)。1 万 person 类型节点
-                # 旧路径 = 5000 万对，ANN 后 ≈ 20 万对（top_k=20）。
-                for k, v in node_clusters.items():
-                    ann_pairs = await build_ann_candidate_pairs(v, self._embed_bdl)
-                    # 仍保留 (in subgraph_nodes) 过滤 + 字符级 is_similarity 二次筛
-                    candidate_resolution[k] = [
-                        (a, b) for (a, b) in ann_pairs
-                        if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)
-                    ]
-            else:
-                # 旧路径：O(n^2) itertools.combinations（内存 ANN 已废弃，默认不走）。
-                for k, v in node_clusters.items():
-                    candidate_resolution[k] = [
-                        (a, b) for a, b in itertools.combinations(v, 2)
-                        if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)
-                    ]
+            for k, v in node_clusters.items():
+                candidate_resolution[k] = [
+                    (a, b) for a, b in itertools.combinations(v, 2)
+                    if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)
+                ]
         num_candidates = sum([len(candidates) for _, candidates in candidate_resolution.items()])
         callback(msg=f"Identified {num_candidates} candidate pairs")
         remain_candidates_to_resolve = num_candidates
 
         resolution_result = set()
         resolution_result_lock = asyncio.Lock()
-        resolution_batch_size = 100
-        max_concurrent_tasks = 5
+        resolution_batch_size = GraphRAGConfig.RESOLUTION_BATCH_SIZE
+        max_concurrent_tasks = GraphRAGConfig.RESOLUTION_MAX_CONCURRENT_TASKS
         semaphore = asyncio.Semaphore(max_concurrent_tasks)
         # Phase 3.3: 进度计数，供前端 progress bar 刷新
         progress_lock = asyncio.Lock()

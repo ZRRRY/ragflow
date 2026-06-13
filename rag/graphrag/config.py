@@ -67,6 +67,18 @@ class GraphRAGConfig:
         os.environ.get("ENTITY_RESOLUTION_KNN_CONCURRENCY", "8")
     )
 
+    # Phase 3.2/3.3 – Entity resolution batching/concurrency parameters.
+    RESOLUTION_BATCH_SIZE = int(os.environ.get("RESOLUTION_BATCH_SIZE", "100"))
+    RESOLUTION_MAX_CONCURRENT_TASKS = int(
+        os.environ.get("RESOLUTION_MAX_CONCURRENT_TASKS", "5")
+    )
+
+    # Phase 1.4 – Resume path safety limits.
+    KG_MAX_SAFE_RESUME_NODES = int(os.environ.get("KG_MAX_SAFE_RESUME_NODES", "5000"))
+
+    # Phase 1 – Maximum parallel documents for subgraph generation.
+    GRAPHRAG_MAX_PARALLEL_DOCS = int(os.environ.get("GRAPHRAG_MAX_PARALLEL_DOCS", "8"))
+
     # Phase 4.4 – Batched entity/edge summarization
     # 默认关闭（"0"），开启后把多个 entity/edge 的 description 拼到一次 LLM call
     USE_BATCHED_SUMMARIZATION = os.environ.get("USE_BATCHED_SUMMARIZATION", "0") == "1"
@@ -86,7 +98,8 @@ class GraphRAGConfig:
             "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d "
             "heartbeat_interval=%ds heartbeat_ttl=%ds "
             "knn_resolution=%s resolution_top_k=%d resolution_sim_thr=%.2f "
-            "knn_concurrency=%d "
+            "knn_concurrency=%d resolution_batch_size=%d resolution_max_concurrent=%d "
+            "max_safe_resume_nodes=%d max_parallel_docs=%d "
             "batched_summarization=%s summary_batch_size=%d "
             "keep_subgraph=%s keep_merge=%s keep_resolution=%s",
             cls.USE_INCREMENTAL_GRAPH,
@@ -110,6 +123,10 @@ class GraphRAGConfig:
             cls.ENTITY_RESOLUTION_TOP_K,
             cls.ENTITY_RESOLUTION_SIM_THRESHOLD,
             cls.ENTITY_RESOLUTION_KNN_CONCURRENCY,
+            cls.RESOLUTION_BATCH_SIZE,
+            cls.RESOLUTION_MAX_CONCURRENT_TASKS,
+            cls.KG_MAX_SAFE_RESUME_NODES,
+            cls.GRAPHRAG_MAX_PARALLEL_DOCS,
             cls.USE_BATCHED_SUMMARIZATION,
             cls.ENTITY_SUMMARY_BATCH_SIZE,
             cls.KEEP_SUBGRAPH,

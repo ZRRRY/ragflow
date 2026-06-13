@@ -249,11 +249,9 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
         TaskService.update_progress(task_id, d)
 
         close_connection()
-        if cancel:
-            raise TaskCanceledException(msg)
-        logging.info(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}")
 
-        # [心跳锁 v2] 终态删锁:task 完成(prog=1.0)或失败(prog=-1.0)后清锁
+        # [心跳锁 v2] 终态删锁:task 完成(prog=1.0)、失败(prog=-1.0)或取消后清锁
+        # 必须在抛出 TaskCanceledException 之前执行,否则后台 _heartbeat_loop 会继续续期
         if prog is not None and (prog >= 1.0 or prog <= 0):
             try:
                 REDIS_CONN.delete(f"graphrag:hb:{task_id}")
@@ -261,6 +259,10 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
                 logging.exception("[heartbeat] 终态删锁失败 task=%s", task_id)
             # Phase 4.1: 线程安全写
             _set_current_task_id(None)
+
+        if cancel:
+            raise TaskCanceledException(msg)
+        logging.info(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}")
     except TaskCanceledException:
         raise
     except DoesNotExist:

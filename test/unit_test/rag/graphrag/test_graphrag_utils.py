@@ -598,6 +598,58 @@ class TestMergeState:
         assert await is_doc_merged("t1", "kb1", "doc_123") is False
 
 
+class TestDeleteRelationEdgesBulk:
+    """Tests for _delete_relation_edges_bulk terms-count batching."""
+
+    @pytest.mark.asyncio
+    async def test_splits_large_to_node_list(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        deleted_conditions = []
+
+        def mock_delete(condition, index_name, kb_id):
+            deleted_conditions.append(condition)
+            return None
+
+        monkeypatch.setattr(_utils.settings.docStoreConn, "delete", mock_delete)
+        # Force a tiny terms limit so a moderate list spans multiple batches.
+        monkeypatch.setattr(_utils, "_MAX_TERMS_COUNT", 3)
+
+        await _utils._delete_relation_edges_bulk(
+            "t1", "kb1", "A", ["B", "C", "D", "E", "F"]
+        )
+
+        assert len(deleted_conditions) == 2
+        assert deleted_conditions[0]["from_entity_kwd"] == "A"
+        assert deleted_conditions[0]["to_entity_kwd"] == ["B", "C", "D"]
+        assert deleted_conditions[1]["from_entity_kwd"] == "A"
+        assert deleted_conditions[1]["to_entity_kwd"] == ["E", "F"]
+
+    @pytest.mark.asyncio
+    async def test_retries_failed_batch(self, monkeypatch):
+        from rag.graphrag import utils as _utils
+
+        deleted_conditions = []
+        attempts = {"count": 0}
+
+        def flaky_delete(condition, index_name, kb_id):
+            deleted_conditions.append(condition)
+            attempts["count"] += 1
+            if attempts["count"] < 2:
+                raise RuntimeError("transient")
+            return None
+
+        monkeypatch.setattr(_utils.settings.docStoreConn, "delete", flaky_delete)
+        monkeypatch.setattr(_utils, "_MAX_TERMS_COUNT", 100)
+
+        await _utils._delete_relation_edges_bulk(
+            "t1", "kb1", "A", ["B", "C"]
+        )
+
+        assert len(deleted_conditions) == 2
+        assert deleted_conditions[0] == deleted_conditions[1]
+
+
 class TestPreDeleteAddedUpdated:
     """Tests for _pre_delete_added_updated idempotency helper."""
 

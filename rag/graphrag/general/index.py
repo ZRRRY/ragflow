@@ -119,6 +119,18 @@ def _lock_acquire_timeout_config(config: dict) -> int:
     return value
 
 
+def _min_timeout_config(value: int, default: int, minimum: int = 60) -> int:
+    """Return a timeout value with a sensible lower bound.
+
+    A value of 0 or extremely small timeouts would otherwise be treated as
+    "no timeout" by ``_run_with_retry`` and could hang indefinitely.  This
+    helper clamps the timeout to at least ``minimum`` seconds.
+    """
+    if value is None or value <= 0:
+        return default if default >= minimum else minimum
+    return max(value, minimum)
+
+
 def _select_extractor_type(graphrag_config: dict):
     return graphrag_config.get("method", "light")
 
@@ -158,7 +170,7 @@ _LOCK_METRICS_KEY_TMPL = "graphrag:lock_metrics:{}"
 _LOCK_METRICS_TTL = 3600
 
 
-def _record_lock_metric(
+async def _record_lock_metric(
     kb_id: str,
     lock_name: str,
     *,
@@ -166,14 +178,20 @@ def _record_lock_metric(
     held_seconds: float | None = None,
 ) -> None:
     """记录一个锁事件到 Redis hash。失败不影响主流程。"""
+
+    def _write(redis, key: str, field: str, value: str, ttl: int):
+        redis.hset(key, field, value)
+        redis.expire(key, ttl)
+
     try:
         import time
         from rag.utils.redis_conn import REDIS_CONN
         key = _LOCK_METRICS_KEY_TMPL.format(kb_id)
         value = f"{waited_seconds or 0:.3f},{held_seconds or 0:.3f},{time.time():.0f}"
         if REDIS_CONN.REDIS is not None:
-            REDIS_CONN.REDIS.hset(key, lock_name, value)
-            REDIS_CONN.REDIS.expire(key, _LOCK_METRICS_TTL)
+            await thread_pool_exec(
+                _write, REDIS_CONN.REDIS, key, lock_name, value, _LOCK_METRICS_TTL
+            )
     except Exception:
         logging.exception("record_lock_metric write failed (non-fatal)")
 
@@ -297,7 +315,7 @@ async def run_graphrag_for_kb(
     *,
     with_resolution: bool = True,
     with_community: bool = True,
-    max_parallel_docs: int = int(os.environ.get("GRAPHRAG_MAX_PARALLEL_DOCS", "8")),
+    max_parallel_docs: int = GraphRAGConfig.GRAPHRAG_MAX_PARALLEL_DOCS,
 ) -> dict:
     tenant_id, kb_id = row["tenant_id"], row["kb_id"]
     task_id = row["id"]
@@ -328,9 +346,18 @@ async def run_graphrag_for_kb(
         1,
         86400,
     )
-    merge_timeout_seconds = _bounded_int_config(graphrag_config, "merge_timeout_seconds", DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS, 0, 86400)
-    resolution_timeout_seconds = _bounded_int_config(graphrag_config, "resolution_timeout_seconds", DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS, 0, 86400)
-    community_timeout_seconds = _bounded_int_config(graphrag_config, "community_timeout_seconds", DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS, 0, 86400)
+    merge_timeout_seconds = _min_timeout_config(
+        _bounded_int_config(graphrag_config, "merge_timeout_seconds", DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS, 0, 86400),
+        DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS,
+    )
+    resolution_timeout_seconds = _min_timeout_config(
+        _bounded_int_config(graphrag_config, "resolution_timeout_seconds", DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS, 0, 86400),
+        DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS,
+    )
+    community_timeout_seconds = _min_timeout_config(
+        _bounded_int_config(graphrag_config, "community_timeout_seconds", DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS, 0, 86400),
+        DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS,
+    )
     lock_acquire_timeout_seconds = _lock_acquire_timeout_config(graphrag_config)
 
     if not doc_ids:
@@ -588,7 +615,7 @@ async def run_graphrag_for_kb(
     await _acquire_lock(kb_lock, "merge lock", lock_acquire_timeout_seconds, callback, task_id)
     lock_held_t0 = asyncio.get_running_loop().time()
     try:
-        _record_lock_metric(
+        await _record_lock_metric(
             kb_id=kb_id, lock_name="batch_merge",
             waited_seconds=lock_held_t0 - lock_acquire_t0,
             held_seconds=None,  # 在 finally 里更新
@@ -679,7 +706,7 @@ async def run_graphrag_for_kb(
         # Phase 4.3: 记录持锁时长
         try:
             _held = asyncio.get_running_loop().time() - lock_held_t0
-            _record_lock_metric(
+            await _record_lock_metric(
                 kb_id=kb_id, lock_name="batch_merge",
                 waited_seconds=None,
                 held_seconds=_held,
@@ -767,9 +794,7 @@ async def run_graphrag_for_kb(
             # 大 KB 下必 OOM 或 30min+ 卡死。加一个硬上限，超过则 fail-fast 并要求用户
             # 重新走增量提交，让 EntityResolution 走 incremental 路径（按 type 分块，
             # candidate 量从 O(n^2) 降到 O(new × type_existing)）。
-            max_safe_resume_nodes = int(
-                os.environ.get("KG_MAX_SAFE_RESUME_NODES", "5000")
-            )
+            max_safe_resume_nodes = GraphRAGConfig.KG_MAX_SAFE_RESUME_NODES
             if len(subgraph_nodes) > max_safe_resume_nodes:
                 callback(
                     msg=(
@@ -1400,84 +1425,92 @@ async def resolve_entities_incremental(
             return set()
 
     if GraphRAGConfig.USE_KNN_FOR_RESOLUTION:
-        # 3. KNN path: read vectors from OpenSearch and run concurrent KNN queries
-        vector_dim = getattr(embed_bdl, "dimension", None)
-        if vector_dim is None:
-            try:
-                test_emb, _ = await asyncio.get_running_loop().run_in_executor(
-                    None, embed_bdl.encode, ["DIM_CHECK"]
-                )
-                vector_dim = len(test_emb[0])
-            except Exception as e:
-                logging.warning("[P3] Failed to detect embedding dimension: %s", e)
+        if not hasattr(settings.docStoreConn, "knn_search_entities"):
+            logging.warning(
+                "[P3] KNN resolution requested but %s does not support knn_search_entities; "
+                "falling back to char-level filtering.",
+                type(settings.docStoreConn).__name__,
+            )
+        else:
+            # 3. KNN path: read vectors from OpenSearch and run concurrent KNN queries
+            vector_dim = getattr(embed_bdl, "dimension", None)
+            if vector_dim is None:
+                try:
+                    test_emb, _ = await asyncio.get_running_loop().run_in_executor(
+                        None, embed_bdl.encode, ["DIM_CHECK"]
+                    )
+                    vector_dim = len(test_emb[0])
+                except Exception as e:
+                    logging.warning("[P3] Failed to detect embedding dimension: %s", e)
+                    return
+
+            new_node_vectors = await fetch_node_vectors(tenant_id, kb_id, list(union_nodes), vector_dim)
+            if not new_node_vectors:
+                logging.info("[P3] No vectors found for new nodes, skipping resolution.")
                 return
 
-        new_node_vectors = await fetch_node_vectors(tenant_id, kb_id, list(union_nodes), vector_dim)
-        if not new_node_vectors:
-            logging.info("[P3] No vectors found for new nodes, skipping resolution.")
-            return
+            vector_field = f"q_{vector_dim}_vec"
+            knn_semaphore = asyncio.Semaphore(GraphRAGConfig.ENTITY_RESOLUTION_KNN_CONCURRENCY)
 
-        vector_field = f"q_{vector_dim}_vec"
-        knn_semaphore = asyncio.Semaphore(GraphRAGConfig.ENTITY_RESOLUTION_KNN_CONCURRENCY)
+            async def _knn_one(node_name, vector, ent_type):
+                async with knn_semaphore:
+                    try:
+                        res = await thread_pool_exec(
+                            settings.docStoreConn.knn_search_entities,
+                            [search.index_name(tenant_id)],
+                            [kb_id],
+                            vector,
+                            vector_field,
+                            GraphRAGConfig.ENTITY_RESOLUTION_TOP_K,
+                            GraphRAGConfig.ENTITY_RESOLUTION_SIM_THRESHOLD,
+                            entity_type=ent_type,
+                            exclude_name=node_name,
+                        )
+                        fields_map = settings.docStoreConn.get_fields(res, ["entity_kwd"])
+                        neighbors = []
+                        for cid, row in fields_map.items():
+                            neighbor_name = row.get("entity_kwd")
+                            if isinstance(neighbor_name, list):
+                                neighbor_name = neighbor_name[0]
+                            if not neighbor_name or neighbor_name == node_name:
+                                continue
+                            if not is_similarity_str(node_name, neighbor_name):
+                                continue
+                            neighbors.append(neighbor_name)
+                        return node_name, neighbors
+                    except Exception as e:
+                        logging.warning("KNN search failed for node %s: %s", node_name, e)
+                        return node_name, []
 
-        async def _knn_one(node_name, vector, ent_type):
-            async with knn_semaphore:
-                try:
-                    res = await thread_pool_exec(
-                        settings.docStoreConn.knn_search_entities,
-                        [search.index_name(tenant_id)],
-                        [kb_id],
-                        vector,
-                        vector_field,
-                        GraphRAGConfig.ENTITY_RESOLUTION_TOP_K,
-                        GraphRAGConfig.ENTITY_RESOLUTION_SIM_THRESHOLD,
-                        entity_type=ent_type,
-                        exclude_name=node_name,
-                    )
-                    fields_map = settings.docStoreConn.get_fields(res, ["entity_kwd"])
-                    neighbors = []
-                    for cid, row in fields_map.items():
-                        neighbor_name = row.get("entity_kwd")
-                        if isinstance(neighbor_name, list):
-                            neighbor_name = neighbor_name[0]
-                        if not neighbor_name or neighbor_name == node_name:
-                            continue
-                        if not is_similarity_str(node_name, neighbor_name):
-                            continue
-                        neighbors.append(neighbor_name)
-                    return node_name, neighbors
-                except Exception as e:
-                    logging.warning("KNN search failed for node %s: %s", node_name, e)
-                    return node_name, []
-
-        for ent_type, new_nodes in new_nodes_by_type.items():
-            if not new_nodes or ent_type in excluded_types:
-                continue
-
-            tasks = []
-            for node_name in new_nodes:
-                vector = new_node_vectors.get(node_name)
-                if not vector:
+            for ent_type, new_nodes in new_nodes_by_type.items():
+                if not new_nodes or ent_type in excluded_types:
                     continue
-                tasks.append(asyncio.create_task(_knn_one(node_name, vector, ent_type)))
 
-            if not tasks:
-                continue
+                tasks = []
+                for node_name in new_nodes:
+                    vector = new_node_vectors.get(node_name)
+                    if not vector:
+                        continue
+                    tasks.append(asyncio.create_task(_knn_one(node_name, vector, ent_type)))
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, Exception):
-                    logging.warning("KNN task exception: %s", res)
+                if not tasks:
                     continue
-                node_name, neighbors = res
-                for neighbor_name in neighbors:
-                    a, b = (node_name, neighbor_name) if node_name < neighbor_name else (neighbor_name, node_name)
-                    candidate_pairs.add((a, b))
-                    candidate_neighbors.add(neighbor_name)
-    else:
+
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, Exception):
+                        logging.warning("KNN task exception: %s", res)
+                        continue
+                    node_name, neighbors = res
+                    for neighbor_name in neighbors:
+                        a, b = (node_name, neighbor_name) if node_name < neighbor_name else (neighbor_name, node_name)
+                        candidate_pairs.add((a, b))
+                        candidate_neighbors.add(neighbor_name)
+
+    if not candidate_pairs:
         # 3. Char-level filtering fallback: fetch existing names by type,
         # then do O(new × existing) is_similarity_str checks (no ANN, no embedding).
-        logging.info("[P3] KNN disabled, falling back to char-level filtering.")
+        logging.info("[P3] Falling back to char-level filtering for entity resolution.")
         for ent_type, new_nodes in new_nodes_by_type.items():
             if not new_nodes or ent_type in excluded_types:
                 continue
@@ -1565,8 +1598,6 @@ async def resolve_entities_incremental(
     er = EntityResolution(
         llm_bdl,
         excluded_types=excluded_types,
-        embed_bdl=None,
-        use_ann_prefilter=False,
     )
     try:
         reso = await er(
@@ -1633,7 +1664,6 @@ async def resolve_entities(
     er = EntityResolution(
         llm_bdl,
         excluded_types=build_excluded_types(entity_types),
-        embed_bdl=embed_bdl,
     )
     reso = await er(graph, subgraph_nodes, callback=callback, task_id=task_id)
     graph = reso.graph

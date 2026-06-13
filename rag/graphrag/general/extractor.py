@@ -422,6 +422,26 @@ class Extractor:
             if cur_name is not None and cur_buf:
                 result[cur_name] = "\n".join(cur_buf).strip()
 
+            # FIX: detect silent data loss when LLM omits entities/edges from the
+            # batched response and fall back to per-item summarization.
+            expected_keys = {name for name, _ in batch}
+            missing_keys = expected_keys - set(result.keys())
+            if missing_keys:
+                logging.warning(
+                    "batched_summarize missing %d/%d keys in batch offset=%d: %s; "
+                    "falling back to per-entity summarization",
+                    len(missing_keys), len(batch), s, sorted(missing_keys),
+                )
+                for name, desc in batch:
+                    if name not in missing_keys:
+                        continue
+                    try:
+                        result[name] = await self._handle_entity_relation_summary(
+                            name, desc, task_id=task_id
+                        )
+                    except Exception:
+                        logging.exception("per-entity summarize fallback failed for %s", name)
+
         return result
 
     async def _merge_graph_nodes(self, graph: nx.Graph, nodes: list[str], change: GraphChange, task_id=""):

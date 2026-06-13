@@ -135,6 +135,7 @@ ragflow/
 │   ├── launch_backend_service.sh # Python backend launcher
 │   ├── launch_admin_service.sh   # Python admin launcher
 │   ├── nginx/              # Nginx configs (python/go/hybrid modes)
+│   ├── finisher/           # GraphRAG stuck-task reconciliation helpers
 │   └── .env                # Docker Compose environment
 ├── helm/                   # Kubernetes Helm chart
 │   ├── Chart.yaml
@@ -415,6 +416,7 @@ cd web && npm run prepare  # initializes husky
 | `.pre-commit-config.yaml` | Root-level pre-commit hooks |
 | `docker/docker-compose-base.yml` | Infrastructure services (MySQL, ES, Redis, MinIO, etc.) |
 | `docker/docker-compose.yml` | App services with cpu/gpu profiles |
+| `docker/.env` | Docker Compose environment variables (DB passwords, doc engine, feature flags) |
 | `docker/entrypoint.sh` | Container startup orchestrator |
 | `docker/nginx/ragflow.conf.python` | Nginx config for Python backend mode |
 | `docker/nginx/ragflow.conf.golang` | Nginx config for Go backend mode |
@@ -432,4 +434,5 @@ cd web && npm run prepare  # initializes husky
 - **Adding a new document parser**: Add a module in `deepdoc/parser/` and reference it from `rag/app/` chunkers.
 - **Running only Python backend without task executors**: Use `docker/entrypoint.sh --disable-taskexecutor`.
 - **Switching doc engine**: Set `DOC_ENGINE` environment variable to `elasticsearch`, `infinity`, `opensearch`, or `oceanbase`.
+- **GraphRAG tuning switches**: Most GraphRAG incremental/async switches (e.g., `USE_INCREMENTAL_GRAPH`, `USE_ADAPTIVE_LIMITER`, `RECONCILE_STUCK_ON_BOOT`) are read once at Python import time from `docker/.env`; restart containers after changing them. For stuck GraphRAG tasks, use `docker/finisher/finish_stuck_graphrag.py` or enable `RECONCILE_STUCK_ON_BOOT=1`.
 - **Proxy mode for frontend dev**: `web/.env.development` sets `API_PROXY_SCHEME=python` by default. Change to `go` or `hybrid` when developing against the Go backend.

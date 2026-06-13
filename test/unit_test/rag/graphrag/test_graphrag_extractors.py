@@ -51,6 +51,44 @@ class TestGraphExtractor:
         assert seen_task_ids == ["task-123", "task-123", "task-123"]
 
 
+class TestExtractorBatchedSummarize:
+    @pytest.mark.p2
+    @pytest.mark.asyncio
+    async def test_falls_back_for_missing_keys(self, monkeypatch):
+        from rag.graphrag.general import extractor as extractor_module
+
+        extractor = extractor_module.Extractor(_build_llm_stub())
+
+        async def fake_async_chat(_system, _history, _gen_conf=None, task_id=""):
+            # LLM returns only one of two requested entities.
+            return (
+                "=== ENTITY: E1 ===\n"
+                "summary one\n"
+                "=== END ===\n"
+            )
+
+        monkeypatch.setattr(extractor, "_async_chat", fake_async_chat)
+
+        seen = []
+
+        async def fake_handle_summary(name, desc, task_id=""):
+            seen.append(name)
+            return f"fallback:{name}"
+
+        monkeypatch.setattr(extractor, "_handle_entity_relation_summary", fake_handle_summary)
+        monkeypatch.setattr(extractor_module.GraphRAGConfig, "USE_BATCHED_SUMMARIZATION", True)
+        monkeypatch.setattr(extractor_module.GraphRAGConfig, "ENTITY_SUMMARY_BATCH_SIZE", 10)
+
+        result = await extractor._batched_summarize(
+            [("E1", "d1"), ("E2", "d2")], task_id="task-123"
+        )
+
+        assert result.get("E1") == "summary one"
+        assert result.get("E2") == "fallback:E2"
+        assert "E2" in seen
+        assert "E1" not in seen
+
+
 class TestCommunityReportsExtractor:
     @pytest.mark.p2
     @pytest.mark.asyncio

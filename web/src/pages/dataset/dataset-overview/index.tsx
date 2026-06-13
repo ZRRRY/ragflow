@@ -12,16 +12,13 @@ import {
 import WhatIsThis from '@/components/what-is-this';
 import { RunningStatusMap, RunningStatusOld } from '@/constants/knowledge';
 import { useFetchDocumentList } from '@/hooks/use-document-request';
+import { useFetchKnowledgeBaseConfiguration } from '@/hooks/use-knowledge-request';
 import { FC, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { RunningStatus } from '../dataset/constant';
 import { LogTabs } from './dataset-common';
 import { DatasetFilter } from './dataset-filter';
-import {
-  useFetchDatasetChunkCount,
-  useFetchFileLogList,
-  useFetchOverviewTotal,
-} from './hook';
+import { useFetchFileLogList, useFetchOverviewTotal } from './hook';
 import { DocumentLog, IFileLogItem } from './interface';
 import FileLogsTable from './overview-table';
 
@@ -138,7 +135,8 @@ const FileLogsPage: FC = () => {
     },
   });
   const { data: topData } = useFetchOverviewTotal();
-  const { data: chunkTotal } = useFetchDatasetChunkCount();
+  const { data: knowledgeBaseConfiguration } =
+    useFetchKnowledgeBaseConfiguration();
   const {
     pagination: { total: fileTotal },
   } = useFetchDocumentList(false);
@@ -288,7 +286,7 @@ const FileLogsPage: FC = () => {
         </StatCard>
         <StatCard
           title={t('datasetOverview.totalChunks')}
-          value={chunkTotal ?? 0}
+          value={knowledgeBaseConfiguration?.chunk_count ?? 0}
           icon={
             isDark ? (
               <SvgIcon name="data-flow/total-chunks-icon" width={40} />
