@@ -556,6 +556,21 @@ async def get_knowledge_graph(tenant_id, dataset_id):
         return get_error_data_result(message="Internal server error")
 
 
+@manager.route("/datasets/<dataset_id>/graph", methods=["DELETE"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+def delete_knowledge_graph(tenant_id, dataset_id):
+    try:
+        success, result = dataset_api_service.delete_knowledge_graph(dataset_id, tenant_id)
+        if success:
+            return get_result(data=result)
+        else:
+            return get_result(data=False, message=result, code=RetCode.AUTHENTICATION_ERROR)
+    except Exception as e:
+        logging.exception(e)
+        return get_error_data_result(message="Internal server error")
+
+
 @manager.route("/datasets/<dataset_id>/index", methods=["POST"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs

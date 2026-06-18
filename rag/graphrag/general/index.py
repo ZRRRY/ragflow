@@ -16,6 +16,8 @@
 import asyncio
 import json
 import logging
+import os
+import re
 
 import networkx as nx
 
@@ -23,7 +25,7 @@ from api.db.services.document_service import DocumentService
 from api.db.services.task_service import has_canceled
 from common.exceptions import TaskCanceledException
 from common.connection_utils import timeout
-from rag.graphrag.entity_resolution import EntityResolution
+from rag.graphrag.entity_resolution import EntityResolution, EXCLUDED_RESOLUTION_TYPES
 from rag.graphrag.checkpoints import (
     COMMUNITY_CHECKPOINT,
     RESOLUTION_CHECKPOINT,
@@ -43,19 +45,29 @@ from rag.graphrag.phase_markers import (
     has_phase_marker,
     set_phase_marker,
 )
+from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.utils import (
+    GRAPH_FIELD_SEP,
     GraphChange,
     chunk_id,
     does_graph_contains,
+    get_from_to,
     get_graph,
+    get_graph_from_index,
     graph_merge,
     insert_chunks_bounded,
+    is_doc_merged,
+    query_existing_entities,
+    query_existing_relations,
+    query_node_relations,
+    query_merge_state,
     set_graph,
     tidy_graph,
+    write_merge_state,
 )
 from common.misc_utils import thread_pool_exec
 from rag.nlp import rag_tokenizer, search
-from rag.utils.redis_conn import RedisDistributedLock
+from rag.utils.redis_conn import RedisDistributedLock, REDIS_CONN
 from common import settings
 from common.doc_store.doc_store_base import OrderByExpr
 
@@ -63,12 +75,13 @@ from common.doc_store.doc_store_base import OrderByExpr
 DEFAULT_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 4096
 MIN_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 512
 MAX_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 8196
-DEFAULT_GRAPHRAG_RETRY_ATTEMPTS = 2
-DEFAULT_GRAPHRAG_RETRY_BACKOFF_SECONDS = 2.0
-DEFAULT_GRAPHRAG_RETRY_BACKOFF_MAX_SECONDS = 60.0
-DEFAULT_GRAPHRAG_BUILD_SUBGRAPH_TIMEOUT_PER_CHUNK_SECONDS = 300
+# 以下常量默认值与官方 v0.26.0 保持一致；可通过对应环境变量覆盖为调优值
+DEFAULT_GRAPHRAG_RETRY_ATTEMPTS = int(os.environ.get("GRAPHRAG_RETRY_ATTEMPTS", "2"))
+DEFAULT_GRAPHRAG_RETRY_BACKOFF_SECONDS = float(os.environ.get("GRAPHRAG_RETRY_BACKOFF_SECONDS", "2.0"))
+DEFAULT_GRAPHRAG_RETRY_BACKOFF_MAX_SECONDS = float(os.environ.get("GRAPHRAG_RETRY_BACKOFF_MAX_SECONDS", "60.0"))
+DEFAULT_GRAPHRAG_BUILD_SUBGRAPH_TIMEOUT_PER_CHUNK_SECONDS = int(os.environ.get("GRAPHRAG_BUILD_SUBGRAPH_TIMEOUT_PER_CHUNK_SECONDS", "300"))
 DEFAULT_GRAPHRAG_BUILD_SUBGRAPH_MIN_TIMEOUT_SECONDS = 600
-DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = 180
+DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = int(os.environ.get("GRAPHRAG_MERGE_TIMEOUT_SECONDS", "180"))
 DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS = 1800
 DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS = 1800
 DEFAULT_GRAPHRAG_LOCK_ACQUIRE_TIMEOUT_SECONDS = 600
@@ -115,6 +128,18 @@ def _lock_acquire_timeout_config(config: dict) -> int:
     return value
 
 
+def _min_timeout_config(value: int, default: int, minimum: int = 60) -> int:
+    """Return a timeout value with a sensible lower bound.
+
+    A value of 0 or extremely small timeouts would otherwise be treated as
+    "no timeout" by ``_run_with_retry`` and could hang indefinitely.  This
+    helper clamps the timeout to at least ``minimum`` seconds.
+    """
+    if value is None or value <= 0:
+        return default if default >= minimum else minimum
+    return max(value, minimum)
+
+
 def _select_extractor_type(graphrag_config: dict):
     return graphrag_config.get("method", "light")
 
@@ -144,6 +169,38 @@ def _has_cancel_and_exit(task_id: str, message: str, callback=None) -> None:
     if callback:
         callback(msg=message)
     raise TaskCanceledException(f"Task {task_id} was cancelled")
+
+
+# Phase 4.3: record lock wait/held durations in a Redis hash so external
+# dashboards / exporters can scrape them.
+_LOCK_METRICS_KEY_TMPL = "graphrag:lock_metrics:{}"
+_LOCK_METRICS_TTL = 3600
+
+
+async def _record_lock_metric(
+    kb_id: str,
+    lock_name: str,
+    *,
+    waited_seconds: float | None = None,
+    held_seconds: float | None = None,
+) -> None:
+    """Persist a lock event to Redis. Failures are non-fatal."""
+
+    def _write(redis, key: str, field: str, value: str, ttl: int):
+        redis.hset(key, field, value)
+        redis.expire(key, ttl)
+
+    try:
+        import time
+        from rag.utils.redis_conn import REDIS_CONN
+        key = _LOCK_METRICS_KEY_TMPL.format(kb_id)
+        value = f"{waited_seconds or 0:.3f},{held_seconds or 0:.3f},{time.time():.0f}"
+        if REDIS_CONN.REDIS is not None:
+            await thread_pool_exec(
+                _write, REDIS_CONN.REDIS, key, lock_name, value, _LOCK_METRICS_TTL
+            )
+    except Exception:
+        logging.exception("record_lock_metric write failed (non-fatal)")
 
 
 async def _run_with_retry(
@@ -265,13 +322,14 @@ async def run_graphrag_for_kb(
     *,
     with_resolution: bool = True,
     with_community: bool = True,
-    max_parallel_docs: int = 4,
+    max_parallel_docs: int = GraphRAGConfig.GRAPHRAG_MAX_PARALLEL_DOCS,
 ) -> dict:
     tenant_id, kb_id = row["tenant_id"], row["kb_id"]
     task_id = row["id"]
     start = asyncio.get_running_loop().time()
     fields_for_chunks = ["content_with_weight", "doc_id"]
     graphrag_config = kb_parser_config.get("graphrag", {})
+    kb_entity_types = graphrag_config.get("entity_types", []) or []
     batch_chunk_token_size = _batch_chunk_token_size_config(graphrag_config, "batch_chunk_token_size", DEFAULT_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE)
     retry_attempts = _bounded_int_config(graphrag_config, "retry_attempts", DEFAULT_GRAPHRAG_RETRY_ATTEMPTS, 1, 10)
     retry_backoff_seconds = _bounded_float_config(graphrag_config, "retry_backoff_seconds", DEFAULT_GRAPHRAG_RETRY_BACKOFF_SECONDS, 0.0, 600.0)
@@ -294,13 +352,22 @@ async def run_graphrag_for_kb(
         1,
         86400,
     )
-    merge_timeout_seconds = _bounded_int_config(graphrag_config, "merge_timeout_seconds", DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS, 0, 86400)
-    resolution_timeout_seconds = _bounded_int_config(graphrag_config, "resolution_timeout_seconds", DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS, 0, 86400)
-    community_timeout_seconds = _bounded_int_config(graphrag_config, "community_timeout_seconds", DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS, 0, 86400)
+    merge_timeout_seconds = _min_timeout_config(
+        _bounded_int_config(graphrag_config, "merge_timeout_seconds", DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS, 0, 86400),
+        DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS,
+    )
+    resolution_timeout_seconds = _min_timeout_config(
+        _bounded_int_config(graphrag_config, "resolution_timeout_seconds", DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS, 0, 86400),
+        DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS,
+    )
+    community_timeout_seconds = _min_timeout_config(
+        _bounded_int_config(graphrag_config, "community_timeout_seconds", DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS, 0, 86400),
+        DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS,
+    )
     lock_acquire_timeout_seconds = _lock_acquire_timeout_config(graphrag_config)
 
     if not doc_ids:
-        logging.info(f"Fetching all docs for {kb_id}")
+        logging.info("Fetching all docs for %s", kb_id)
         docs, _ = DocumentService.get_by_kb_id(
             kb_id=kb_id,
             page_number=0,
@@ -321,6 +388,35 @@ async def run_graphrag_for_kb(
     else:
         callback(msg=f"[GraphRAG] dataset:{kb_id} has {len(doc_ids)} documents to process.")
 
+    # Phase 6: conditional cleanup based on environment switches
+    if not GraphRAGConfig.KEEP_SUBGRAPH:
+        try:
+            await thread_pool_exec(
+                settings.docStoreConn.delete,
+                {"kb_id": kb_id, "knowledge_graph_kwd": ["subgraph"]},
+                search.index_name(tenant_id),
+                kb_id,
+            )
+            callback(msg=f"[GraphRAG] Cleared previous subgraph checkpoints for dataset:{kb_id}")
+        except Exception as e:
+            logging.warning("[GraphRAG] Failed to clear previous subgraph checkpoints for dataset %s: %s", kb_id, e)
+
+    if not GraphRAGConfig.KEEP_MERGE:
+        try:
+            await thread_pool_exec(
+                settings.docStoreConn.delete,
+                {"kb_id": kb_id, "knowledge_graph_kwd": ["graph", "entity", "relation", "merge_state"]},
+                search.index_name(tenant_id),
+                kb_id,
+            )
+            callback(msg=f"[GraphRAG] Cleared previous graph/entity/relation/merge_state for dataset:{kb_id}")
+        except Exception as e:
+            logging.warning("[GraphRAG] Failed to clear previous merge results for dataset %s: %s", kb_id, e)
+
+    if not GraphRAGConfig.KEEP_RESOLUTION:
+        clear_phase_markers(kb_id, (PHASE_RESOLUTION, PHASE_COMMUNITY))
+        callback(msg=f"[GraphRAG] Cleared phase markers to force rerun resolution/community for dataset:{kb_id}")
+
     def load_doc_chunks(doc_id: str) -> list[str]:
         from common.token_utils import num_tokens_from_string
 
@@ -338,9 +434,8 @@ async def run_graphrag_for_kb(
 
         callback(msg=f"[GraphRAG] chunk_list returned {len(raw_chunks)} raw chunks for doc:{doc_id}")
 
-        contents = [content for chunk in raw_chunks if (content := chunk.get("content_with_weight", ""))
-]
-        # For NER-based extractionm, no need to batch extract entity and relation
+        contents = [content for chunk in raw_chunks if (content := chunk.get("content_with_weight", ""))]
+        # For NER-based extraction, no need to batch extract entity and relation
         if _select_extractor_type(graphrag_config) == "ner":
             return contents
 
@@ -373,9 +468,11 @@ async def run_graphrag_for_kb(
         kg_extractor = _select_extractor(graphrag_config)
 
         async with semaphore:
-            # CHECKPOINT: bounded by semaphore so doc-store lookups respect max_parallel_docs
             _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before loading checkpoint for doc {doc_id}.", callback)
-            existing_sg = await load_subgraph_from_store(tenant_id, kb_id, doc_id)
+            # Subgraph checkpoints are only used in incremental paths.
+            existing_sg = None
+            if GraphRAGConfig.USE_INCREMENTAL_GRAPH or GraphRAGConfig.USE_INCREMENTAL_MERGE:
+                existing_sg = await load_subgraph_from_store(tenant_id, kb_id, doc_id)
             if existing_sg:
                 subgraphs[doc_id] = existing_sg
                 callback(msg=f"[GraphRAG] doc:{doc_id} subgraph found in store, skipping LLM extraction.")
@@ -396,13 +493,20 @@ async def run_graphrag_for_kb(
                 msg = f"[GraphRAG] {label}"
                 callback(msg=f"{msg} start (chunks={len(chunks)}, timeout={build_subgraph_timeout_seconds}s, attempts={build_subgraph_retry_attempts})")
 
+                try:
+                    _, doc_obj = DocumentService.get_by_id(doc_id)
+                    fallback_title = os.path.splitext(doc_obj.name or "")[0] if doc_obj else ""
+                except Exception:
+                    fallback_title = ""
+
                 _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before subgraph generation for doc {doc_id}.", callback)
                 try:
                     async def build_subgraph_attempt():
-                        checkpoint_sg = await load_subgraph_from_store(tenant_id, kb_id, doc_id)
-                        if checkpoint_sg:
-                            callback(msg=f"[GraphRAG] doc:{doc_id} subgraph found in store during retry, skipping LLM extraction.")
-                            return checkpoint_sg
+                        if GraphRAGConfig.USE_INCREMENTAL_GRAPH or GraphRAGConfig.USE_INCREMENTAL_MERGE:
+                            checkpoint_sg = await load_subgraph_from_store(tenant_id, kb_id, doc_id)
+                            if checkpoint_sg:
+                                callback(msg=f"[GraphRAG] doc:{doc_id} subgraph found in store during retry, skipping LLM extraction.")
+                                return checkpoint_sg
                         return await generate_subgraph(
                             kg_extractor,
                             tenant_id,
@@ -415,6 +519,7 @@ async def run_graphrag_for_kb(
                             embedding_model,
                             callback,
                             task_id=task_id,
+                            fallback_title=fallback_title,
                         )
 
                     sg = await _run_with_retry(
@@ -465,9 +570,6 @@ async def run_graphrag_for_kb(
     ok_docs = [d for d in doc_ids if d in subgraphs]
     final_graph = None
 
-    # Determine whether the resolution/community phases still need to run on
-    # this KB. Markers from a prior task let us skip already-completed phases
-    # even when no new docs are merged this round (the resume path).
     resolution_pending = with_resolution and not has_phase_marker(kb_id, PHASE_RESOLUTION)
     community_pending = with_community and not has_phase_marker(kb_id, PHASE_COMMUNITY)
 
@@ -478,7 +580,17 @@ async def run_graphrag_for_kb(
 
     kb_lock = RedisDistributedLock(f"graphrag_task_{kb_id}", lock_value=f"batch_merge:{task_id}", timeout=1200)
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before acquiring merge lock.", callback)
+    lock_acquire_t0 = asyncio.get_running_loop().time()
     await _acquire_lock(kb_lock, "merge lock", lock_acquire_timeout_seconds, callback, task_id)
+    lock_held_t0 = asyncio.get_running_loop().time()
+    try:
+        await _record_lock_metric(
+            kb_id=kb_id, lock_name="batch_merge",
+            waited_seconds=lock_held_t0 - lock_acquire_t0,
+            held_seconds=None,
+        )
+    except Exception:
+        logging.exception("record_lock_metric failed (non-fatal)")
     callback(msg=f"[GraphRAG] dataset:{kb_id} merge lock acquired")
 
     try:
@@ -491,12 +603,27 @@ async def run_graphrag_for_kb(
             sg = subgraphs[doc_id]
             union_nodes.update(set(sg.nodes()))
 
+            if GraphRAGConfig.USE_INCREMENTAL_MERGE:
+                await write_merge_state(
+                    tenant_id, kb_id, doc_id,
+                    state="merging",
+                    expected_nodes=len(sg.nodes),
+                    expected_edges=len(sg.edges),
+                )
+
             try:
                 async def merge_subgraph_attempt():
-                    current_graph = await get_graph(tenant_id, kb_id)
-                    if current_graph and doc_id in current_graph.graph.get("source_id", []):
-                        callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} already merged, skipping retry.")
-                        return current_graph
+                    if GraphRAGConfig.USE_INCREMENTAL_MERGE:
+                        # 增量路径：使用 merge_state 状态表判断是否已经合并
+                        if await is_doc_merged(tenant_id, kb_id, doc_id):
+                            callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} already merged, skipping retry.")
+                            return None
+                    else:
+                        # 官方全量路径：加载全局图并检查 source_id（保持 v0.26.0 原行为）
+                        current_graph = await get_graph(tenant_id, kb_id)
+                        if current_graph and doc_id in current_graph.graph.get("source_id", []):
+                            callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} already merged, skipping retry.")
+                            return current_graph
                     return await merge_subgraph(
                         tenant_id,
                         kb_id,
@@ -519,24 +646,46 @@ async def run_graphrag_for_kb(
             except TaskCanceledException:
                 raise
             except Exception as e:
+                if GraphRAGConfig.USE_INCREMENTAL_MERGE:
+                    await write_merge_state(
+                        tenant_id, kb_id, doc_id,
+                        state="failed",
+                        expected_nodes=len(sg.nodes),
+                        expected_edges=len(sg.edges),
+                        extra={"error": repr(e)},
+                    )
                 failed_docs.append((doc_id, f"merge failed: {e!r}"))
                 callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} FAILED: {e!r}")
                 raise
+
             if new_graph is not None:
                 final_graph = new_graph
+                if GraphRAGConfig.USE_INCREMENTAL_MERGE:
+                    await write_merge_state(
+                        tenant_id, kb_id, doc_id,
+                        state="merged",
+                        expected_nodes=len(sg.nodes),
+                        expected_edges=len(sg.edges),
+                    )
 
         if ok_docs and final_graph is None:
             callback(msg=f"[GraphRAG] dataset:{kb_id} merge finished (no in-memory graph returned).")
         elif ok_docs:
             callback(msg=f"[GraphRAG] dataset:{kb_id} merge finished, graph ready.")
-            # New content was merged into the global graph; any prior
-            # resolution/community results are now stale and must be redone
-            # on this or a future run. Clear phase markers accordingly.
             clear_phase_markers(kb_id)
             resolution_pending = with_resolution
             community_pending = with_community
             callback(msg=f"[GraphRAG] dataset:{kb_id} cleared phase markers after merge.")
     finally:
+        try:
+            _held = asyncio.get_running_loop().time() - lock_held_t0
+            await _record_lock_metric(
+                kb_id=kb_id, lock_name="batch_merge",
+                waited_seconds=None,
+                held_seconds=_held,
+            )
+        except Exception:
+            logging.exception("record_lock_metric(held) failed (non-fatal)")
         kb_lock.release()
 
     if not with_resolution and not with_community:
@@ -549,6 +698,31 @@ async def run_graphrag_for_kb(
         callback(msg=f"[GraphRAG] dataset:{kb_id} all requested phases already complete; nothing to do.")
         return {"ok_docs": ok_docs, "failed_docs": failed_docs, "total_docs": len(doc_ids), "total_chunks": total_chunks, "seconds": now - start}
 
+    if GraphRAGConfig.USE_ASYNC_KG_PHASES:
+        queue_payload = {
+            "tenant_id": tenant_id,
+            "kb_id": kb_id,
+            "task_id": row["id"],
+            "with_resolution": with_resolution and resolution_pending,
+            "with_community": with_community and community_pending,
+            "kb_task_llm_id": row.get("llm_id"),
+            "task_language": language,
+        }
+        ok = REDIS_CONN.queue_product(GraphRAGConfig.KG_POSTPROCESS_QUEUE, queue_payload)
+        if ok:
+            logging.info("[GraphRAG] kb:%s queued resolution/community to %s", kb_id, GraphRAGConfig.KG_POSTPROCESS_QUEUE)
+            now = asyncio.get_running_loop().time()
+            return {
+                "ok_docs": ok_docs,
+                "failed_docs": failed_docs,
+                "total_docs": len(doc_ids),
+                "total_chunks": total_chunks,
+                "seconds": now - start,
+                "postprocess_queued": True,
+            }
+        else:
+            logging.warning("[GraphRAG] kb:%s FAILED to queue postprocess; falling back to synchronous execution.", kb_id)
+
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before resolution/community extraction.", callback)
 
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before acquiring post-merge lock.", callback)
@@ -558,9 +732,14 @@ async def run_graphrag_for_kb(
     try:
         _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before resolution/community extraction.", callback)
 
-        # Resume path: no docs were merged this round but pending phases
-        # require the previously-persisted graph. Load it from the doc store.
-        if final_graph is None:
+        need_preload_full_graph = (
+            final_graph is None
+            and (
+                (resolution_pending and not GraphRAGConfig.USE_INCREMENTAL_RESOLUTION)
+                or (community_pending and not GraphRAGConfig.USE_ASYNC_COMMUNITY)
+            )
+        )
+        if need_preload_full_graph:
             final_graph = await get_graph(tenant_id, kb_id)
             if final_graph is None:
                 callback(msg=f"[GraphRAG] dataset:{kb_id} no persisted graph found; cannot run resolution/community.")
@@ -571,11 +750,26 @@ async def run_graphrag_for_kb(
         subgraph_nodes = set()
         for sg in subgraphs.values():
             subgraph_nodes.update(set(sg.nodes()))
-        # On a pure-resume run (no new docs) the union of "newly added" nodes
-        # is empty, but resolution still needs *some* anchor set. Fall back to
-        # all graph nodes so candidate pairing actually finds something.
         if not subgraph_nodes:
             subgraph_nodes = set(final_graph.nodes())
+            max_safe_resume_nodes = GraphRAGConfig.KG_MAX_SAFE_RESUME_NODES
+            if len(subgraph_nodes) > max_safe_resume_nodes:
+                callback(
+                    msg=(
+                        f"[GraphRAG] dataset:{kb_id} resume path would load "
+                        f"{len(subgraph_nodes)} nodes for resolution, "
+                        f"exceeds KG_MAX_SAFE_RESUME_NODES={max_safe_resume_nodes}. "
+                        f"Please resubmit the task with all docs merged instead of resuming."
+                    )
+                )
+                now = asyncio.get_running_loop().time()
+                return {
+                    "ok_docs": ok_docs,
+                    "failed_docs": failed_docs,
+                    "total_docs": len(doc_ids),
+                    "total_chunks": total_chunks,
+                    "seconds": now - start,
+                }
 
         if resolution_pending:
             _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before entity resolution.", callback)
@@ -592,6 +786,7 @@ async def run_graphrag_for_kb(
                     embedding_model,
                     callback,
                     task_id=task_id,
+                    entity_types=kb_entity_types,
                 )
                 return graph_for_resolution
 
@@ -651,6 +846,135 @@ async def run_graphrag_for_kb(
     }
 
 
+def _extract_book_and_chapters(doc_id: str, chunks: list[str], fallback_title: str = ""):
+    """Extract book title and chapter hierarchy from Markdown chunks."""
+    book_title = None
+    for chunk in chunks:
+        m = re.search(r"^#\s+(.+)$", chunk, re.MULTILINE)
+        if m:
+            book_title = m.group(1).strip()
+            break
+
+    if not book_title:
+        book_title = fallback_title
+    if not book_title:
+        logging.warning(f"[ChapterGraph] doc_id={doc_id}: no # title and no fallback_title, skipping chapter extraction")
+        return None, [], [], []
+
+    chapter_entities = []
+    chapter_relations = []
+    seen_chapters = set()
+    chunk_chapters = []
+
+    chapter_entities.append({
+        "entity_name": book_title,
+        "entity_type": "书籍",
+        "description": f"书籍《{book_title}》",
+        "source_id": [doc_id],
+    })
+
+    has_markdown_headers = False
+    for chunk in chunks:
+        chapters_in_chunk = []
+        for m in re.finditer(r"^##\s+(.+)$", chunk, re.MULTILINE):
+            has_markdown_headers = True
+            chapter = m.group(1).strip()
+            chapter_node_name = f"《{book_title}》{chapter}"
+            chapters_in_chunk.append(chapter_node_name)
+            if chapter_node_name not in seen_chapters:
+                seen_chapters.add(chapter_node_name)
+                chapter_entities.append({
+                    "entity_name": chapter_node_name,
+                    "entity_type": "章节",
+                    "description": f"《{book_title}》的章节：{chapter}",
+                    "source_id": [doc_id],
+                })
+                chapter_relations.append({
+                    "src_id": book_title,
+                    "tgt_id": chapter_node_name,
+                    "description": f"《{book_title}》包含章节《{chapter}》",
+                    "keywords": ["contains", "章节", "书籍"],
+                    "weight": 1,
+                    "source_id": [doc_id],
+                })
+        chunk_chapters.append(chapters_in_chunk)
+
+    if not has_markdown_headers:
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                continue
+            first_line = ""
+            for line in chunk.split('\n'):
+                stripped = line.strip()
+                if stripped:
+                    first_line = stripped
+                    break
+            if first_line and len(first_line) <= 100:
+                chapter_node_name = f"《{book_title}》{first_line}"
+                chunk_chapters[i].append(chapter_node_name)
+                if chapter_node_name not in seen_chapters:
+                    seen_chapters.add(chapter_node_name)
+                    chapter_entities.append({
+                        "entity_name": chapter_node_name,
+                        "entity_type": "章节",
+                        "description": f"《{book_title}》的章节：{first_line}",
+                        "source_id": [doc_id],
+                    })
+                    chapter_relations.append({
+                        "src_id": book_title,
+                        "tgt_id": chapter_node_name,
+                        "description": f"《{book_title}》包含章节《{first_line}》",
+                        "keywords": ["contains", "章节", "书籍"],
+                        "weight": 1,
+                        "source_id": [doc_id],
+                    })
+        if chunks and len(chunk_chapters) > 1:
+            first_chapter = None
+            for chapters in chunk_chapters[1:]:
+                if chapters:
+                    first_chapter = chapters[0]
+                    break
+            if first_chapter and not chunk_chapters[0]:
+                chunk_chapters[0].append(first_chapter)
+
+    logging.info(f"[ChapterGraph] doc_id={doc_id}: book_title={book_title}, chapters={len(seen_chapters)}, has_md_headers={has_markdown_headers}")
+    return book_title, chapter_entities, chapter_relations, chunk_chapters
+
+
+def _link_entities_to_chapters(doc_id: str, chunks: list[str], entities: list[dict], chunk_chapters: list[list[str]]):
+    """Link entities to the chapters that mention them."""
+    relations = []
+    seen_pairs = set()
+    chunk_texts = [chunk.lower() for chunk in chunks]
+
+    for ent in entities:
+        if ent.get("entity_type") in ("书籍", "章节"):
+            continue
+        ent_name = ent["entity_name"]
+        ent_name_lower = ent_name.lower()
+        matched = False
+        for idx, text in enumerate(chunk_texts):
+            if ent_name_lower in text:
+                matched = True
+                for chapter in chunk_chapters[idx]:
+                    pair = (chapter, ent_name)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    relations.append({
+                        "src_id": chapter,
+                        "tgt_id": ent_name,
+                        "description": f"章节《{chapter}》涉及实体《{ent_name}》",
+                        "keywords": ["involves", "章节", "实体"],
+                        "weight": 1,
+                        "source_id": [doc_id],
+                    })
+        if not matched:
+            logging.debug(f"[ChapterGraph] doc_id={doc_id}: entity '{ent_name}' not found in any chunk text")
+    logging.info(f"[ChapterGraph] doc_id={doc_id}: entity_chapter_relations={len(relations)}, entities_processed={len(entities)}")
+    return relations
+
+
 async def generate_subgraph(
     extractor: Extractor,
     tenant_id: str,
@@ -663,6 +987,7 @@ async def generate_subgraph(
     embed_bdl,
     callback,
     task_id: str = "",
+    fallback_title: str = "",
 ):
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled during subgraph generation for doc {doc_id}.", callback)
 
@@ -677,7 +1002,46 @@ async def generate_subgraph(
         language=language,
         entity_types=entity_types,
     )
-    ents, rels = await ext(doc_id, chunks, callback, task_id=task_id)
+    llm_ents, llm_rels = await ext(doc_id, chunks, callback, task_id=task_id)
+
+    chapter_ents, chapter_rels, chunk_chapters = [], [], []
+    if GraphRAGConfig.USE_CHAPTER_GRAPH:
+        for i, ck in enumerate(chunks[:2]):
+            preview = ck[:300].replace("\n", " | ")
+            callback(msg=f"[ChapterGraph DEBUG] chunk {i} preview: {preview}")
+        callback(msg=f"[ChapterGraph DEBUG] total chunks={len(chunks)}, fallback_title={fallback_title}")
+
+        _, chapter_ents, chapter_rels, chunk_chapters = _extract_book_and_chapters(doc_id, chunks, fallback_title)
+        callback(msg=f"[ChapterGraph DEBUG] chapter_ents={len(chapter_ents)}, chapter_rels={len(chapter_rels)}")
+        if chapter_ents:
+            callback(msg=f"[ChapterGraph DEBUG] chapter_entities={[e['entity_name'] for e in chapter_ents]}")
+        if chapter_rels:
+            callback(msg=f"[ChapterGraph DEBUG] chapter_rels_sample={(chapter_rels[0]['src_id'], chapter_rels[0]['tgt_id'])}")
+
+    ents = list(llm_ents)
+    rels = list(llm_rels)
+
+    if chapter_ents:
+        merged_ents = {}
+        for ent in llm_ents:
+            merged_ents[ent["entity_name"]] = dict(ent)
+        for cent in chapter_ents:
+            name = cent["entity_name"]
+            if name in merged_ents:
+                existing = merged_ents[name]
+                existing["source_id"] = sorted(set(existing.get("source_id", []) + cent.get("source_id", [])))
+                if cent.get("entity_type") in ("书籍", "章节"):
+                    existing["entity_type"] = cent["entity_type"]
+                    existing["description"] = cent["description"]
+            else:
+                merged_ents[name] = dict(cent)
+        ents = list(merged_ents.values())
+        rels.extend(chapter_rels)
+
+        entity_chapter_rels = _link_entities_to_chapters(doc_id, chunks, llm_ents, chunk_chapters)
+        rels.extend(entity_chapter_rels)
+        callback(msg=f"[ChapterGraph DEBUG] entity_chapter_rels={len(entity_chapter_rels)}")
+
     subgraph = nx.Graph()
 
     for ent in ents:
@@ -688,12 +1052,22 @@ async def generate_subgraph(
         subgraph.add_node(ent["entity_name"], **ent)
 
     ignored_rels = 0
+    ignored_rel_samples = []
     for rel in rels:
         _has_cancel_and_exit(task_id, f"Task {task_id} cancelled during relationship processing for doc {doc_id}.", callback)
 
         assert "description" in rel, f"relation {rel} does not have description"
-        if not subgraph.has_node(rel["src_id"]) or not subgraph.has_node(rel["tgt_id"]):
+        has_src = subgraph.has_node(rel["src_id"])
+        has_tgt = subgraph.has_node(rel["tgt_id"])
+        if not has_src or not has_tgt:
             ignored_rels += 1
+            if len(ignored_rel_samples) < 5:
+                ignored_rel_samples.append({
+                    "src_id": rel["src_id"],
+                    "tgt_id": rel["tgt_id"],
+                    "has_src": has_src,
+                    "has_tgt": has_tgt,
+                })
             continue
         rel["source_id"] = [doc_id]
         subgraph.add_edge(
@@ -719,12 +1093,127 @@ async def generate_subgraph(
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before saving subgraph for doc {doc_id}.", callback)
     await thread_pool_exec(settings.docStoreConn.delete,{"knowledge_graph_kwd": "subgraph", "source_id": doc_id},search.index_name(tenant_id),kb_id,)
     await thread_pool_exec(settings.docStoreConn.insert,[{"id": cid, **chunk}],search.index_name(tenant_id),kb_id,)
+
+    if GraphRAGConfig.USE_INCREMENTAL_MERGE:
+        await write_merge_state(
+            tenant_id, kb_id, doc_id,
+            state="pending",
+            expected_nodes=len(subgraph.nodes),
+            expected_edges=len(subgraph.edges),
+        )
+
     now = asyncio.get_running_loop().time()
     callback(msg=f"generated subgraph for doc {doc_id} in {now - start:.2f} seconds.")
     return subgraph
 
 
-@timeout(60 * 3)
+async def merge_subgraph_incremental(
+    tenant_id: str,
+    kb_id: str,
+    doc_id: str,
+    subgraph: nx.Graph,
+    embedding_model,
+    callback,
+):
+    """Incremental merge: does not load the global graph into memory.
+
+    Only queries existing nodes / edges that appear in the new subgraph,
+    merges attributes in memory, skips global PageRank, and writes delta.
+    """
+    start = asyncio.get_running_loop().time()
+    change = GraphChange()
+
+    node_names = list(subgraph.nodes())
+
+    logging.info("[P2] Querying %d entities for existing data...", len(node_names))
+    existing_entities = await query_existing_entities(tenant_id, kb_id, node_names)
+    logging.info("[P2] Found %d existing entities.", len(existing_entities))
+
+    delta_graph = nx.Graph()
+    delta_graph.graph["source_id"] = list(subgraph.graph.get("source_id", []))
+
+    for node_name, attr in subgraph.nodes(data=True):
+        if node_name in existing_entities:
+            old_fields = existing_entities[node_name]
+            try:
+                old_meta = json.loads(old_fields["content_with_weight"])
+            except Exception:
+                old_meta = {}
+
+            merged_attr = dict(old_meta)
+            new_desc = attr.get("description", "")
+            if new_desc:
+                old_desc = merged_attr.get("description", "")
+                merged_attr["description"] = old_desc + GRAPH_FIELD_SEP + new_desc if old_desc else new_desc
+            old_sources = set(merged_attr.get("source_id", []))
+            new_sources = set(attr.get("source_id", []))
+            merged_attr["source_id"] = sorted(old_sources | new_sources)
+            if attr.get("entity_type"):
+                if not merged_attr.get("entity_type"):
+                    merged_attr["entity_type"] = attr["entity_type"]
+            for k, v in attr.items():
+                if k not in merged_attr:
+                    merged_attr[k] = v
+            if "pagerank" not in merged_attr:
+                merged_attr["pagerank"] = old_meta.get("pagerank", 0.001)
+
+            delta_graph.add_node(node_name, **merged_attr)
+            change.added_updated_nodes.add(node_name)
+        else:
+            new_attr = dict(attr)
+            if "pagerank" not in new_attr:
+                new_attr["pagerank"] = 0.001
+            delta_graph.add_node(node_name, **new_attr)
+            change.added_updated_nodes.add(node_name)
+
+    edge_pairs = list(subgraph.edges())
+    logging.info("[P2] Querying %d relations for existing data...", len(edge_pairs))
+    existing_relations = await query_existing_relations(tenant_id, kb_id, edge_pairs)
+    logging.info("[P2] Found %d existing relations.", len(existing_relations))
+
+    for source, target, attr in subgraph.edges(data=True):
+        edge_key = get_from_to(source, target)
+        if edge_key in existing_relations:
+            old_fields = existing_relations[edge_key]
+            try:
+                old_meta = json.loads(old_fields["content_with_weight"])
+            except Exception:
+                old_meta = {}
+
+            merged_attr = dict(old_meta)
+            merged_attr["weight"] = merged_attr.get("weight", 0) + attr.get("weight", 0)
+            new_desc = attr.get("description", "")
+            if new_desc:
+                old_desc = merged_attr.get("description", "")
+                merged_attr["description"] = old_desc + GRAPH_FIELD_SEP + new_desc if old_desc else new_desc
+            old_kw = set(merged_attr.get("keywords", []))
+            new_kw = set(attr.get("keywords", []))
+            merged_attr["keywords"] = sorted(old_kw | new_kw)
+            old_sources = set(merged_attr.get("source_id", []))
+            new_sources = set(attr.get("source_id", []))
+            merged_attr["source_id"] = sorted(old_sources | new_sources)
+            for k, v in attr.items():
+                if k not in merged_attr:
+                    merged_attr[k] = v
+
+            delta_graph.add_edge(source, target, **merged_attr)
+            change.added_updated_edges.add(edge_key)
+        else:
+            delta_graph.add_edge(source, target, **attr)
+            change.added_updated_edges.add(edge_key)
+
+    for node_name in delta_graph.nodes:
+        delta_graph.nodes[node_name]["rank"] = int(delta_graph.degree(node_name))
+
+    await set_graph(tenant_id, kb_id, embedding_model, delta_graph, change, callback)
+
+    now = asyncio.get_running_loop().time()
+    logging.info("[P2] incremental merge for doc %s done in %.2fs (nodes: %d, edges: %d).",
+                 doc_id, now - start, len(change.added_updated_nodes), len(change.added_updated_edges))
+    return delta_graph
+
+
+@timeout(None)
 async def merge_subgraph(
     tenant_id: str,
     kb_id: str,
@@ -735,6 +1224,19 @@ async def merge_subgraph(
 ):
     start = asyncio.get_running_loop().time()
     change = GraphChange()
+
+    if GraphRAGConfig.USE_INCREMENTAL_MERGE:
+        try:
+            return await merge_subgraph_incremental(
+                tenant_id, kb_id, doc_id, subgraph, embedding_model, callback
+            )
+        except Exception as exc:
+            logging.exception(
+                "[P2] incremental merge failed for doc %s, will NOT fallback to monolithic: %s",
+                doc_id, exc,
+            )
+            raise
+
     old_graph = await get_graph(tenant_id, kb_id, subgraph.graph["source_id"])
     if old_graph is not None:
         logging.info("Merge with an exiting graph...................")
@@ -748,13 +1250,289 @@ async def merge_subgraph(
     for node_name, pagerank in pr.items():
         new_graph.nodes[node_name]["pagerank"] = pagerank
 
+    if GraphRAGConfig.USE_CHAPTER_GRAPH:
+        for n in new_graph.nodes:
+            if new_graph.nodes[n].get("entity_type") == "书籍":
+                neighbors = [nb for nb in new_graph.neighbors(n) if new_graph.nodes[nb].get("entity_type") == "章节"]
+                callback(msg=f"[ChapterGraph DEBUG] After merge, Book '{n}' has {len(neighbors)} Chapter neighbors: {neighbors}")
+                break
+
     await set_graph(tenant_id, kb_id, embedding_model, new_graph, change, callback)
     now = asyncio.get_running_loop().time()
     callback(msg=f"merging subgraph for doc {doc_id} into the global graph done in {now - start:.2f} seconds.")
     return new_graph
 
 
-@timeout(60 * 30, 1)
+async def resolve_entities_incremental(
+    tenant_id: str,
+    kb_id: str,
+    union_nodes: set[str],
+    llm_bdl,
+    embed_bdl,
+    callback,
+    task_id: str = "",
+    entity_types: list[str] | None = None,
+):
+    """Incremental entity resolution via OpenSearch KNN or char-level filtering."""
+    from collections import defaultdict
+    from rag.graphrag.entity_resolution import build_excluded_types, is_similarity_str
+    from rag.graphrag.utils import fetch_node_vectors
+
+    start = asyncio.get_running_loop().time()
+    excluded_types = build_excluded_types(entity_types)
+
+    if not union_nodes:
+        logging.info("[P3] No new nodes, skipping resolution.")
+        return
+
+    new_node_fields = await query_existing_entities(tenant_id, kb_id, list(union_nodes))
+
+    new_nodes_by_type = defaultdict(list)
+    node_attrs = {}
+    for node_name in union_nodes:
+        fields = new_node_fields.get(node_name)
+        if not fields:
+            continue
+        try:
+            meta = json.loads(fields["content_with_weight"])
+        except Exception:
+            continue
+        ent_type = meta.get("entity_type", "-")
+        new_nodes_by_type[ent_type].append(node_name)
+        node_attrs[node_name] = meta
+
+    if not new_nodes_by_type:
+        logging.info("[P3] No valid new nodes with types, skipping resolution.")
+        return
+
+    candidate_pairs: set[tuple[str, str]] = set()
+    candidate_neighbors: set[str] = set()
+
+    async def _fetch_existing_names_by_type(tenant_id, kb_id, ent_type):
+        """Fetch all existing entity names of a given type via scroll."""
+        index_name = search.index_name(tenant_id)
+        query_body = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"terms": {"kb_id": [kb_id]}},
+                        {"terms": {"knowledge_graph_kwd": ["entity"]}},
+                        {"term": {"entity_type_kwd": ent_type}},
+                    ]
+                }
+            }
+        }
+        try:
+            res = await thread_pool_exec(
+                settings.docStoreConn.search_with_scroll,
+                index_name,
+                query_body,
+                ["entity_kwd"],
+            )
+            fields_map = settings.docStoreConn.get_fields(res, ["entity_kwd"])
+            names = set()
+            for cid, row in fields_map.items():
+                name = row.get("entity_kwd")
+                if isinstance(name, list):
+                    name = name[0]
+                if name:
+                    names.add(name)
+            return names
+        except Exception as e:
+            logging.warning("[P3] Failed to fetch existing names for type %s: %s", ent_type, e)
+            return set()
+
+    if GraphRAGConfig.USE_KNN_FOR_RESOLUTION:
+        if not hasattr(settings.docStoreConn, "knn_search_entities"):
+            logging.warning(
+                "[P3] KNN resolution requested but %s does not support knn_search_entities; "
+                "falling back to char-level filtering.",
+                type(settings.docStoreConn).__name__,
+            )
+        else:
+            vector_dim = getattr(embed_bdl, "dimension", None)
+            if vector_dim is None:
+                try:
+                    test_emb, _ = await asyncio.get_running_loop().run_in_executor(
+                        None, embed_bdl.encode, ["DIM_CHECK"]
+                    )
+                    vector_dim = len(test_emb[0])
+                except Exception as e:
+                    logging.warning("[P3] Failed to detect embedding dimension: %s", e)
+                    return
+
+            new_node_vectors = await fetch_node_vectors(tenant_id, kb_id, list(union_nodes), vector_dim)
+            if not new_node_vectors:
+                logging.info("[P3] No vectors found for new nodes, skipping resolution.")
+                return
+
+            vector_field = f"q_{vector_dim}_vec"
+            knn_semaphore = asyncio.Semaphore(GraphRAGConfig.ENTITY_RESOLUTION_KNN_CONCURRENCY)
+
+            async def _knn_one(node_name, vector, ent_type):
+                async with knn_semaphore:
+                    try:
+                        res = await thread_pool_exec(
+                            settings.docStoreConn.knn_search_entities,
+                            [search.index_name(tenant_id)],
+                            [kb_id],
+                            vector,
+                            vector_field,
+                            GraphRAGConfig.ENTITY_RESOLUTION_TOP_K,
+                            GraphRAGConfig.ENTITY_RESOLUTION_SIM_THRESHOLD,
+                            entity_type=ent_type,
+                            exclude_name=node_name,
+                        )
+                        fields_map = settings.docStoreConn.get_fields(res, ["entity_kwd"])
+                        neighbors = []
+                        for cid, row in fields_map.items():
+                            neighbor_name = row.get("entity_kwd")
+                            if isinstance(neighbor_name, list):
+                                neighbor_name = neighbor_name[0]
+                            if not neighbor_name or neighbor_name == node_name:
+                                continue
+                            if not is_similarity_str(node_name, neighbor_name):
+                                continue
+                            neighbors.append(neighbor_name)
+                        return node_name, neighbors
+                    except Exception as e:
+                        logging.warning("KNN search failed for node %s: %s", node_name, e)
+                        return node_name, []
+
+            for ent_type, new_nodes in new_nodes_by_type.items():
+                if not new_nodes or ent_type in excluded_types:
+                    continue
+
+                tasks = []
+                for node_name in new_nodes:
+                    vector = new_node_vectors.get(node_name)
+                    if not vector:
+                        continue
+                    tasks.append(asyncio.create_task(_knn_one(node_name, vector, ent_type)))
+
+                if not tasks:
+                    continue
+
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, Exception):
+                        logging.warning("KNN task exception: %s", res)
+                        continue
+                    node_name, neighbors = res
+                    for neighbor_name in neighbors:
+                        a, b = (node_name, neighbor_name) if node_name < neighbor_name else (neighbor_name, node_name)
+                        candidate_pairs.add((a, b))
+                        candidate_neighbors.add(neighbor_name)
+
+    if not candidate_pairs:
+        logging.info("[P3] Falling back to char-level filtering for entity resolution.")
+        for ent_type, new_nodes in new_nodes_by_type.items():
+            if not new_nodes or ent_type in excluded_types:
+                continue
+
+            existing_names = await _fetch_existing_names_by_type(tenant_id, kb_id, ent_type)
+            existing_names = existing_names - set(new_nodes)
+
+            for node_name in new_nodes:
+                for existing_name in existing_names:
+                    if is_similarity_str(node_name, existing_name):
+                        a, b = (
+                            (node_name, existing_name)
+                            if node_name < existing_name
+                            else (existing_name, node_name)
+                        )
+                        candidate_pairs.add((a, b))
+                        candidate_neighbors.add(existing_name)
+
+    if not candidate_pairs:
+        logging.info("[P3] No candidates found, skipping resolution.")
+        return
+
+    neighbor_attrs = await query_existing_entities(tenant_id, kb_id, list(candidate_neighbors))
+
+    candidate_resolution = defaultdict(list)
+    for a, b in candidate_pairs:
+        type_a = node_attrs.get(a, {}).get("entity_type")
+        if type_a is None and a in neighbor_attrs:
+            try:
+                meta = json.loads(neighbor_attrs[a]["content_with_weight"])
+                type_a = meta.get("entity_type", "-")
+            except Exception:
+                type_a = "-"
+        type_b = node_attrs.get(b, {}).get("entity_type")
+        if type_b is None and b in neighbor_attrs:
+            try:
+                meta = json.loads(neighbor_attrs[b]["content_with_weight"])
+                type_b = meta.get("entity_type", "-")
+            except Exception:
+                type_b = "-"
+        if type_a == type_b and type_a not in excluded_types:
+            candidate_resolution[type_a].append((a, b))
+
+    if not candidate_resolution:
+        logging.info("[P3] No valid candidates after type validation, skipping resolution.")
+        return
+
+    local_graph = nx.Graph()
+    for node_name in union_nodes:
+        if node_name in node_attrs:
+            local_graph.add_node(node_name, **node_attrs[node_name])
+    for node_name, fields in neighbor_attrs.items():
+        try:
+            meta = json.loads(fields["content_with_weight"])
+        except Exception:
+            meta = {}
+        local_graph.add_node(node_name, **meta)
+
+    all_local_nodes = list(local_graph.nodes())
+    rel_fields = await query_node_relations(tenant_id, kb_id, all_local_nodes)
+    for fields in rel_fields:
+        from_node = fields.get("from_entity_kwd")
+        to_node = fields.get("to_entity_kwd")
+        if isinstance(from_node, list):
+            from_node = from_node[0]
+        if isinstance(to_node, list):
+            to_node = to_node[0]
+        if from_node and to_node:
+            try:
+                meta = json.loads(fields["content_with_weight"])
+            except Exception:
+                meta = {}
+            local_graph.add_edge(from_node, to_node, **meta)
+
+    logging.info(
+        "[P3] Recalled %d candidates, local graph: %d nodes, %d edges.",
+        len(candidate_pairs), local_graph.number_of_nodes(), local_graph.number_of_edges(),
+    )
+
+    er = EntityResolution(
+        llm_bdl,
+        excluded_types=excluded_types,
+    )
+    try:
+        reso = await er(
+            local_graph,
+            set(union_nodes),
+            callback=callback,
+            task_id=task_id,
+            candidate_resolution=dict(candidate_resolution),
+        )
+    except Exception as e:
+        logging.warning("P3: EntityResolution failed: %s", e)
+        raise
+
+    change = reso.change
+    logging.info(
+        "[P3] Resolution removed %d nodes and %d edges.",
+        len(change.removed_nodes), len(change.removed_edges),
+    )
+
+    await set_graph(tenant_id, kb_id, embed_bdl, reso.graph, change, callback)
+    now = asyncio.get_running_loop().time()
+    logging.info("[P3] incremental resolution done in %.2fs.", now - start)
+
+
+@timeout(None)
 async def resolve_entities(
     graph,
     subgraph_nodes: set[str],
@@ -765,18 +1543,37 @@ async def resolve_entities(
     embed_bdl,
     callback,
     task_id: str = "",
+    entity_types: list[str] | None = None,
 ):
-    # Check if task has been canceled before resolution
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled during entity resolution.", callback)
 
     start = asyncio.get_running_loop().time()
+
+    if GraphRAGConfig.USE_INCREMENTAL_RESOLUTION:
+        try:
+            await resolve_entities_incremental(
+                tenant_id, kb_id, subgraph_nodes, llm_bdl, embed_bdl, callback,
+                task_id=task_id, entity_types=entity_types,
+            )
+            now = asyncio.get_running_loop().time()
+            callback(msg=f"Graph resolution done in {now - start:.2f}s.")
+            return
+        except Exception as exc:
+            logging.exception(
+                "[P3] incremental resolution failed, will NOT fallback to monolithic: %s",
+                exc,
+            )
+            raise
+
     checkpoints = await load_checkpoints(tenant_id, kb_id, RESOLUTION_CHECKPOINT)
 
     async def save_resolution_checkpoint(checkpoint_key: str, payload):
         return await save_checkpoint(tenant_id, kb_id, RESOLUTION_CHECKPOINT, checkpoint_key, payload)
 
+    from rag.graphrag.entity_resolution import build_excluded_types
     er = EntityResolution(
         llm_bdl,
+        excluded_types=build_excluded_types(entity_types) if GraphRAGConfig.USE_INCREMENTAL_RESOLUTION else None,
     )
     reso = await er(
         graph,
@@ -800,28 +1597,24 @@ async def resolve_entities(
     callback(msg=f"Graph resolution done in {now - start:.2f}s.")
 
 
-@timeout(60 * 30, 1)
-async def extract_community(
-    graph,
+async def _extract_community_core(
+    graph: nx.Graph,
     tenant_id: str,
     kb_id: str,
-    doc_id: str,
     llm_bdl,
-    embed_bdl,
     callback,
     task_id: str = "",
 ):
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before community extraction.", callback)
 
+    """Shared implementation of community detection + indexing."""
     start = asyncio.get_running_loop().time()
     checkpoints = await load_checkpoints(tenant_id, kb_id, COMMUNITY_CHECKPOINT)
 
     async def save_community_checkpoint(checkpoint_key: str, payload):
         return await save_checkpoint(tenant_id, kb_id, COMMUNITY_CHECKPOINT, checkpoint_key, payload)
 
-    ext = CommunityReportsExtractor(
-        llm_bdl,
-    )
+    ext = CommunityReportsExtractor(llm_bdl)
     cr = await ext(
         graph,
         callback=callback,
@@ -834,7 +1627,7 @@ async def extract_community(
 
     community_structure = cr.structured_output
     community_reports = cr.output
-    doc_ids = graph.graph["source_id"]
+    doc_ids = graph.graph.get("source_id", [])
 
     now = asyncio.get_running_loop().time()
     callback(msg=f"Graph extracted {len(cr.structured_output)} communities in {now - start:.2f}s.")
@@ -847,25 +1640,20 @@ async def extract_community(
             "report": rep,
             "evidences": "\n".join([f.get("explanation", "") for f in stru["findings"]]),
         }
-        # Deterministic id derived from (kb_id, community title) so reruns of
-        # extract_community produce stable ids.  Combined with insert-then-
-        # prune below, this means a crash mid-insert leaves the prior set of
-        # community reports intact -- never the partial-delete state the old
-        # delete-then-insert order produced.
         chunk_payload_for_id = {
             "content_with_weight": f"community_report::{stru['title']}",
             "kb_id": kb_id,
         }
         chunk = {
             "id": chunk_id(chunk_payload_for_id),
-            "docnm_kwd": stru["title"],
-            "title_tks": rag_tokenizer.tokenize(stru["title"]),
+            "docnm_kwd": stru['title'],
+            "title_tks": rag_tokenizer.tokenize(stru['title']),
             "content_with_weight": json.dumps(obj, ensure_ascii=False),
             "content_ltks": rag_tokenizer.tokenize(obj["report"] + " " + obj["evidences"]),
             "knowledge_graph_kwd": "community_report",
-            "weight_flt": stru["weight"],
-            "entities_kwd": stru["entities"],
-            "important_kwd": stru["entities"],
+            "weight_flt": stru['weight'],
+            "entities_kwd": stru['entities'],
+            "important_kwd": stru['entities'],
             "kb_id": kb_id,
             "source_id": list(doc_ids),
             "available_int": 0,
@@ -875,10 +1663,6 @@ async def extract_community(
 
     new_ids: set[str] = {c["id"] for c in chunks}
 
-    # Snapshot existing community_report ids BEFORE inserting so we can
-    # delete exactly the stale set afterwards.  If the search fails we fall
-    # back to the prior delete-everything-then-insert behaviour rather than
-    # leaving an inconsistent mix.
     old_ids: list[str] = []
     try:
         existing_res = await thread_pool_exec(
@@ -895,10 +1679,6 @@ async def extract_community(
 
     await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert community reports")
 
-    # Now that all new reports are persisted, prune stale rows.  Anything in
-    # old_ids that is not also in new_ids is no longer current (community
-    # composition changed across runs).  A failure here just leaves stale
-    # rows; the new rows are already in place.
     stale_ids = [i for i in old_ids if i not in new_ids]
     if stale_ids:
         try:
@@ -917,3 +1697,64 @@ async def extract_community(
     now = asyncio.get_running_loop().time()
     callback(msg=f"Graph indexed {len(cr.structured_output)} communities in {now - start:.2f}s.")
     return community_structure, community_reports
+
+
+async def extract_community_indexed(
+    tenant_id: str,
+    kb_id: str,
+    llm_bdl,
+    embed_bdl,
+    callback,
+    task_id: str = "",
+):
+    """Load the full graph from the doc-store index and run community detection.
+
+    This is the P4 async path: it guarantees that community detection sees the
+    complete global topology regardless of whether the caller passed a delta
+    subgraph or a full graph.
+    """
+    start = asyncio.get_running_loop().time()
+    graph = await get_graph_from_index(tenant_id, kb_id)
+    if graph is None or len(graph.nodes) == 0:
+        logging.info("[P4] No graph found in index, skipping community extraction.")
+        return [], []
+
+    logging.info(
+        "[P4] Loaded %d nodes, %d edges from index for community detection in %.2fs.",
+        len(graph.nodes), len(graph.edges), asyncio.get_running_loop().time() - start,
+    )
+    return await _extract_community_core(
+        graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id
+    )
+
+
+@timeout(60 * 30, 1)
+async def extract_community(
+    graph,
+    tenant_id: str,
+    kb_id: str,
+    doc_id: str,
+    llm_bdl,
+    embed_bdl,
+    callback,
+    task_id: str = "",
+):
+    if task_id and has_canceled(task_id):
+        callback(msg=f"Task {task_id} cancelled before community extraction.")
+        raise TaskCanceledException(f"Task {task_id} was cancelled")
+
+    start = asyncio.get_running_loop().time()
+
+    if GraphRAGConfig.USE_ASYNC_COMMUNITY:
+        source_ids = graph.graph.get("source_id", []) if graph else []
+        if len(source_ids) <= 1:
+            logging.info("[P4] Incoming graph appears to be a delta; loading full graph from index.")
+            return await extract_community_indexed(
+                tenant_id, kb_id, llm_bdl, embed_bdl, callback, task_id=task_id
+            )
+        else:
+            logging.info("[P4] Incoming graph appears complete; using it directly for community detection.")
+
+    return await _extract_community_core(
+        graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id
+    )

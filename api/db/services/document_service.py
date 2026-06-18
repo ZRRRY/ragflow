@@ -36,6 +36,7 @@ from common.time_utils import current_timestamp, get_format_time
 
 from rag.nlp import search
 from rag.utils.redis_conn import REDIS_CONN
+from rag.graphrag.config import GraphRAGConfig
 
 
 class DocumentService(CommonService):
@@ -498,20 +499,35 @@ class DocumentService(CommonService):
         # Cleanup knowledge graph references (non-critical, log and continue)
         try:
             if chunk_index_exists:
+                # Phase 2.5: under incremental GraphRAG (delta graph or incremental merge), eagerly
+                # delete the document's subgraph so intermediate products do not linger. In the
+                # official path both switches are off, so we keep the v0.26.0 behavior exactly.
+                delete_subgraph = GraphRAGConfig.DELETE_SUBGRAPH_ON_DOC_DELETE
+                if delete_subgraph:
+                    settings.docStoreConn.delete(
+                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["subgraph"], "source_id": doc.id},
+                        chunk_index_name,
+                        doc.kb_id,
+                    )
+
                 graph_source = settings.docStoreConn.get_fields(
                     settings.docStoreConn.search(["source_id"], [], {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, [], OrderByExpr(), 0, 1, chunk_index_name, [doc.kb_id]),
                     ["source_id"],
                 )
                 if len(graph_source) > 0 and doc.id in list(graph_source.values())[0]["source_id"]:
+                    kg_types = ["entity", "relation", "graph", "community_report"]
+                    if not delete_subgraph:
+                        # v0.26.0 also removes source_id from subgraph chunks before deleting orphans.
+                        kg_types.append("subgraph")
                     settings.docStoreConn.update(
-                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "source_id": doc.id},
+                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": kg_types, "source_id": doc.id},
                         {"remove": {"source_id": doc.id}},
                         chunk_index_name,
                         doc.kb_id,
                     )
                     settings.docStoreConn.update({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
                     settings.docStoreConn.delete(
-                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "must_not": {"exists": "source_id"}},
+                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": kg_types, "must_not": {"exists": "source_id"}},
                         chunk_index_name,
                         doc.kb_id,
                     )

@@ -3,7 +3,9 @@ import {
   useGetPaginationWithRouter,
   useHandleSearchChange,
 } from '@/hooks/logic-hooks';
+import { IDataset } from '@/interfaces/database/dataset';
 import {
+  getKbDetail,
   getKnowledgeBasicInfo,
   listDataPipelineLogDocument,
 } from '@/services/knowledge-service';
@@ -12,6 +14,15 @@ import { useCallback, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router';
 import { LogTabs } from './dataset-common';
 import { IFileLogList, IOverviewTotal } from './interface';
+
+const enum DatasetOverviewApiAction {
+  FetchDatasetChunkCount = 'fetchDatasetChunkCount',
+}
+
+const DatasetOverviewKeys = {
+  chunkCount: (datasetId?: string) =>
+    [DatasetOverviewApiAction.FetchDatasetChunkCount, datasetId] as const,
+};
 
 const useFetchOverviewTotal = () => {
   const [searchParams] = useSearchParams();
@@ -24,6 +35,26 @@ const useFetchOverviewTotal = () => {
         knowledgeBaseId || '',
       );
       return res.data || [];
+    },
+  });
+  return { data };
+};
+
+// Mirrors the file-count strategy used in this page: fetched once on mount
+// with no active polling — see useFetchDocumentList(false). The dataset
+// detail (which carries chunk_count) is invalidated by the document list
+// when docs change, so the count refreshes on cache invalidation only.
+const useFetchDatasetChunkCount = () => {
+  const [searchParams] = useSearchParams();
+  const { id } = useParams();
+  const knowledgeBaseId = searchParams.get('id') || id;
+  const { data } = useQuery<number>({
+    queryKey: DatasetOverviewKeys.chunkCount(knowledgeBaseId),
+    enabled: !!knowledgeBaseId,
+    queryFn: async () => {
+      const { data: res = {} } = await getKbDetail(knowledgeBaseId || '');
+      const detail: IDataset | undefined = res.data;
+      return detail?.chunk_count ?? 0;
     },
   });
   return { data };
@@ -92,4 +123,8 @@ const useFetchFileLogList = () => {
   };
 };
 
-export { useFetchFileLogList, useFetchOverviewTotal };
+export {
+  useFetchDatasetChunkCount,
+  useFetchFileLogList,
+  useFetchOverviewTotal,
+};

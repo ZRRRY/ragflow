@@ -474,6 +474,114 @@ class OSConnection(DocStoreConnection):
         logger.error(f"OSConnection.search timeout for {ATTEMPT_TIME} times!")
         raise Exception("OSConnection.search timeout.")
 
+    def knn_search_entities(
+        self,
+        index_names: str | list[str],
+        knowledgebase_ids: list[str],
+        vector: list[float],
+        vector_column_name: str,
+        k: int,
+        min_score: float | None = None,
+        entity_type: str | None = None,
+        exclude_name: str | None = None,
+    ) -> dict:
+        """OpenSearch KNN query for entity chunks.
+
+        Returns the raw OpenSearch response so callers can use
+        ``get_fields()`` / ``get_scores()`` on it.
+        """
+        if isinstance(index_names, str):
+            index_names = index_names.split(",")
+
+        filter_must = [
+            {"terms": {"kb_id": knowledgebase_ids}},
+            {"terms": {"knowledge_graph_kwd": ["entity"]}},
+        ]
+        if entity_type:
+            filter_must.append({"term": {"entity_type_kwd": entity_type}})
+
+        knn_body = {
+            "query": {
+                "knn": {
+                    vector_column_name: {
+                        "vector": list(vector),
+                        "k": k,
+                        "filter": {"bool": {"must": filter_must}},
+                    }
+                }
+            }
+        }
+        if min_score is not None:
+            knn_body["query"]["knn"][vector_column_name]["min_score"] = min_score
+        if exclude_name:
+            knn_body["query"]["knn"][vector_column_name]["filter"]["bool"]["must_not"] = [
+                {"term": {"entity_kwd": exclude_name}}
+            ]
+
+        for i in range(ATTEMPT_TIME):
+            try:
+                res = self.os.search(
+                    index=index_names,
+                    body=knn_body,
+                    timeout=600,
+                    track_total_hits=True,
+                    _source=True,
+                )
+                logger.debug(f"OSConnection.knn_search_entities {str(index_names)} res: " + str(res))
+                return res
+            except Exception as e:
+                logger.exception(
+                    f"OSConnection.knn_search_entities {str(index_names)} query: " + str(knn_body)
+                )
+                if str(e).find("Timeout") > 0:
+                    continue
+                raise e
+        logger.error(f"OSConnection.knn_search_entities timeout for {ATTEMPT_TIME} times!")
+        raise Exception("OSConnection.knn_search_entities timeout.")
+
+    def search_with_scroll(self, index_names, query_body: dict, fields: list[str], scroll_timeout="2m", batch_size=1000):
+        """Use OpenSearch scroll API to fetch all results safely.
+
+        This bypasses the index.max_result_window limit and is suitable
+        for retrieving large result sets (e.g. GraphRAG entity/relation
+        chunks) without causing OpenSearch OOM or connection storms.
+        """
+        scroll_id = None
+        try:
+            res = self.os.search(
+                index=index_names,
+                body=query_body,
+                scroll=scroll_timeout,
+                size=batch_size,
+                _source=True,
+            )
+            scroll_id = res.get("_scroll_id")
+            hits = res["hits"]["hits"]
+
+            while True:
+                page = self.os.scroll(scroll_id=scroll_id, scroll=scroll_timeout)
+                page_hits = page["hits"]["hits"]
+                if not page_hits:
+                    break
+                hits.extend(page_hits)
+                scroll_id = page.get("_scroll_id")
+                if not scroll_id:
+                    break
+
+            # Return format compatible with __getSource / get_fields
+            return {"hits": {"hits": hits}}
+        except Exception as e:
+            logger.exception(
+                f"OSConnection.search_with_scroll {str(index_names)} query: " + json.dumps(query_body)
+            )
+            raise e
+        finally:
+            if scroll_id:
+                try:
+                    self.os.clear_scroll(scroll_id=scroll_id)
+                except Exception:
+                    pass
+
     def get(self, chunkId: str, indexName: str, knowledgebaseIds: list[str]) -> dict | None:
         for i in range(ATTEMPT_TIME):
             try:
@@ -513,9 +621,14 @@ class OSConnection(DocStoreConnection):
         for _ in range(ATTEMPT_TIME):
             try:
                 res = []
+                # Phase 2.1: refresh="wait_for" -> "false"
+                # OpenSearch 默认 refresh_interval=1s，每批 bulk 等 1-2s refresh
+                # 在 100w+ chunks 的 KB 上浪费 4-8 小时。改 false 后由调用方在
+                # 全部 batch 写完时主动 refresh 一次（见 set_graph_delta/set_graph_monolithic）。
+                # 中间查询的 stale 风险靠 OpenSearch 默认 1s 自然 refresh 兜底。
                 r = self.os.bulk(index=(indexName), body=operations,
-                                 refresh="wait_for", timeout=60)
-                if re.search(r"False", str(r["errors"]), re.IGNORECASE):
+                                 refresh="false", timeout=300)
+                if not r["errors"]:
                     return res
 
                 for item in r["items"]:
@@ -835,6 +948,51 @@ class OSConnection(DocStoreConnection):
             return list()
         bkts = res["aggregations"][agg_field]["buckets"]
         return [(b["key"], b["doc_count"]) for b in bkts]
+
+    def count(self, condition: dict, indexName: str, knowledgebaseIds: list[str]) -> int:
+        assert "_id" not in condition
+        cond = condition.copy()
+        cond["kb_id"] = knowledgebaseIds
+
+        bqry = Q("bool", must=[])
+        for k, v in cond.items():
+            if k == "available_int":
+                if v == 0:
+                    bqry.filter.append(Q("range", available_int={"lt": 1}))
+                else:
+                    bqry.filter.append(
+                        Q("bool", must_not=Q("range", available_int={"lt": 1})))
+                continue
+            if not v:
+                continue
+            if isinstance(v, list):
+                bqry.filter.append(Q("terms", **{k: v}))
+            elif isinstance(v, str) or isinstance(v, int):
+                bqry.filter.append(Q("term", **{k: v}))
+            else:
+                raise Exception(
+                    f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
+
+        if not bqry.filter and not bqry.must and not bqry.must_not:
+            qry = {"match_all": {}}
+        else:
+            qry = bqry.to_dict()
+        body = {"query": qry}
+        logger.debug(f"OSConnection.count {indexName} query: " + json.dumps(body))
+
+        for i in range(ATTEMPT_TIME):
+            try:
+                res = self.os.count(index=indexName, body=body)
+                return int(res.get("count", 0))
+            except NotFoundError:
+                return 0
+            except Exception as e:
+                logger.exception(f"OSConnection.count {indexName} query: " + json.dumps(body))
+                if str(e).find("Timeout") > 0:
+                    continue
+                raise e
+        logger.error(f"OSConnection.count timeout for {ATTEMPT_TIME} times!")
+        raise Exception("OSConnection.count timeout.")
 
     """
     SQL

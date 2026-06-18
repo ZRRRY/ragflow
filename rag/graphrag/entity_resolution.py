@@ -29,6 +29,7 @@ import editdistance
 from rag.graphrag.entity_resolution_prompt import ENTITY_RESOLUTION_PROMPT
 from rag.graphrag.checkpoints import resolution_checkpoint_key
 from rag.llm.chat_model import Base as CompletionLLM
+from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.utils import perform_variable_replacements, chat_limiter, GraphChange
 from api.db.services.task_service import has_canceled
 from common.exceptions import TaskCanceledException
@@ -37,6 +38,68 @@ from common.exceptions import TaskCanceledException
 DEFAULT_RECORD_DELIMITER = "##"
 DEFAULT_ENTITY_INDEX_DELIMITER = "<|>"
 DEFAULT_RESOLUTION_RESULT_DELIMITER = "&&"
+
+# Entity types that should skip resolution (book and chapter nodes are
+# intentionally kept separate even if they share names across documents).
+EXCLUDED_RESOLUTION_TYPES = {"书籍", "章节"}
+
+
+def _has_digit_in_2gram_diff(a, b):
+    def to_2gram_set(s):
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+
+    set_a = to_2gram_set(a)
+    set_b = to_2gram_set(b)
+    diff = set_a ^ set_b
+    return any(any(c.isdigit() for c in pair) for pair in diff)
+
+
+def is_similarity_str(a, b):
+    """Module-level character-level similarity check."""
+    if _has_digit_in_2gram_diff(a, b):
+        return False
+
+    if is_english(a) and is_english(b):
+        if editdistance.eval(a, b) <= min(len(a), len(b)) // 2:
+            return True
+        return False
+
+    a, b = set(a), set(b)
+    max_l = max(len(a), len(b))
+    if max_l < 4:
+        return len(a & b) > 1
+
+    return len(a & b) * 1.0 / max_l >= 0.8
+
+
+_EXCLUDED_TYPE_ALIASES = {
+    "书籍": {"书籍", "book", "books", "Book", "Books", "BOOK"},
+    "章节": {"章节", "chapter", "chapters", "Chapter", "Chapters", "CHAPTER",
+             "section", "sections", "Section", "Sections", "SECTION"},
+}
+
+
+def build_excluded_types(excluded_from_config: list[str] | None = None) -> set[str]:
+    """Build the set of entity types that should skip resolution.
+
+    Expands common aliases so English ``entity_types`` like ``Book``/``Chapter``
+    are handled the same way as the Chinese defaults.
+    """
+    result: set[str] = set(EXCLUDED_RESOLUTION_TYPES)
+    if not excluded_from_config:
+        return result
+    for cfg_type in excluded_from_config:
+        if not isinstance(cfg_type, str):
+            continue
+        cfg_type_stripped = cfg_type.strip()
+        if not cfg_type_stripped:
+            continue
+        result.add(cfg_type_stripped)
+        for canonical, aliases in _EXCLUDED_TYPE_ALIASES.items():
+            all_aliases_lower = {a.lower() for a in aliases}
+            if cfg_type_stripped.lower() in all_aliases_lower:
+                result.update(aliases)
+    return result
 
 
 @dataclass
@@ -58,6 +121,7 @@ class EntityResolution(Extractor):
     def __init__(
             self,
             llm_invoker: CompletionLLM,
+            excluded_types: set[str] | None = None,
     ):
         super().__init__(llm_invoker)
         """Init method definition."""
@@ -67,12 +131,14 @@ class EntityResolution(Extractor):
         self._entity_index_delimiter_key = "entity_index_delimiter"
         self._resolution_result_delimiter_key = "resolution_result_delimiter"
         self._input_text_key = "input_text"
+        self._excluded_types = excluded_types if excluded_types is not None else set()
 
     async def __call__(self, graph: nx.Graph,
                        subgraph_nodes: set[str],
                        prompt_variables: dict[str, Any] | None = None,
                        callback: Callable | None = None,
                        task_id: str = "",
+                       candidate_resolution: dict[str, list[tuple[str, str]]] | None = None,
                        checkpoints: dict[str, Any] | None = None,
                        save_checkpoint: Callable[[str, Any], Awaitable[bool]] | None = None) -> EntityResolutionResult:
         """Call method definition."""
@@ -91,23 +157,43 @@ class EntityResolution(Extractor):
         }
 
         nodes = sorted(graph.nodes())
-        entity_types = sorted(set(graph.nodes[node].get('entity_type', '-') for node in nodes))
+        entity_types = sorted(
+            etype for etype in set(graph.nodes[node].get('entity_type', '-') for node in nodes)
+            if etype not in self._excluded_types
+        )
         node_clusters = {entity_type: [] for entity_type in entity_types}
 
         for node in nodes:
-            node_clusters[graph.nodes[node].get('entity_type', '-')].append(node)
+            etype = graph.nodes[node].get('entity_type', '-')
+            if etype in self._excluded_types:
+                continue
+            node_clusters[etype].append(node)
 
-        candidate_resolution = {entity_type: [] for entity_type in entity_types}
-        for k, v in node_clusters.items():
-            candidate_resolution[k] = [(a, b) for a, b in itertools.combinations(v, 2) if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)]
+        if candidate_resolution is not None:
+            candidate_resolution = {
+                etype: [
+                    (a, b) for a, b in pairs
+                    if etype not in self._excluded_types
+                    and (a in subgraph_nodes or b in subgraph_nodes)
+                    and self.is_similarity(a, b)
+                ]
+                for etype, pairs in candidate_resolution.items()
+            }
+        else:
+            candidate_resolution = {entity_type: [] for entity_type in entity_types}
+            for k, v in node_clusters.items():
+                candidate_resolution[k] = [
+                    (a, b) for a, b in itertools.combinations(v, 2)
+                    if (a in subgraph_nodes or b in subgraph_nodes) and self.is_similarity(a, b)
+                ]
         num_candidates = sum([len(candidates) for _, candidates in candidate_resolution.items()])
         callback(msg=f"Identified {num_candidates} candidate pairs")
         remain_candidates_to_resolve = num_candidates
 
         resolution_result = set()
         resolution_result_lock = asyncio.Lock()
-        resolution_batch_size = 100
-        max_concurrent_tasks = 5
+        resolution_batch_size = getattr(GraphRAGConfig, "RESOLUTION_BATCH_SIZE", 100) or 100
+        max_concurrent_tasks = getattr(GraphRAGConfig, "RESOLUTION_MAX_CONCURRENT_TASKS", 5) or 5
         semaphore = asyncio.Semaphore(max_concurrent_tasks)
         checkpoints = checkpoints or {}
 

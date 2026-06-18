@@ -375,6 +375,9 @@ def init_settings():
         STORAGE_IMPL = storage_impl
 
     global retriever, kg_retriever
+    from common.doc_store_audit import install as install_docstore_audit
+    install_docstore_audit(docStoreConn)
+
     retriever = search.Dealer(docStoreConn)
     from rag.graphrag import search as kg_search
 
