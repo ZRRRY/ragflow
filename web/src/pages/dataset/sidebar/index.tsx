@@ -1,5 +1,3 @@
-import { isEmpty } from 'lodash';
-
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -14,7 +12,7 @@ import { IconFontFill } from '@/components/icon-font';
 import { RAGFlowAvatar } from '@/components/ragflow-avatar';
 import { Button } from '@/components/ui/button';
 import { useSecondPathName } from '@/hooks/route-hook';
-import { useFetchKnowledgeGraph } from '@/hooks/use-knowledge-request';
+import { useFetchKnowledgeGraphStatus } from '@/hooks/use-knowledge-request';
 import { cn, formatBytes } from '@/lib/utils';
 import { Routes } from '@/routes';
 import { formatPureDate } from '@/utils/date';
@@ -30,8 +28,8 @@ type PropType = {
 export function SideBar({ dataset: data }: PropType) {
   const pathName = useSecondPathName();
   const { id } = useParams();
-  const { data: routerData } = useFetchKnowledgeGraph();
   const { t } = useTranslation();
+  const { data: statusData } = useFetchKnowledgeGraphStatus();
 
   const items = useMemo(() => {
     const list = [
@@ -57,7 +55,7 @@ export function SideBar({ dataset: data }: PropType) {
       },
     ];
 
-    if (!isEmpty(routerData?.graph)) {
+    if (statusData?.exists) {
       list.push({
         icon: <IconFontFill name="knowledgegraph" className="size-[1em]" />,
         label: t(`knowledgeDetails.knowledgeGraph`),
@@ -66,7 +64,7 @@ export function SideBar({ dataset: data }: PropType) {
     }
 
     return list;
-  }, [t, routerData]);
+  }, [t, statusData]);
 
   return (
     <aside className="flex flex-col w-64 relative">

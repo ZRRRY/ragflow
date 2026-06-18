@@ -462,12 +462,24 @@ class OSConnection(DocStoreConnection):
         logger.error(f"OSConnection.knn_search_entities timeout for {ATTEMPT_TIME} times!")
         raise Exception("OSConnection.knn_search_entities timeout.")
 
-    def search_with_scroll(self, index_names, query_body: dict, fields: list[str], scroll_timeout="2m", batch_size=1000):
-        """Use OpenSearch scroll API to fetch all results safely.
+    def search_with_scroll(
+        self,
+        index_names,
+        query_body: dict,
+        fields: list[str],
+        scroll_timeout="2m",
+        batch_size=1000,
+        max_results: int | None = None,
+    ):
+        """Use OpenSearch scroll API to fetch results safely.
 
         This bypasses the index.max_result_window limit and is suitable
         for retrieving large result sets (e.g. GraphRAG entity/relation
         chunks) without causing OpenSearch OOM or connection storms.
+
+        :param max_results: If set, stop scrolling once this many hits have
+            been collected and return early. Useful for visualization APIs
+            that only need a sampled subset of a very large index.
         """
         scroll_id = None
         try:
@@ -480,6 +492,8 @@ class OSConnection(DocStoreConnection):
             )
             scroll_id = res.get("_scroll_id")
             hits = res["hits"]["hits"]
+            if max_results is not None and len(hits) >= max_results:
+                return {"hits": {"hits": hits[:max_results]}}
 
             while True:
                 page = self.os.scroll(scroll_id=scroll_id, scroll=scroll_timeout)
@@ -487,6 +501,9 @@ class OSConnection(DocStoreConnection):
                 if not page_hits:
                     break
                 hits.extend(page_hits)
+                if max_results is not None and len(hits) >= max_results:
+                    hits = hits[:max_results]
+                    break
                 scroll_id = page.get("_scroll_id")
                 if not scroll_id:
                     break

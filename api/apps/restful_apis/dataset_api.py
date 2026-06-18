@@ -561,6 +561,27 @@ async def get_knowledge_graph(tenant_id, dataset_id):
         return get_error_data_result(message="Internal server error")
 
 
+@manager.route("/datasets/<dataset_id>/graph/status", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def get_knowledge_graph_status(tenant_id, dataset_id):
+    """Check whether a knowledge graph exists for a dataset.
+
+    GET /api/v1/datasets/<dataset_id>/graph/status
+    Success: {"code": 0, "data": {"exists": true|false}}
+    Errors: AUTHENTICATION_ERROR for access denied; DATA_ERROR for internal errors.
+    """
+    try:
+        success, result = await dataset_api_service.get_knowledge_graph_status(dataset_id, tenant_id)
+        if success:
+            return get_result(data=result)
+        else:
+            return get_result(data=False, message=result, code=RetCode.AUTHENTICATION_ERROR)
+    except Exception as e:
+        logging.exception(e)
+        return get_error_data_result(message="Internal server error")
+
+
 @manager.route("/datasets/<dataset_id>/graph/export", methods=["GET"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs

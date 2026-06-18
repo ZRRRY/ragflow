@@ -250,6 +250,10 @@ export function getKnowledgeGraph(knowledgeId: string) {
   return request.get(api.getKnowledgeGraph(knowledgeId));
 }
 
+export function getKnowledgeGraphStatus(knowledgeId: string) {
+  return request.get(api.getKnowledgeGraphStatus(knowledgeId));
+}
+
 export function deleteKnowledgeGraph(knowledgeId: string) {
   return request.delete(api.knowledgeGraph(knowledgeId));
 }

@@ -25,7 +25,11 @@ from api.db.joint_services.tenant_model_service import get_model_config_from_pro
 from common.constants import PAGERANK_FLD
 from common import settings
 from networkx.readwrite import json_graph
-from rag.graphrag.utils import get_graph_from_index, get_graph_from_json
+from rag.graphrag.utils import (
+    get_graph_from_index,
+    get_graph_from_index_for_visualization,
+    get_graph_from_json,
+)
 from api.db.db_models import File
 from api.db.services.document_service import DocumentService, queue_raptor_o_graphrag_tasks
 from api.db.services.file2document_service import File2DocumentService
@@ -448,7 +452,20 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
     if not KnowledgebaseService.accessible(dataset_id, tenant_id):
         return False, "No authorization."
 
-    obj = await _fetch_raw_knowledge_graph(dataset_id, tenant_id)
+    from rag.graphrag.config import GraphRAGConfig
+
+    if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
+        # Incremental mode: entity/relation chunks are stored separately.
+        # Use a visualization-optimized path that loads only a sampled subset
+        # instead of scanning the entire index.
+        _, kb = KnowledgebaseService.get_by_id(dataset_id)
+        graph = await get_graph_from_index_for_visualization(kb.tenant_id, dataset_id)
+        obj = {"graph": {}, "mind_map": {}}
+        if graph is not None and len(graph.nodes) > 0:
+            obj["graph"] = json_graph.node_link_data(graph, edges="edges")
+    else:
+        # Legacy mode: keep the existing behavior unchanged.
+        obj = await _fetch_raw_knowledge_graph(dataset_id, tenant_id)
 
     if "nodes" in obj["graph"]:
         all_nodes = obj["graph"]["nodes"]
@@ -464,6 +481,50 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
             filtered_edges = [o for o in obj["graph"]["edges"] if o["source"] != o["target"] and o["source"] in node_id_set and o["target"] in node_id_set]
             obj["graph"]["edges"] = sorted(filtered_edges, key=lambda x: x.get("weight", 0), reverse=True)[:256]
     return True, obj
+
+
+async def get_knowledge_graph_status(dataset_id: str, tenant_id: str):
+    """
+    Lightweight check to see whether a knowledge graph exists for a dataset.
+
+    Unlike ``get_knowledge_graph``, this function does not load, assemble or
+    return any graph data. It only returns a boolean ``exists`` flag, making
+    it cheap enough to be called from the sidebar on every dataset sub-page.
+
+    :param dataset_id: dataset ID
+    :param tenant_id: tenant ID
+    :return: (success, {"exists": bool}) or (success, error_message)
+    """
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return False, "No authorization."
+
+    _, kb = KnowledgebaseService.get_by_id(dataset_id)
+    from rag.nlp import search
+
+    idx_name = search.index_name(kb.tenant_id)
+    if not settings.docStoreConn.index_exist(idx_name, dataset_id):
+        return True, {"exists": False}
+
+    # Legacy / default mode: a single monolithic graph blob.
+    conds = {
+        "fields": ["id"],
+        "size": 1,
+        "kb_id": [dataset_id],
+        "knowledge_graph_kwd": ["graph"],
+    }
+    res = await settings.retriever.search(conds, idx_name, [dataset_id])
+    if res.total > 0:
+        return True, {"exists": True}
+
+    # Incremental mode: entity/relation chunks.
+    conds = {
+        "fields": ["id"],
+        "size": 1,
+        "kb_id": [dataset_id],
+        "knowledge_graph_kwd": ["entity"],
+    }
+    res = await settings.retriever.search(conds, idx_name, [dataset_id])
+    return True, {"exists": res.total > 0}
 
 
 async def get_knowledge_graph_full(dataset_id: str, tenant_id: str):

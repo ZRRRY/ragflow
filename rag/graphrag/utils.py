@@ -1032,8 +1032,136 @@ async def get_graph_from_index(tenant_id, kb_id):
     return graph
 
 
-async def get_graph_from_json(tenant_id, kb_id, exclude_rebuild=None):
-    """Legacy path: load the monolithic graph JSON blob."""
+async def get_graph_from_index_for_visualization(
+    tenant_id, kb_id, max_nodes=256, max_edges=256, scan_limit=5000
+):
+    """Assemble a truncated graph for visualization from indexed chunks.
+
+    Unlike ``get_graph_from_index``, this function does **not** load the full
+    entity/relation index. It samples up to ``scan_limit`` entities, keeps the
+    top ``max_nodes`` by pagerank, and only fetches relations between those
+    selected nodes. This keeps the visualization API memory-safe even for
+    very large knowledge graphs in incremental mode.
+    """
+    graph = nx.Graph()
+    graph.graph["source_id"] = []
+    seen_sources = set()
+
+    # 1. Sample entities without loading the entire index.
+    ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
+    ent_query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"kb_id": [kb_id]}},
+                    {"terms": {"knowledge_graph_kwd": ["entity"]}},
+                ]
+            }
+        }
+    }
+
+    es_res = await thread_pool_exec(
+        settings.docStoreConn.search_with_scroll,
+        search.index_name(tenant_id),
+        ent_query,
+        ent_flds,
+        batch_size=1000,
+        max_results=scan_limit,
+    )
+    es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
+
+    candidate_nodes = []
+    for _cid, d in es_res.items():
+        try:
+            meta = json.loads(d["content_with_weight"])
+            ent_name = d["entity_kwd"]
+            if isinstance(ent_name, list):
+                ent_name = ent_name[0] if ent_name else None
+            if not ent_name:
+                continue
+            pagerank = float(meta.get("pagerank", 0) or 0)
+            candidate_nodes.append((ent_name, pagerank, meta))
+            for sid in meta.get("source_id", []):
+                seen_sources.add(sid)
+        except Exception:
+            logging.exception("Failed to parse entity chunk %s", _cid)
+            continue
+
+    if not candidate_nodes:
+        return None
+
+    # Keep the top-ranked nodes for visualization.
+    candidate_nodes.sort(key=lambda x: x[1], reverse=True)
+    top_nodes = candidate_nodes[:max_nodes]
+    node_set = {name for name, _, _ in top_nodes}
+
+    for ent_name, _, meta in top_nodes:
+        graph.add_node(ent_name, **meta)
+
+    # 2. Fetch only relations whose endpoints are both in the selected node set.
+    rel_flds = ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"]
+    rel_condition = {
+        "kb_id": [kb_id],
+        "knowledge_graph_kwd": ["relation"],
+        "from_entity_kwd": list(node_set),
+        "to_entity_kwd": list(node_set),
+    }
+
+    rel_res = await thread_pool_exec(
+        settings.docStoreConn.search,
+        rel_flds,
+        [],
+        rel_condition,
+        [],
+        OrderByExpr(),
+        0,
+        max_edges * 2,
+        search.index_name(tenant_id),
+        [kb_id],
+    )
+    rel_fields = settings.docStoreConn.get_fields(rel_res, rel_flds)
+
+    kept_edges = 0
+    for _cid, d in rel_fields.items():
+        try:
+            meta = json.loads(d["content_with_weight"])
+            from_node = d["from_entity_kwd"]
+            to_node = d["to_entity_kwd"]
+            if isinstance(from_node, list):
+                from_node = from_node[0] if from_node else None
+            if isinstance(to_node, list):
+                to_node = to_node[0] if to_node else None
+            if (
+                from_node
+                and to_node
+                and from_node in node_set
+                and to_node in node_set
+            ):
+                graph.add_edge(from_node, to_node, **meta)
+                kept_edges += 1
+                if kept_edges >= max_edges:
+                    break
+            for sid in meta.get("source_id", []):
+                seen_sources.add(sid)
+        except Exception:
+            logging.exception("Failed to parse relation chunk %s", _cid)
+            continue
+
+    graph.graph["source_id"] = sorted(seen_sources)
+    logging.info(
+        "get_graph_from_index_for_visualization: kb=%s nodes=%d edges=%d sources=%d",
+        kb_id, len(graph.nodes), len(graph.edges), len(seen_sources),
+    )
+    return graph
+
+
+async def get_graph_from_json(tenant_id, kb_id, exclude_rebuild=None, allow_rebuild=True):
+    """Legacy path: load the monolithic graph JSON blob.
+
+    :param allow_rebuild: When False, skip the expensive rebuild from subgraph
+        chunks and only return the persisted blob. This is used by the
+        visualization API to avoid scanning the entire doc store.
+    """
     conds = {"fields": ["content_with_weight", "removed_kwd", "source_id"], "size": 1, "knowledge_graph_kwd": ["graph"]}
     res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
     if not res.total == 0:
@@ -1043,8 +1171,10 @@ async def get_graph_from_json(tenant_id, kb_id, exclude_rebuild=None):
                     g = json_graph.node_link_graph(json.loads(res.field[id]["content_with_weight"]), edges="edges")
                     if "source_id" not in g.graph:
                         g.graph["source_id"] = res.field[id]["source_id"]
-                else:
+                elif allow_rebuild:
                     g = await rebuild_graph(tenant_id, kb_id, exclude_rebuild)
+                else:
+                    continue
                 return g
             except Exception:
                 continue

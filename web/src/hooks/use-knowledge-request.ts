@@ -16,6 +16,7 @@ import kbService, {
   deleteKnowledgeGraph,
   getKbDetail,
   getKnowledgeGraph,
+  getKnowledgeGraphStatus,
   listDataset,
   listTag,
   removeTag,
@@ -47,6 +48,7 @@ export const enum KnowledgeApiAction {
   SaveKnowledge = 'saveKnowledge',
   FetchKnowledgeDetail = 'fetchKnowledgeDetail',
   FetchKnowledgeGraph = 'fetchKnowledgeGraph',
+  FetchKnowledgeGraphStatus = 'fetchKnowledgeGraphStatus',
   FetchMetadata = 'fetchMetadata',
   FetchMetadataKeys = 'fetchMetadataKeys',
   FetchKnowledgeList = 'fetchKnowledgeList',
@@ -360,6 +362,24 @@ export function useFetchKnowledgeGraph() {
   return { data, loading };
 }
 
+export function useFetchKnowledgeGraphStatus() {
+  const knowledgeBaseId = useKnowledgeBaseId();
+
+  const { data, isFetching: loading } = useQuery<{ exists: boolean }>({
+    queryKey: [KnowledgeApiAction.FetchKnowledgeGraphStatus, knowledgeBaseId],
+    initialData: { exists: false },
+    enabled: !!knowledgeBaseId,
+    gcTime: 0,
+    queryFn: async () => {
+      const { data: responseData } =
+        await getKnowledgeGraphStatus(knowledgeBaseId);
+      return responseData?.data ?? { exists: false };
+    },
+  });
+
+  return { data, loading };
+}
+
 export function useFetchKnowledgeMetadata(kbIds: string[] = []) {
   const { data, isFetching: loading } = useQuery<
     Record<string, Record<string, string[]>>
@@ -413,6 +433,9 @@ export const useRemoveKnowledgeGraph = () => {
         message.success(i18n.t(`message.deleted`));
         queryClient.invalidateQueries({
           queryKey: [KnowledgeApiAction.FetchKnowledgeGraph],
+        });
+        queryClient.invalidateQueries({
+          queryKey: [KnowledgeApiAction.FetchKnowledgeGraphStatus],
         });
       }
       return data?.code;

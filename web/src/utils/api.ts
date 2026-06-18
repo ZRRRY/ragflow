@@ -102,6 +102,8 @@ export default {
   getKbDetail: (datasetId: string) => `${restAPIv1}/datasets/${datasetId}`,
   getKnowledgeGraph: (knowledgeId: string) =>
     `${restAPIv1}/datasets/${knowledgeId}/graph`,
+  getKnowledgeGraphStatus: (knowledgeId: string) =>
+    `${restAPIv1}/datasets/${knowledgeId}/graph/status`,
   knowledgeGraph: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/graph`,
   deleteKnowledgeGraph: (knowledgeId: string) =>
