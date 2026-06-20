@@ -1,0 +1,20 @@
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+index c3b720811..d78b8713d 100644
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -1905,6 +1905,15 @@ async def main():
+     logging.error("BUG!!! You should not reach here!!!")
+ 
+ 
++# === CUSTOM BEGIN [graphrag-task-extras] ===
++# 原因：隔离 GraphRAG 增量/优化相关的 task_executor 自定义逻辑
++# 日期：2026-06-20
++# 关联：rag/svr/task_executor_extras.py
++from rag.svr.task_executor_extras import patch_task_executor
++patch_task_executor()
++# === CUSTOM END [graphrag-task-extras] ===
++
++
+ if __name__ == "__main__":
+     # Parse command line arguments (consistent with SAAS version)
+     parser = argparse.ArgumentParser(description="Task Executor")

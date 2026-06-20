@@ -1,0 +1,80 @@
+diff --git a/rag/graphrag/utils.py b/rag/graphrag/utils.py
+index 038646199..fdbf9a5be 100644
+--- a/rag/graphrag/utils.py
++++ b/rag/graphrag/utils.py
+@@ -34,6 +34,12 @@ from rag.nlp import rag_tokenizer, search
+ from rag.utils.redis_conn import REDIS_CONN
+ from common import settings
+ from common.doc_store.doc_store_base import OrderByExpr
++# === CUSTOM BEGIN [graphrag-incremental] ===
++# 原因：增量/优化功能开关，用于 utils 路由
++# 日期：2026-06-20
++# 关联：rag/graphrag/utils_extras.py
++from rag.graphrag.config import GraphRAGConfig
++# === CUSTOM END [graphrag-incremental] ===
+ 
+ GRAPH_FIELD_SEP = "<SEP>"
+ 
+@@ -467,6 +473,14 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
+ 
+ async def does_graph_contains(tenant_id, kb_id, doc_id):
+     # Get doc_ids of graph
++    # === CUSTOM BEGIN [graphrag-incremental] ===
++    # 原因：增量/优化路径路由到自定义模块
++    # 日期：2026-06-20
++    # 关联：rag/graphrag/utils_extras.py
++    if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
++        from rag.graphrag import utils_extras
++        return await utils_extras.does_graph_contains(tenant_id, kb_id, doc_id)
++    # === CUSTOM END [graphrag-incremental] ===
+     fields = ["source_id"]
+     condition = {
+         "knowledge_graph_kwd": ["graph"],
+@@ -495,7 +509,8 @@ async def get_graph_doc_ids(tenant_id, kb_id) -> list[str]:
+     return doc_ids
+ 
+ 
+-async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
++async def get_graph_from_json(tenant_id, kb_id, exclude_rebuild=None):
++    """Legacy path: load the monolithic graph JSON blob."""
+     conds = {"fields": ["content_with_weight", "removed_kwd", "source_id"], "size": 1, "knowledge_graph_kwd": ["graph"]}
+     res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+     if not res.total == 0:
+@@ -514,7 +529,19 @@ async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
+     return result
+ 
+ 
+-async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
++async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
++    # === CUSTOM BEGIN [graphrag-incremental] ===
++    # 原因：增量/优化路径路由到自定义模块
++    # 日期：2026-06-20
++    # 关联：rag/graphrag/utils_extras.py
++    if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
++        from rag.graphrag import utils_extras
++        return await utils_extras.get_graph(tenant_id, kb_id, exclude_rebuild)
++    # === CUSTOM END [graphrag-incremental] ===
++    return await get_graph_from_json(tenant_id, kb_id, exclude_rebuild)
++
++
++async def _set_graph_impl(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
+     global chat_limiter
+     start = asyncio.get_running_loop().time()
+ 
+@@ -662,6 +689,16 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
+         callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
+ 
+ 
++async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
++    # === CUSTOM BEGIN [graphrag-incremental] ===
++    # 原因：GraphRAG 增量/优化写入路由到自定义模块
++    # 日期：2026-06-20
++    # 关联：rag/graphrag/utils_extras.py
++    from rag.graphrag import utils_extras
++    return await utils_extras.set_graph(tenant_id, kb_id, embd_mdl, graph, change, callback)
++    # === CUSTOM END [graphrag-incremental] ===
++
++
+ def is_continuous_subsequence(subseq, seq):
+     def find_all_indexes(tup, value):
+         indexes = []

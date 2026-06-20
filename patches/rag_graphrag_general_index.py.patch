@@ -1,0 +1,18 @@
+diff --git a/rag/graphrag/general/index.py b/rag/graphrag/general/index.py
+index 9c00ae28e..7e8637b2a 100644
+--- a/rag/graphrag/general/index.py
++++ b/rag/graphrag/general/index.py
+@@ -917,3 +917,13 @@ async def extract_community(
+     now = asyncio.get_running_loop().time()
+     callback(msg=f"Graph indexed {len(cr.structured_output)} communities in {now - start:.2f}s.")
+     return community_structure, community_reports
++
++
++# === CUSTOM BEGIN [graphrag-incremental] ===
++# 原因：activate custom GraphRAG incremental/optimization strategies
++# 日期：2026-06-20
++# 关联：rag/graphrag/general/index_patch.py
++import sys
++from rag.graphrag.general import index_patch
++index_patch.apply_patch(sys.modules[__name__])
++# === CUSTOM END [graphrag-incremental] ===

@@ -1,0 +1,26 @@
+diff --git a/rag/graphrag/entity_resolution.py b/rag/graphrag/entity_resolution.py
+index 6819d003e..197a59bc0 100644
+--- a/rag/graphrag/entity_resolution.py
++++ b/rag/graphrag/entity_resolution.py
+@@ -309,3 +309,21 @@ class EntityResolution(Extractor):
+             return len(a & b) > 1
+ 
+         return len(a & b)*1./max_l >= 0.8
++
++
++# === CUSTOM BEGIN [incremental-entity-resolution] ===
++# 原因：将增量实体消解的自定义逻辑（类型排除、外部候选对、可配置批大小）隔离到独立模块，
++#       保持官方 EntityResolution 类与 main 分支一致。
++# 日期：2026-06-20
++# 关联：rag/graphrag/entity_resolution_extras.py
++from rag.graphrag.config import GraphRAGConfig
++from rag.graphrag.entity_resolution_extras import (
++    EXCLUDED_RESOLUTION_TYPES,
++    IncrementalEntityResolution,
++    build_excluded_types,
++    is_similarity_str,
++)
++
++if GraphRAGConfig.USE_INCREMENTAL_RESOLUTION:
++    EntityResolution = IncrementalEntityResolution
++# === CUSTOM END [incremental-entity-resolution] ===

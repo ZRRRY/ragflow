@@ -1,0 +1,16 @@
+diff --git a/.gitignore b/.gitignore
+index d289bd94e..70b1613ac 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -237,7 +237,10 @@ bin/*
+ !bin/.gitkeep
+ .claude/settings.local.json
+ 
+-.run/
++# GraphRAG review documents
++docs/graphrag_review/
++
+ # Local agent tooling state (per-developer; not for commit)
++.run/
+ .omc/
+ .marscode/

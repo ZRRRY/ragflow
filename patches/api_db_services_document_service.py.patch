@@ -1,0 +1,47 @@
+diff --git a/api/db/services/document_service.py b/api/db/services/document_service.py
+index 12fdc19fe..39e13a069 100644
+--- a/api/db/services/document_service.py
++++ b/api/db/services/document_service.py
+@@ -36,6 +36,12 @@ from common.time_utils import current_timestamp, get_format_time
+ 
+ from rag.nlp import search
+ from rag.utils.redis_conn import REDIS_CONN
++# === CUSTOM BEGIN [graphrag-doc-delete] ===
++# 原因：将 Phase 2.5 增量 GraphRAG 文档删除逻辑隔离到独立模块
++# 日期：2026-06-20
++# 关联：rag/graphrag/document_delete_extras.py
++from rag.graphrag.document_delete_extras import cleanup_knowledge_graph_references
++# === CUSTOM END [graphrag-doc-delete] ===
+ 
+ 
+ class DocumentService(CommonService):
+@@ -498,23 +504,12 @@ class DocumentService(CommonService):
+         # Cleanup knowledge graph references (non-critical, log and continue)
+         try:
+             if chunk_index_exists:
+-                graph_source = settings.docStoreConn.get_fields(
+-                    settings.docStoreConn.search(["source_id"], [], {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, [], OrderByExpr(), 0, 1, chunk_index_name, [doc.kb_id]),
+-                    ["source_id"],
+-                )
+-                if len(graph_source) > 0 and doc.id in list(graph_source.values())[0]["source_id"]:
+-                    settings.docStoreConn.update(
+-                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "source_id": doc.id},
+-                        {"remove": {"source_id": doc.id}},
+-                        chunk_index_name,
+-                        doc.kb_id,
+-                    )
+-                    settings.docStoreConn.update({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
+-                    settings.docStoreConn.delete(
+-                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "must_not": {"exists": "source_id"}},
+-                        chunk_index_name,
+-                        doc.kb_id,
+-                    )
++                # === CUSTOM BEGIN [graphrag-doc-delete] ===
++                # 原因：将 Phase 2.5 增量 GraphRAG 文档删除逻辑隔离到独立模块
++                # 日期：2026-06-20
++                # 关联：rag/graphrag/document_delete_extras.py
++                cleanup_knowledge_graph_references(doc, chunk_index_name)
++                # === CUSTOM END [graphrag-doc-delete] ===
+         except Exception as e:
+             logging.warning(f"Failed to cleanup knowledge graph for document {doc.id}: {e}")
+ 
