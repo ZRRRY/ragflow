@@ -188,28 +188,6 @@ class RedisDB:
             logging.warning("RedisDB.get " + str(k) + " got exception: " + str(e))
             self.__open__()
 
-    def ttl(self, k):
-        """Return the remaining TTL (in seconds) for ``k``.
-
-        Return values (matches the redis-py / Valkey spec):
-          * ``-2`` — key does not exist.
-          * ``-1`` — key exists but has no associated expire.
-          * ``>= 0`` — remaining time-to-live in seconds.
-
-        Notes
-        -----
-        Returns ``None`` if the Redis connection is unavailable. The caller
-        MUST be prepared to handle three distinct integer sentinels and the
-        ``None`` fallback — do NOT treat ``None`` the same as ``-2``.
-        """
-        if not self.REDIS:
-            return None
-        try:
-            return self.REDIS.ttl(k)
-        except Exception as e:
-            logging.warning("RedisDB.ttl " + str(k) + " got exception: " + str(e))
-            self.__open__()
-
     def set_obj(self, k, obj, exp=3600):
         try:
             self.REDIS.set(k, json.dumps(obj, ensure_ascii=False), exp)
@@ -574,13 +552,9 @@ class RedisDistributedLock:
         REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
         return self.lock.acquire(token=self.lock_value)
 
-    async def spin_acquire(self, stop_event: asyncio.Event = None):
+    async def spin_acquire(self):
         REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
         while True:
-            if stop_event is not None and stop_event.is_set():
-                raise asyncio.CancelledError(
-                    f"spin_acquire aborted by stop_event for {self.lock_key}"
-                )
             if self.lock.acquire(token=self.lock_value):
                 break
             await asyncio.sleep(10)

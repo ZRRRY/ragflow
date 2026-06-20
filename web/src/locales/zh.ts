@@ -2634,7 +2634,12 @@ Tokenizer 会根据所选方式将内容存储为对应的数据结构。`,
       downloadTip: '正在从数据源下载文件。',
       processingTip: '正在由pipeline处理文件。',
       totalFiles: '文件总数',
+      // === CUSTOM BEGIN [dataset-overview-totalChunks] ===
+      // 原因：在数据集概览中增加分块总数，用于 GraphRAG 增量/优化监控
+      // 日期：2026-06-20
+      // 关联：rag/graphrag/config.py, rag/graphrag/utils_pagination.py
       totalChunks: '分块总数',
+      // === CUSTOM END [dataset-overview-totalChunks] ===
       downloading: '正在下载',
       processing: '正在处理',
       downloadSuccessTip: '下载成功总数',

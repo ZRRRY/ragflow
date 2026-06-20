@@ -375,15 +375,43 @@ def init_settings():
         STORAGE_IMPL = storage_impl
 
     global retriever, kg_retriever
-    # P2-14: 兜底 audit hook 的 import 异常。doc_store_audit 模块自身的 import 失败
-    # 不应阻止 API server 启动 (audit hook 是 best-effort 可观测性,非核心路径)。
+    # === CUSTOM BEGIN [doc-store-audit-hook] ===
+    # 原因：安装 docStoreConn.delete 审计 hook（兜底 import 异常，避免阻塞启动）
+    # 日期：2026-06-20
+    # 关联：common/doc_store_audit.py
     try:
-        from common.doc_store_audit import install as install_docstore_audit
-        install_docstore_audit(docStoreConn)
+        from common.doc_store_audit import install_with_fallback
+        install_with_fallback(docStoreConn)
     except ImportError as e:
         logging.warning(f"doc_store_audit hook unavailable, skipping install: {e}")
+    # === CUSTOM END [doc-store-audit-hook] ===
+
+    # === CUSTOM BEGIN [es-conn-extras] ===
+    # 原因：注入自定义 ESConnection.count 方法，供 GraphRAG 增量/优化逻辑使用。
+    # 日期：2026-06-20
+    # 关联：common/doc_store/es_conn_extras.py
+    try:
+        from common.doc_store.es_conn_extras import install as install_es_conn_extras
+        install_es_conn_extras()
+    except ImportError as e:
+        logging.warning(f"es_conn_extras hook unavailable, skipping install: {e}")
     except Exception as e:
-        logging.exception(f"doc_store_audit install failed, continuing without audit: {e}")
+        logging.exception(f"es_conn_extras install failed, continuing without extras: {e}")
+    # === CUSTOM END [es-conn-extras] ===
+
+    # === CUSTOM BEGIN [os-conn-extras] ===
+    # 原因：注入自定义 OSConnection 方法（knn_search_entities、search_with_scroll、count
+    # 及 GraphRAG 优化的 insert），供 GraphRAG 增量/优化逻辑使用。
+    # 日期：2026-06-20
+    # 关联：common/doc_store/opensearch_conn_extras.py
+    try:
+        from common.doc_store.opensearch_conn_extras import install as install_opensearch_conn_extras
+        install_opensearch_conn_extras()
+    except ImportError as e:
+        logging.warning(f"opensearch_conn_extras hook unavailable, skipping install: {e}")
+    except Exception as e:
+        logging.exception(f"opensearch_conn_extras install failed, continuing without extras: {e}")
+    # === CUSTOM END [os-conn-extras] ===
 
     retriever = search.Dealer(docStoreConn)
     from rag.graphrag import search as kg_search

@@ -210,3 +210,16 @@ def uninstall(docStoreConn) -> bool:
         docStoreConn.delete = original
     setattr(docStoreConn, _INSTALL_FLAG, False)
     return True
+
+
+def install_with_fallback(docStoreConn) -> None:
+    """Install the audit wrapper, swallowing any failure so startup is not blocked.
+
+    This is a convenience entry point for ``common.settings.init_settings``.
+    All implementation details and runtime error handling live in this module
+    so the caller only needs a single line.
+    """
+    try:
+        install(docStoreConn)
+    except Exception as e:
+        _logger.exception("doc_store_audit install failed, continuing without audit: %s", e)

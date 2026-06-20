@@ -17,12 +17,14 @@ import { useTranslation } from 'react-i18next';
 import { RunningStatus } from '../dataset/constant';
 import { LogTabs } from './dataset-common';
 import { DatasetFilter } from './dataset-filter';
-import {
-  useFetchDatasetChunkCount,
-  useFetchFileLogList,
-  useFetchOverviewTotal,
-} from './hook';
+import { useFetchFileLogList, useFetchOverviewTotal } from './hook';
 import { DocumentLog, IFileLogItem } from './interface';
+// === CUSTOM BEGIN [dataset-overview-chunk-count] ===
+// 原因：Display total chunk count on the dataset overview page.
+// 日期：2026-06-20
+// 关联：hook-extras.ts
+import { useFetchDatasetChunkCount } from './hook-extras';
+// === CUSTOM END [dataset-overview-chunk-count] ===
 import FileLogsTable from './overview-table';
 
 interface StatCardProps {
@@ -138,7 +140,12 @@ const FileLogsPage: FC = () => {
     },
   });
   const { data: topData } = useFetchOverviewTotal();
+  // === CUSTOM BEGIN [dataset-overview-chunk-count] ===
+  // 原因：Fetch chunk total for the extra stats card.
+  // 日期：2026-06-20
+  // 关联：hook-extras.ts
   const { data: chunkTotal } = useFetchDatasetChunkCount();
+  // === CUSTOM END [dataset-overview-chunk-count] ===
   const {
     pagination: { total: fileTotal },
   } = useFetchDocumentList(false);
@@ -264,7 +271,13 @@ const FileLogsPage: FC = () => {
       flex flex-col overflow-y-auto scrollbar-auto"
     >
       {/* Stats Cards */}
+      {/* === CUSTOM BEGIN [dataset-overview-chunk-count] ===
+        原因：Four columns are needed for the extra total-chunks stat card.
+        日期：2026-06-20
+        关联：hook-extras.ts
+      */}
       <div className="grid grid-cols-4 md:grid-cols-4 gap-7 mb-6">
+        {/* === CUSTOM END [dataset-overview-chunk-count] === */}
         <StatCard
           title={t('datasetOverview.totalFiles')}
           value={topAllData.totalFiles.value}
@@ -286,6 +299,11 @@ const FileLogsPage: FC = () => {
             </span>
           </div>
         </StatCard>
+        {/* === CUSTOM BEGIN [dataset-overview-chunk-count] ===
+          原因：Render the extra total-chunks stat card.
+          日期：2026-06-20
+          关联：hook-extras.ts
+        */}
         <StatCard
           title={t('datasetOverview.totalChunks')}
           value={chunkTotal ?? 0}
@@ -297,6 +315,7 @@ const FileLogsPage: FC = () => {
             )
           }
         />
+        {/* === CUSTOM END [dataset-overview-chunk-count] === */}
         <StatCard
           title={t('datasetOverview.downloading')}
           value={topAllData.downloads.value}

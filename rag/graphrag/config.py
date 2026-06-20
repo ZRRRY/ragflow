@@ -227,3 +227,10 @@ class GraphRAGConfig:
 
 # 不在 import 时自动打印,避免 worker 启动时重复污染日志。
 # 需要诊断时显式调用 GraphRAGConfig.log_flags(force=True)。
+
+# === CUSTOM BEGIN [redis-conn-monkey-patch] ===
+# 原因：为 RedisDB 与 RedisDistributedLock 注入 GraphRAG 自定义方法，避免修改官方 redis_conn.py
+# 日期：2026-06-20
+# 关联：rag/utils/redis_conn_patch.py
+from rag.utils import redis_conn_patch  # noqa: F401
+# === CUSTOM END [redis-conn-monkey-patch] ===

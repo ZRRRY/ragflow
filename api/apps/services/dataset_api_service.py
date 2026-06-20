@@ -21,9 +21,7 @@ import re
 from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance
 from common.constants import PAGERANK_FLD
 from common import settings
-from networkx.readwrite import json_graph
-from rag.graphrag.utils import get_graph_from_index_for_visualization, get_graph_from_json
-from rag.graphrag.config import GraphRAGConfig
+from api.apps.services import dataset_api_service_extras as _dataset_extras
 from api.db.db_models import File
 from api.db.services.document_service import DocumentService, queue_raptor_o_graphrag_tasks
 from api.db.services.file2document_service import File2DocumentService
@@ -408,76 +406,20 @@ def list_datasets(tenant_id: str, args: dict):
     return True, {"data": response_data_list, "total": total}
 
 
-async def _fetch_raw_knowledge_graph(dataset_id: str, tenant_id: str):
-    """
-    Fetch the raw (un-truncated) knowledge graph data from the monolithic JSON blob.
-
-    This is the official v0.26.0 default path. The incremental path uses
-    ``get_graph_from_index_for_visualization`` directly in ``get_knowledge_graph``.
-
-    Defensive depth: re-check ``KnowledgebaseService.accessible`` here so this
-    helper is safe to call from any new entry point (not only ``get_knowledge_graph``),
-    preventing accidental authz bypass if the caller forgets the check.
-    """
-    # 防御性深度权限校验:避免被其他入口绕过 (P2-9 安全回归修复)
-    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
-        return {"graph": {}, "mind_map": {}}
-
-    _, kb = KnowledgebaseService.get_by_id(dataset_id)
-    if not kb:
-        return {"graph": {}, "mind_map": {}}
-
-    obj = {"graph": {}, "mind_map": {}}
-    from rag.nlp import search
-
-    if not settings.docStoreConn.index_exist(search.index_name(kb.tenant_id), dataset_id):
-        return obj
-
-    graph = await get_graph_from_json(kb.tenant_id, dataset_id)
-    if graph is not None and len(graph.nodes) > 0:
-        obj["graph"] = json_graph.node_link_data(graph, edges="edges")
-
-    return obj
-
-
 async def get_knowledge_graph(dataset_id: str, tenant_id: str):
     """
-    Get knowledge graph for a dataset (truncated to 256 nodes and 128 edges for visualization).
+    Get knowledge graph for a dataset.
 
     :param dataset_id: dataset ID
     :param tenant_id: tenant ID
     :return: (success, result) or (success, error_message)
     """
-    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
-        return False, "No authorization."
-
-    if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
-        _, kb = KnowledgebaseService.get_by_id(dataset_id)
-        graph = await get_graph_from_index_for_visualization(
-            kb.tenant_id, dataset_id, max_nodes=256, max_edges=128
-        )
-        obj = {"graph": {}, "mind_map": {}}
-        if graph is not None and len(graph.nodes) > 0:
-            obj["graph"] = json_graph.node_link_data(graph, edges="edges")
-    else:
-        obj = await _fetch_raw_knowledge_graph(dataset_id, tenant_id)
-
-    if "nodes" in obj["graph"]:
-        all_nodes = obj["graph"]["nodes"]
-        if GraphRAGConfig.USE_CHAPTER_GRAPH:
-            protected_types = {"书籍", "章节"}
-            protected_nodes = [n for n in all_nodes if n.get("entity_type") in protected_types]
-            other_nodes = [n for n in all_nodes if n.get("entity_type") not in protected_types]
-            sorted_other_nodes = sorted(other_nodes, key=lambda x: x.get("pagerank", 0), reverse=True)[:max(0, 256 - len(protected_nodes))]
-            obj["graph"]["nodes"] = protected_nodes + sorted_other_nodes
-        else:
-            obj["graph"]["nodes"] = sorted(all_nodes, key=lambda x: x.get("pagerank", 0), reverse=True)[:256]
-
-        if "edges" in obj["graph"]:
-            node_id_set = {o["id"] for o in obj["graph"]["nodes"]}
-            filtered_edges = [o for o in obj["graph"]["edges"] if o["source"] != o["target"] and o["source"] in node_id_set and o["target"] in node_id_set]
-            obj["graph"]["edges"] = sorted(filtered_edges, key=lambda x: x.get("weight", 0), reverse=True)[:128]
-    return True, obj
+    # === CUSTOM BEGIN [graphrag-kg-visualization] ===
+    # 原因：将增量/章节图可视化逻辑隔离到 dataset_api_service_extras.py
+    # 日期：2026-06-20
+    # 关联：api/apps/services/dataset_api_service_extras.py
+    return await _dataset_extras.get_knowledge_graph(dataset_id, tenant_id)
+    # === CUSTOM END [graphrag-kg-visualization] ===
 
 
 def delete_knowledge_graph(dataset_id: str, tenant_id: str):
@@ -493,8 +435,13 @@ def delete_knowledge_graph(dataset_id: str, tenant_id: str):
     _, kb = KnowledgebaseService.get_by_id(dataset_id)
     from rag.nlp import search
     from rag.graphrag.phase_markers import clear_phase_markers
-    settings.docStoreConn.delete({"knowledge_graph_kwd": ["graph", "subgraph", "entity", "relation", "community_report", "merge_state"]},
+    # === CUSTOM BEGIN [graphrag-delete-keywords] ===
+    # 原因：增量构建产物 merge_state 需要在删图时一并清理
+    # 日期：2026-06-20
+    # 关联：api/apps/services/dataset_api_service_extras.py
+    settings.docStoreConn.delete({"knowledge_graph_kwd": _dataset_extras.graph_delete_keywords()},
                                  search.index_name(kb.tenant_id), dataset_id)
+    # === CUSTOM END [graphrag-delete-keywords] ===
     # Wiping the graph invalidates any phase-completion markers used to
     # short-circuit resolution / community detection on resume.
     clear_phase_markers(dataset_id)
@@ -871,8 +818,13 @@ def delete_index(dataset_id: str, tenant_id: str, index_type: str, wipe: bool = 
     if wipe and index_type == "graph":
         from rag.nlp import search
         from rag.graphrag.phase_markers import clear_phase_markers
-        settings.docStoreConn.delete({"knowledge_graph_kwd": ["graph", "subgraph", "entity", "relation", "community_report", "merge_state"]},
+        # === CUSTOM BEGIN [graphrag-delete-keywords] ===
+        # 原因：增量构建产物 merge_state 需要在删图时一并清理
+        # 日期：2026-06-20
+        # 关联：api/apps/services/dataset_api_service_extras.py
+        settings.docStoreConn.delete({"knowledge_graph_kwd": _dataset_extras.graph_delete_keywords()},
                                      search.index_name(kb.tenant_id), dataset_id)
+        # === CUSTOM END [graphrag-delete-keywords] ===
         # Wiping the graph invalidates any phase-completion markers used to
         # short-circuit resolution / community detection on resume.
         clear_phase_markers(dataset_id)

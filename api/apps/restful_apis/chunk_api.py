@@ -571,17 +571,6 @@ async def add_chunk(tenant_id, dataset_id, document_id):
     v = 0.1 * v[0] + 0.9 * v[1]
     d[f"q_{len(v)}_vec"] = v.tolist()
     settings.docStoreConn.insert([d], search.index_name(dataset_tenant_id), dataset_id)
-    # Refresh the index so the subsequent list_chunks call from the same
-    # UI flow sees the new chunk without waiting for OpenSearch's default
-    # 1s refresh_interval. Best-effort: ES / Infinity may not expose
-    # refresh_idx, in which case we silently fall back to the default
-    # refresh interval.
-    refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
-    if refresh_fn is not None:
-        try:
-            refresh_fn(search.index_name(dataset_tenant_id))
-        except Exception:
-            logging.exception("refresh_idx failed after add_chunk (will rely on default refresh_interval)")
 
     DocumentService.increment_chunk_num(doc.id, doc.kb_id, c, 1, 0)
     key_mapping = {

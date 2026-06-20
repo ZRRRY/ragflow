@@ -304,53 +304,6 @@ class ESConnection(ESConnectionBase):
         self.logger.error(f"ESConnection.search timeout for {ATTEMPT_TIME} times!")
         raise Exception("ESConnection.search timeout.")
 
-    def count(self, condition: dict, index_name: str, knowledgebase_ids: list[str]) -> int:
-        assert "_id" not in condition
-        cond = condition.copy()
-        cond["kb_id"] = knowledgebase_ids
-
-        bool_query = Q("bool", must=[])
-        for k, v in cond.items():
-            if k == "available_int":
-                if v == 0:
-                    bool_query.filter.append(Q("range", available_int={"lt": 1}))
-                else:
-                    bool_query.filter.append(
-                        Q("bool", must_not=Q("range", available_int={"lt": 1})))
-                continue
-            if not v:
-                continue
-            if isinstance(v, list):
-                bool_query.filter.append(Q("terms", **{k: v}))
-            elif isinstance(v, str) or isinstance(v, int):
-                bool_query.filter.append(Q("term", **{k: v}))
-            else:
-                raise Exception(
-                    f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
-
-        if not bool_query.filter and not bool_query.must and not bool_query.must_not:
-            qry = {"match_all": {}}
-        else:
-            qry = bool_query.to_dict()
-        body = {"query": qry}
-        self.logger.debug(f"ESConnection.count {index_name} query: " + json.dumps(body))
-
-        for i in range(ATTEMPT_TIME):
-            try:
-                res = self.es.count(index=index_name, body=body)
-                return int(res.get("count", 0))
-            except NotFoundError:
-                return 0
-            except ConnectionTimeout:
-                self.logger.exception("ES request timeout")
-                self._connect()
-                continue
-            except Exception as e:
-                self.logger.exception(f"ESConnection.count {index_name} query: " + json.dumps(body) + str(e))
-                raise e
-        self.logger.error(f"ESConnection.count timeout for {ATTEMPT_TIME} times!")
-        raise Exception("ESConnection.count timeout.")
-
     def insert(self, documents: list[dict], index_name: str, knowledgebase_id: str = None) -> list[str]:
         # Refers to https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
         operations = []

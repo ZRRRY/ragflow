@@ -14,7 +14,6 @@
 #  limitations under the License.
 import argparse
 import time
-from typing import Optional
 
 from rag.svr.task_executor_refactor.task_manager import TaskManager
 from rag.svr.task_executor_refactor.recording_context import timed_with_recording, get_recording_context, RecordingContext, set_recording_context, NullRecordingContext
@@ -58,8 +57,6 @@ from rag.utils.raptor_utils import (
 from common.log_utils import init_root_logger
 from common.config_utils import show_configs
 from rag.graphrag.utils import get_llm_cache, set_llm_cache, get_tags_from_cache, set_tags_to_cache
-from rag.graphrag.config import GraphRAGConfig
-from rag.graphrag.phase_markers import PHASE_RESOLUTION, PHASE_COMMUNITY, has_phase_marker, set_phase_marker, clear_phase_markers
 from rag.prompts.generator import keyword_extraction, question_proposal, content_tagging, run_toc_from_text, gen_metadata
 import logging
 import os
@@ -157,31 +154,6 @@ CURRENT_TASKS = {}
 WORKER_HEARTBEAT_TIMEOUT = int(os.environ.get("WORKER_HEARTBEAT_TIMEOUT", "120"))
 stop_event = threading.Event()
 
-# Heartbeat lock v2: thread-safe current_task_id used by _heartbeat_loop.
-_current_task_id_lock = threading.Lock()
-_current_task_id_state: dict[str, Optional[str]] = {"tid": None}
-
-
-def _get_current_task_id() -> Optional[str]:
-    with _current_task_id_lock:
-        return _current_task_id_state["tid"]
-
-
-def _set_current_task_id(tid: Optional[str]) -> Optional[str]:
-    with _current_task_id_lock:
-        old = _current_task_id_state["tid"]
-        _current_task_id_state["tid"] = tid
-        return old
-
-
-# Backward-compat shim: only installed when reconcile-on-boot is enabled,
-# so default deployments don't pay the global __getattr__ dispatch cost.
-if GraphRAGConfig.RECONCILE_STUCK_ON_BOOT:
-    def __getattr__(name):
-        if name == "current_task_id":
-            return _get_current_task_id()
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 def signal_handler(sig, frame):
     logging.info("Received interrupt signal, shutting down...")
@@ -192,23 +164,6 @@ def signal_handler(sig, frame):
 
 def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing..."):
     try:
-        # Heartbeat lock v2: write a TTL key whenever the active task changes.
-        # Only enabled when reconcile-on-boot is enabled, to avoid unconditional
-        # Redis traffic in official deployments.
-        prev_tid = None
-        if GraphRAGConfig.RECONCILE_STUCK_ON_BOOT:
-            prev_tid = _get_current_task_id()
-            if prev_tid != task_id:
-                _set_current_task_id(task_id)
-                try:
-                    REDIS_CONN.set(
-                        f"graphrag:hb:{task_id}",
-                        f"{socket.gethostname()}:{os.getpid()}",
-                        exp=GraphRAGConfig.HEARTBEAT_TTL,
-                    )
-                except Exception:
-                    logging.exception("[heartbeat] initial lock write failed task=%s", task_id)
-
         if prog is not None and prog < 0:
             msg = "[ERROR]" + msg
         cancel = has_canceled(task_id)
@@ -229,28 +184,7 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
 
         TaskService.update_progress(task_id, d)
 
-        # Close the Peewee DB connection used by TaskService.  The Redis
-        # connection used for heartbeat keys below is a separate pool
-        # (REDIS_CONN), so closing the SQL connection does not affect it.
         close_connection()
-
-        # Heartbeat cleanup, decoupled from the prog value to avoid stranded
-        # keys on `set_progress(task_id, prog=None)` paths (msg-only updates):
-        #   1) on task switch, drop the previous task's heartbeat
-        #   2) on terminal state (prog >= 1.0 or prog <= 0), drop current task's heartbeat
-        if GraphRAGConfig.RECONCILE_STUCK_ON_BOOT:
-            if prev_tid and prev_tid != task_id:
-                try:
-                    REDIS_CONN.delete(f"graphrag:hb:{prev_tid}")
-                except Exception:
-                    logging.exception("[heartbeat] previous-task lock delete failed task=%s", prev_tid)
-            if prog is not None and (prog >= 1.0 or prog <= 0):
-                try:
-                    REDIS_CONN.delete(f"graphrag:hb:{task_id}")
-                except Exception:
-                    logging.exception("[heartbeat] terminal lock delete failed task=%s", task_id)
-                _set_current_task_id(None)
-
         if cancel:
             raise TaskCanceledException(msg)
         logging.info(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}")
@@ -260,157 +194,6 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
         logging.warning(f"set_progress({task_id}) got exception DoesNotExist")
     except Exception as e:
         logging.exception(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}, got exception: {e}")
-
-
-async def reconcile_stuck_graphrag_tasks():
-    """Boot-time scan: mark stuck graphrag tasks as done when OpenSearch has data.
-
-    Only runs when ``RECONCILE_STUCK_ON_BOOT=1``. Uses a heartbeat TTL + grace
-    window to avoid racing with a genuinely running worker.
-    """
-    if not GraphRAGConfig.RECONCILE_STUCK_ON_BOOT:
-        logging.info("[reconcile] RECONCILE_STUCK_ON_BOOT=0, skipping")
-        return
-
-    grace_ms = GraphRAGConfig.STUCK_TASK_GRACE_MINUTES * 60 * 1000
-    cutoff_ms = int(time.time() * 1000) - grace_ms
-    min_nodes = GraphRAGConfig.STUCK_TASK_MIN_NODES
-    min_edges = GraphRAGConfig.STUCK_TASK_MIN_EDGES
-    logging.info(
-        "[reconcile] starting: grace=%dmin min_nodes=%d min_edges=%d",
-        GraphRAGConfig.STUCK_TASK_GRACE_MINUTES, min_nodes, min_edges,
-    )
-
-    try:
-        kbs = list(
-            KnowledgebaseService.model.select(
-                KnowledgebaseService.model.id,
-                KnowledgebaseService.model.tenant_id,
-                KnowledgebaseService.model.graphrag_task_id,
-            ).where(
-                (KnowledgebaseService.model.graphrag_task_id.is_null(False))
-                & (KnowledgebaseService.model.graphrag_task_finish_at.is_null())
-            ).dicts()
-        )
-    except Exception:
-        logging.exception("[reconcile] candidate KB list query failed")
-        return
-    logging.info("[reconcile] candidate %d KBs", len(kbs))
-
-    finalized = skipped = failed = 0
-    for kb in kbs:
-        kb_id = kb["id"]
-        tenant_id = kb["tenant_id"]
-        task_id = kb["graphrag_task_id"]
-        try:
-            claim = f"graphrag:reconcile:{task_id}"
-            if not REDIS_CONN.REDIS.set(claim, "1", ex=600, nx=True):
-                logging.info("[reconcile] kb=%s task=%s already claimed, skip", kb_id, task_id)
-                continue
-
-            ok, task_obj = TaskService.get_by_id(task_id)
-            if not ok or task_obj is None:
-                logging.warning("[reconcile] kb=%s task=%s does not exist, skip", kb_id, task_id)
-                REDIS_CONN.delete(claim)
-                continue
-            prog = task_obj.progress or 0
-            update_time = task_obj.update_time or 0
-            if not (0 < prog < 1):
-                logging.info("[reconcile] kb=%s task=%s progress=%.4f not in (0,1), skip", kb_id, task_id, prog)
-                REDIS_CONN.delete(claim)
-                continue
-
-            heartbeat_key = f"graphrag:hb:{task_id}"
-            try:
-                ttl = REDIS_CONN.ttl(heartbeat_key)
-                if ttl is None:
-                    ttl = -2
-            except Exception:
-                logging.exception("[reconcile] TTL query failed task=%s, falling back to grace check", task_id)
-                ttl = -2
-
-            if ttl > 0:
-                logging.info(
-                    "[reconcile] kb=%s task=%s heartbeat still alive (ttl=%ds), skip",
-                    kb_id, task_id, ttl,
-                )
-                REDIS_CONN.delete(claim)
-                skipped += 1
-                continue
-
-            if update_time > cutoff_ms:
-                logging.info(
-                    "[reconcile] kb=%s task=%s heartbeat missing but update_time within grace, skip",
-                    kb_id, task_id,
-                )
-                REDIS_CONN.delete(claim)
-                continue
-
-            index = search.index_name(tenant_id)
-            try:
-                n_nodes = await thread_pool_exec(
-                    settings.docStoreConn.count, {"knowledge_graph_kwd": ["entity"]}, index, [kb_id]
-                )
-                n_nodes = int(n_nodes or 0)
-            except Exception:
-                logging.exception("[reconcile] entity count failed kb=%s", kb_id)
-                n_nodes = 0
-            try:
-                n_edges = await thread_pool_exec(
-                    settings.docStoreConn.count, {"knowledge_graph_kwd": ["relation"]}, index, [kb_id]
-                )
-                n_edges = int(n_edges or 0)
-            except Exception:
-                logging.exception("[reconcile] relation count failed kb=%s", kb_id)
-                n_edges = 0
-
-            if n_nodes < min_nodes or n_edges < min_edges:
-                logging.warning(
-                    "[reconcile] kb=%s task=%s only %d nodes / %d edges below threshold, skip",
-                    kb_id, task_id, n_nodes, n_edges,
-                )
-                REDIS_CONN.delete(claim)
-                skipped += 1
-                continue
-
-            msg = f"Knowledge Graph reconciled ({n_nodes} nodes, {n_edges} edges) [boot]"
-            TaskService.update_progress(task_id, {"progress": 1.0, "progress_msg": msg})
-            try:
-                REDIS_CONN.delete(heartbeat_key)
-            except Exception:
-                logging.exception("[reconcile] heartbeat delete failed task=%s", task_id)
-            # Setting graphrag_task_id back to None ensures the next
-            # reconcile pass can pick this KB up via the is_null() filter.
-            # An empty string would be matched by `=` but NOT by `is_null()`,
-            # so the KB would silently become invisible to future scans.
-            KnowledgebaseService.update_by_id(
-                kb_id, {"graphrag_task_finish_at": datetime.now(), "graphrag_task_id": None}
-            )
-            try:
-                clear_phase_markers(kb_id)
-            except Exception:
-                logging.exception("[reconcile] clear_phase_markers failed kb=%s", kb_id)
-            # Intentionally do NOT delete graphrag_task_{kb_id} here: that
-            # lock is owned by the live worker running the real KG pipeline,
-            # and force-deleting it would cancel an in-flight task on a
-            # sibling worker. The lock has its own TTL and will expire.
-            REDIS_CONN.delete(claim)
-
-            logging.info("[reconcile] FINALIZED kb=%s task=%s (%d nodes, %d edges)", kb_id, task_id, n_nodes, n_edges)
-            finalized += 1
-        except Exception:
-            logging.exception("[reconcile] kb=%s task=%s failed", kb_id, task_id)
-            failed += 1
-            try:
-                REDIS_CONN.delete(f"graphrag:reconcile:{task_id}")
-            except Exception:
-                pass
-            try:
-                REDIS_CONN.delete(f"graphrag:hb:{task_id}")
-            except Exception:
-                pass
-
-    logging.info("[reconcile] done: finalized=%d skipped=%d failed=%d (candidates %d)", finalized, skipped, failed, len(kbs))
 
 
 async def collect():
@@ -1977,167 +1760,6 @@ async def get_server_ip() -> str:
         return "Unknown"
 
 
-async def _heartbeat_loop():
-    """Renew the heartbeat lock for the currently active task."""
-    interval = GraphRAGConfig.HEARTBEAT_INTERVAL
-    ttl = GraphRAGConfig.HEARTBEAT_TTL
-    value = f"{socket.gethostname()}:{os.getpid()}"
-    while True:
-        await asyncio.sleep(interval)
-        tid = _get_current_task_id()
-        if not tid:
-            continue
-        try:
-            # XX flag: only renew if the key already exists.  This
-            # prevents reviving a heartbeat that set_progress already
-            # deleted during task finalize — without XX we would race
-            # the delete and keep a stuck task invisible to reconcile.
-            REDIS_CONN.REDIS.set(f"graphrag:hb:{tid}", value, ex=ttl, xx=True)
-        except Exception:
-            logging.exception("[heartbeat] renew failed task=%s", tid)
-
-
-async def kg_postprocess_consumer():
-    """P5-T3: background consumer for async resolution/community phases."""
-    if not GraphRAGConfig.USE_ASYNC_KG_PHASES:
-        return
-
-    queue_name = GraphRAGConfig.KG_POSTPROCESS_QUEUE
-    group_name = SVR_CONSUMER_GROUP_NAME + "_kg_pp"
-    consumer_name = CONSUMER_NAME + "_kg_pp"
-    logging.info("[KG-PP] Consumer starting on %s (group=%s)", queue_name, group_name)
-
-    while not stop_event.is_set():
-        msg = None
-        try:
-            msg = REDIS_CONN.queue_consumer(queue_name, group_name, consumer_name)
-        except Exception:
-            logging.exception("[KG-PP] queue_consumer error")
-            await asyncio.sleep(5)
-            continue
-
-        if not msg:
-            await asyncio.sleep(1)
-            continue
-
-        payload = msg.get_message()
-        tenant_id = payload.get("tenant_id")
-        kb_id = payload.get("kb_id")
-        task_id = payload.get("task_id")
-        with_resolution = payload.get("with_resolution", False)
-        with_community = payload.get("with_community", False)
-        kb_task_llm_id = payload.get("kb_task_llm_id")
-        task_language = payload.get("task_language", "English")
-
-        logging.info(
-            "[KG-PP] Processing kb=%s task=%s resolution=%s community=%s",
-            kb_id, task_id, with_resolution, with_community,
-        )
-
-        try:
-            if has_canceled(task_id):
-                logging.info("[KG-PP] kb=%s task=%s has been cancelled, skipping", kb_id, task_id)
-                msg.ack()
-                continue
-
-            chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.CHAT, kb_task_llm_id)
-            chat_model = LLMBundle(tenant_id, chat_model_config, lang=task_language)
-            embd_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.EMBEDDING)
-            embedding_model = LLMBundle(tenant_id, embd_model_config, lang=task_language)
-
-            try:
-                kb = KnowledgebaseService.get_detail(kb_id)
-                kb_parser_config = kb.get("parser_config", {}) if kb else {}
-                graphrag_config = kb_parser_config.get("graphrag", {})
-                entity_types = graphrag_config.get("entity_types", []) or []
-            except Exception:
-                logging.exception("[KG-PP] Failed to load KB parser_config for kb=%s", kb_id)
-                entity_types = []
-
-            from rag.graphrag.utils import get_graph
-            final_graph = await get_graph(tenant_id, kb_id)
-            if final_graph is None:
-                logging.error("[KG-PP] kb=%s no persisted graph found, cannot proceed", kb_id)
-                msg.ack()
-                continue
-
-            def pp_callback(msg=None, prog=None):
-                if msg:
-                    logging.info("[KG-PP] kb=%s: %s", kb_id, msg)
-
-            kb_lock = RedisDistributedLock(f"graphrag_task_{kb_id}", lock_value="kg_postprocess", timeout=3600)
-            try:
-                await kb_lock.spin_acquire(stop_event=stop_event)
-            except asyncio.CancelledError:
-                logging.info("[KG-PP] kb=%s spin_acquire aborted by stop_event", kb_id)
-                try:
-                    msg.ack()
-                except Exception:
-                    logging.exception("[KG-PP] ack after cancel failed kb=%s", kb_id)
-                continue
-            try:
-                if has_canceled(task_id):
-                    logging.info("[KG-PP] kb=%s task=%s cancelled after lock acquire", kb_id, task_id)
-                    msg.ack()
-                    continue
-
-                resolution_pending = with_resolution and not has_phase_marker(kb_id, PHASE_RESOLUTION)
-                community_pending = with_community and not has_phase_marker(kb_id, PHASE_COMMUNITY)
-
-                if not resolution_pending and not community_pending:
-                    logging.info("[KG-PP] kb=%s all phases already done", kb_id)
-                    msg.ack()
-                    continue
-
-                async with kg_limiter:
-                    if resolution_pending:
-                        from rag.graphrag.general.index import resolve_entities
-                        subgraph_nodes = set(final_graph.nodes())
-                        await resolve_entities(
-                            final_graph,
-                            subgraph_nodes,
-                            tenant_id,
-                            kb_id,
-                            None,
-                            chat_model,
-                            embedding_model,
-                            pp_callback,
-                            task_id=task_id,
-                            entity_types=entity_types,
-                        )
-                        set_phase_marker(kb_id, PHASE_RESOLUTION)
-                        logging.info("[KG-PP] kb=%s resolution done", kb_id)
-
-                    if community_pending:
-                        from rag.graphrag.general.index import extract_community
-                        await extract_community(
-                            final_graph,
-                            tenant_id,
-                            kb_id,
-                            None,
-                            chat_model,
-                            embedding_model,
-                            pp_callback,
-                            task_id=task_id,
-                        )
-                        set_phase_marker(kb_id, PHASE_COMMUNITY)
-                        logging.info("[KG-PP] kb=%s community done", kb_id)
-
-                msg.ack()
-                logging.info("[KG-PP] kb=%s postprocess complete", kb_id)
-            finally:
-                kb_lock.release()
-        except Exception:
-            # Ack the message even on failure so it does not stay in the
-            # Redis Stream PEL forever and get re-delivered in a loop on the
-            # next boot. The failure is already logged.
-            logging.exception("[KG-PP] kb=%s postprocess failed", kb_id)
-            try:
-                msg.ack()
-            except Exception:
-                logging.exception("[KG-PP] ack after failure failed kb=%s", kb_id)
-
-
 async def report_status():
     """
     Periodically reports the executor's heartbeat
@@ -2265,58 +1887,7 @@ async def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Boot-time reconciliation: leader-elected scan for stuck graphrag tasks.
-    if TASK_TYPE == "common" and GraphRAGConfig.RECONCILE_STUCK_ON_BOOT:
-        _reconcile_leader_key = "graphrag:reconcile:leader"
-        _reconcile_leader_ttl = 600
-        _leader_token = f"{socket.gethostname()}:{os.getpid()}:{time.time()}"
-        _is_leader = False
-        try:
-            _is_leader = bool(
-                REDIS_CONN.REDIS.set(_reconcile_leader_key, _leader_token, ex=_reconcile_leader_ttl, nx=True)
-            )
-        except Exception:
-            logging.exception("reconcile leader election failed, falling back to local decision")
-            _is_leader = True
-
-        if _is_leader:
-            try:
-                await reconcile_stuck_graphrag_tasks()
-            except Exception:
-                logging.exception("reconcile_stuck_graphrag_tasks uncaught exception")
-            finally:
-                try:
-                    if REDIS_CONN.REDIS is not None:
-                        REDIS_CONN.REDIS.eval(
-                            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
-                            1,
-                            _reconcile_leader_key,
-                            _leader_token,
-                        )
-                except Exception:
-                    logging.exception("reconcile leader release failed (will rely on TTL expiry)")
-        else:
-            logging.info("[reconcile] non-leader worker, skipping this reconcile")
-            try:
-                wait_deadline = time.time() + _reconcile_leader_ttl
-                while time.time() < wait_deadline and not stop_event.is_set():
-                    val = None
-                    try:
-                        val = REDIS_CONN.REDIS.get(_reconcile_leader_key) if REDIS_CONN.REDIS else None
-                    except Exception:
-                        pass
-                    if val is None:
-                        break
-                    await asyncio.sleep(2)
-            except Exception:
-                logging.exception("[reconcile] waiting for leader failed")
-
     report_task = asyncio.create_task(report_status())
-    # kg_pp_task 仅在异步 KG phase 开启时才创建,避免默认配置下空跑的 task
-    # (原 kg_postprocess_consumer 在 USE_ASYNC_KG_PHASES=0 时立刻 return,
-    #  仍占 asyncio slot + cancel/join 开销)
-    kg_pp_task = asyncio.create_task(kg_postprocess_consumer()) if GraphRAGConfig.USE_ASYNC_KG_PHASES else None
-    heartbeat_task = asyncio.create_task(_heartbeat_loop()) if GraphRAGConfig.RECONCILE_STUCK_ON_BOOT else None
     tasks = []
 
     logging.info(f"RAGFlow ingestion is ready after {time.time() - start_ts}s initialization.")
@@ -2330,23 +1901,17 @@ async def main():
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         report_task.cancel()
-        if kg_pp_task is not None:
-            kg_pp_task.cancel()
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            await asyncio.gather(
-                report_task,
-                kg_pp_task if kg_pp_task is not None else asyncio.sleep(0),
-                heartbeat_task,
-                return_exceptions=True,
-            )
-        else:
-            await asyncio.gather(
-                report_task,
-                kg_pp_task if kg_pp_task is not None else asyncio.sleep(0),
-                return_exceptions=True,
-            )
+        await asyncio.gather(report_task, return_exceptions=True)
     logging.error("BUG!!! You should not reach here!!!")
+
+
+# === CUSTOM BEGIN [graphrag-task-extras] ===
+# 原因：隔离 GraphRAG 增量/优化相关的 task_executor 自定义逻辑
+# 日期：2026-06-20
+# 关联：rag/svr/task_executor_extras.py
+from rag.svr.task_executor_extras import patch_task_executor
+patch_task_executor()
+# === CUSTOM END [graphrag-task-extras] ===
 
 
 if __name__ == "__main__":

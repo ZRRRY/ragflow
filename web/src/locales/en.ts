@@ -3015,7 +3015,12 @@ Important structured information may include: names, dates, locations, events, k
       downloadTip: 'Files being downloaded from data sources. ',
       processingTip: 'Files being processed by ingestion pipeline.',
       totalFiles: 'Total files',
+      // === CUSTOM BEGIN [dataset-overview-totalChunks] ===
+      // 原因：Add total chunks count to dataset overview for incremental GraphRAG monitoring
+      // 日期：2026-06-20
+      // 关联：rag/graphrag/config.py, rag/graphrag/utils_pagination.py
       totalChunks: 'Total chunks',
+      // === CUSTOM END [dataset-overview-totalChunks] ===
       downloading: 'Downloading',
       downloadSuccessTip: 'Total successful downloads',
       downloadFailedTip: 'Total failed downloads',
