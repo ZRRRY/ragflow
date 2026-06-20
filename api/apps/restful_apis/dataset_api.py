@@ -556,10 +556,23 @@ async def get_knowledge_graph(tenant_id, dataset_id):
         return get_error_data_result(message="Internal server error")
 
 
-@manager.route("/datasets/<dataset_id>/graph", methods=["DELETE"])  # noqa: F821
+@manager.route("/datasets/<dataset_id>/graph", methods=["DELETE"])
 @login_required
 @add_tenant_id_to_kwargs
 def delete_knowledge_graph(tenant_id, dataset_id):
+    """Delete the knowledge graph of a dataset.
+
+    DELETE /api/v1/datasets/<dataset_id>/graph
+    Success: {"code": 0, "data": True}
+    Errors:
+      * ``AUTHENTICATION_ERROR`` — caller has no access to the dataset
+        (RAGFlow project convention: ``AUTHENTICATION_ERROR`` is used here as
+        the catch-all "no authorization" code, even though HTTP-wise the
+        situation is closer to 403 Forbidden. This matches the existing
+        pattern in ``document_api.delete_document`` and
+        ``dify_retrieval_api.delete_dataset``.)
+      * ``DATA_ERROR`` — internal server error.
+    """
     try:
         success, result = dataset_api_service.delete_knowledge_graph(dataset_id, tenant_id)
         if success:

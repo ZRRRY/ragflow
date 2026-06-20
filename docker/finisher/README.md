@@ -10,14 +10,53 @@
 
 所有写操作默认 `dry-run`,加 `--apply` 才会真正执行。脚本是**幂等**的,可以反复跑。
 
+> ## ⚠️ 运行前必读:先停 task_executor,再跑本脚本
+>
+> 本脚本的 `finish` / `cleanup` 操作会直接修改 MySQL `task` 表和 Redis `graphrag:phase:<kb_id>:*` 键,
+> 如果与正在运行的 `task_executor` 进程并发,**会与 task_executor 抢资源**,后果包括:
+>
+> - `task_executor` 正在写 `task` 行时,本脚本的 UPDATE 可能拿到旧行锁后再覆盖,丢失中间进度
+> - `task_executor` 正在跑某 phase 时被 cleanup 删除 phase marker,可能误判"该 phase 没跑过"导致子任务重跑
+> - `task_executor` 持有 `graphrag_task_<kb_id>` Redis 锁时被 cleanup 强制删除,主流程的锁语义被破坏
+>
+> **强制操作顺序**:
+>
+> ```bash
+> # 1) 先停整个 ragflow 服务(同时停 API + task_executor)
+> cd docker && docker compose stop ragflow
+>
+> # 2) 再跑本脚本(dry-run 优先)
+> docker exec docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py --kb-id <KB_ID> finish
+>
+> # 3) 确认 dry-run 输出符合预期后再 --apply
+> docker exec docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py --kb-id <KB_ID> finish --apply
+>
+> # 4) 重启服务
+> docker compose start ragflow
+> ```
+>
+> 只停 `task_executor` 不够,API 也可能触发 task 创建,必须整个 `ragflow` 服务一起停。
+
 ## 准备
 
 确认 `docker-ragflow-cpu-1` 容器已起,且 OS / MySQL / Redis 三个依赖都健康。
 > 本机 `docker compose up -d` 默认会用目录名作前缀,在 `docker/` 目录下起服务,所以容器名前缀都是 `docker-`(完整名:`docker-ragflow-cpu-1`、`docker-mysql-1`、`docker-opensearch01-1`、`docker-redis-1`、`docker-minio-1`)。如果你是用 `docker compose -p <别的名字> up -d` 起的,把所有 `docker-` 前缀替换成你自定义的项目名。
+>
+> **容器名不可硬编码 (P2-19)**:本 README 中所有 `docker-XXX-1` 容器名仅在
+> `docker compose -p docker` 默认配置下有效。若用了 `-p <project>` 或容器重启后
+> hash 变了,**先跑下面这条确认真实容器名再操作**,避免把脚本拷进不存在的容器
+> 或对错的服务发命令:
+>
+> ```bash
+> docker ps --format '{{.Names}}' | grep -E 'ragflow|mysql|opensearch|redis|minio'
+> ```
+>
+> 把后续命令里的 `docker-ragflow-cpu-1` / `docker-mysql-1` 等替换成你环境中的真实名字。
 
 把脚本拷进容器(在 `docker/` 目录下执行):
 
 ```bash
+# 先确认容器名(见上),再拷脚本并验证帮助输出
 docker cp ./finisher/finish_stuck_graphrag.py docker-ragflow-cpu-1:/ragflow/finish_stuck_graphrag.py
 docker exec -it docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py --help
 ```
@@ -72,6 +111,16 @@ docker exec docker-ragflow-cpu-1 python3 /ragflow/finish_stuck_graphrag.py \
 - **不会改 LLM / 嵌入配置**。只改 task 状态和 Redis 临时键。
 
 ## 出错回滚
+
+**Step 0(必须):执行前先备份原始记录**
+
+```sql
+SELECT id, progress, progress_msg, update_time
+FROM task
+WHERE id = '<task_id>';
+```
+
+把上面查到的 `progress`、`progress_msg`、`update_time` 记下来,后续回滚用。
 
 如果执行完后发现改错了 task,直接 SQL 改回去即可:
 

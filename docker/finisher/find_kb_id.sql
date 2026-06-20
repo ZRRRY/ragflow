@@ -4,11 +4,13 @@
 -- 连接方式任选一种(下面命令里的容器名以 `docker compose -f docker-compose.yml up -d`
 --  在 `docker/` 目录下启动时的默认命名为准,即都带 `docker-` 前缀;如果你用了
 -- `docker compose -p <项目名>` 启动,把所有 `docker-` 前缀替换成自定义项目名):
---   A) docker exec -it docker-mysql-1 mysql -uroot -pinfini_rag_flow rag_flow
---   B) docker exec docker-ragflow-cpu-1 mysql -h mysql -uroot -pinfini_rag_flow rag_flow
---   C) 用 MySQL Workbench / DBeaver 等 GUI 连 host:3306 用户 root 密码 infini_rag_flow 数据库 rag_flow
---   D) host 上: mysql -h 127.0.0.1 -P 3306 -uroot -pinfini_rag_flow rag_flow
+--   A) docker exec -it docker-mysql-1 mysql -uroot -p<YOUR_MYSQL_PASSWORD> rag_flow
+--   B) docker exec docker-ragflow-cpu-1 mysql -h mysql -uroot -p<YOUR_MYSQL_PASSWORD> rag_flow
+--   C) 用 MySQL Workbench / DBeaver 等 GUI 连 host:3306 用户 root 密码 <YOUR_MYSQL_PASSWORD> 数据库 rag_flow
+--   D) host 上: mysql -h 127.0.0.1 -P 3306 -uroot -p<YOUR_MYSQL_PASSWORD> rag_flow
 --      (前提:docker-compose-base.yml 里 mysql 端口映射了 3306)
+-- 注意:请将 <YOUR_MYSQL_PASSWORD> 替换为你 docker/.env 里 MYSQL_PASSWORD 的实际值,
+--      或用 -p"$MYSQL_PASSWORD" 形式读取环境变量;RAGFlow 的默认密码见 docker/.env。
 
 
 -- ---- 1) 列出所有 KB,看 ID 和名字 ----------------------------------------
@@ -36,6 +38,15 @@ WHERE name LIKE '%xxx%';
 -- ---- 4) 直接列出所有 progress 卡在 (0, 1) 的 graphrag 任务 ------------
 -- 关联方式:task 没有 kb_id 字段,反查走 knowledgebase.graphrag_task_id
 -- 这一条最直接:看一眼就知道哪个 KB 的哪个 task 卡住了
+--
+-- 性能提示 (P2-18):
+--   * ``WHERE t.progress > 0 AND t.progress < 1`` 在大表(百万 task 行)上
+--     会触发全表扫,因为 ``task.progress`` 列通常无索引。
+--   * ``JOIN ... ON t.id = k.graphrag_task_id`` 也需要
+--     ``knowledgebase.graphrag_task_id`` 上有索引(官方 v0.26.0 默认有)。
+--   * 如果 EXPLAIN 显示走了全表扫,跑前先加索引:
+--       ALTER TABLE task ADD INDEX idx_progress (progress);
+--       ALTER TABLE task ADD INDEX idx_update_time (update_time);
 SELECT
     t.id            AS task_id,
     k.id            AS kb_id,

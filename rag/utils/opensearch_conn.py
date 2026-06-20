@@ -539,12 +539,20 @@ class OSConnection(DocStoreConnection):
         logger.error(f"OSConnection.knn_search_entities timeout for {ATTEMPT_TIME} times!")
         raise Exception("OSConnection.knn_search_entities timeout.")
 
-    def search_with_scroll(self, index_names, query_body: dict, fields: list[str], scroll_timeout="2m", batch_size=1000):
+    def search_with_scroll(self, index_names, query_body: dict, fields: list[str], scroll_timeout="2m", batch_size=1000, max_pages: int = 1000):
         """Use OpenSearch scroll API to fetch all results safely.
 
         This bypasses the index.max_result_window limit and is suitable
         for retrieving large result sets (e.g. GraphRAG entity/relation
         chunks) without causing OpenSearch OOM or connection storms.
+
+        Args:
+            max_pages: Hard upper bound on the number of scroll pages.
+                Default 1000 (matches ``search_all_by_search_after``) so a
+                single query returns at most ``max_pages × batch_size``
+                documents (~1M). Prevents the scroll loop from hanging
+                indefinitely if OpenSearch starts returning empty pages
+                without raising (e.g. transient connection blip).
         """
         scroll_id = None
         try:
@@ -558,15 +566,41 @@ class OSConnection(DocStoreConnection):
             scroll_id = res.get("_scroll_id")
             hits = res["hits"]["hits"]
 
-            while True:
+            # Memory guard: a large KB can produce millions of hits per scroll
+            # call.  Cap at 50k hits (~50MB Python heap) to avoid worker OOM
+            # in callers that load the whole result set into a dict.
+            _HITS_CAP = 50000
+
+            pages_consumed = 1
+            hit_cap_reached = False
+            while pages_consumed < max_pages:
                 page = self.os.scroll(scroll_id=scroll_id, scroll=scroll_timeout)
                 page_hits = page["hits"]["hits"]
                 if not page_hits:
                     break
                 hits.extend(page_hits)
+                if len(hits) >= _HITS_CAP:
+                    hit_cap_reached = True
+                    break
                 scroll_id = page.get("_scroll_id")
                 if not scroll_id:
                     break
+                pages_consumed += 1
+
+            if hit_cap_reached:
+                logger.warning(
+                    "search_with_scroll hit hits_cap=%d (collected %d hits); "
+                    "narrow query or add post-filter",
+                    _HITS_CAP, len(hits),
+                )
+            elif pages_consumed >= max_pages:
+                # Reached max_pages without an empty page — log so operators
+                # know to raise the cap or narrow the query.
+                logger.warning(
+                    "search_with_scroll hit max_pages=%d cap (collected %d hits); "
+                    "narrow query or raise max_pages",
+                    max_pages, len(hits),
+                )
 
             # Return format compatible with __getSource / get_fields
             return {"hits": {"hits": hits}}
@@ -603,6 +637,27 @@ class OSConnection(DocStoreConnection):
         raise Exception("OSConnection.get timeout.")
 
     def insert(self, documents: list[dict], indexName: str, knowledgebaseId: str = None) -> list[str]:
+        """Insert documents via the OpenSearch bulk API.
+
+        Contract (P2-15)
+        ================
+        This method writes with ``refresh="false"`` for throughput. The caller
+        **MUST** ensure an explicit refresh (e.g. via ``refresh_idx``) is issued
+        once *after* all batches of the same logical operation complete, so that
+        downstream queries observe the new data.
+
+        Failure mode if violated
+        -----------------------
+        If the caller forgets the post-batch refresh, intermediate queries will
+        observe stale results for up to ``index.refresh_interval`` seconds
+        (default 1s in OpenSearch). For single-batch callers this may be
+        acceptable; for multi-batch GraphRAG writes (e.g. ``set_graph_delta``,
+        ``set_graph_monolithic``, ``insert_chunks_bounded``) it is **NOT**.
+
+        Acceptable refresh strategies:
+          * ``await docStoreConn.os.indices.refresh(index=...)``           # explicit
+          * rely on the default ``index.refresh_interval`` (1s)            # best-effort
+        """
         # Refers to https://opensearch.org/docs/latest/api-reference/document-apis/bulk/
         operations = []
         for d in documents:

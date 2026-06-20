@@ -50,7 +50,7 @@ services:
       - node.name=opensearch01
       - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD}
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_PASSWORD}
-      - OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g
+      - OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g
       - bootstrap.memory_lock=false
       - discovery.type=single-node
       - plugins.security.disabled=false

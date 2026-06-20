@@ -1323,6 +1323,11 @@ async def resolve_entities_incremental(
             }
         }
         try:
+            # ES / Infinity doc store does not implement search_with_scroll;
+            # in that case fall back to an empty set so resolution can still
+            # proceed via char-level filtering.
+            if not hasattr(settings.docStoreConn, "search_with_scroll"):
+                return set()
             res = await thread_pool_exec(
                 settings.docStoreConn.search_with_scroll,
                 index_name,
@@ -1426,16 +1431,35 @@ async def resolve_entities_incremental(
 
     if not candidate_pairs:
         logging.info("[P3] Falling back to char-level filtering for entity resolution.")
+        # Phase 2.4 safety: cap the per-type candidate set and batch the new-node
+        # side so a 10k existing × 100 new KB does not produce a 1M Cartesian
+        # product in memory. Each batch reuses the existing_names set, so the
+        # cost is O(batches × |existing|) string compares per type, bounded by
+        # RESOLUTION_CHAR_BATCH_SIZE * RESOLUTION_CHAR_MAX_CANDIDATES.
+        char_batch = max(1, int(GraphRAGConfig.RESOLUTION_CHAR_BATCH_SIZE))
+        max_candidates = max(1, int(GraphRAGConfig.RESOLUTION_CHAR_MAX_CANDIDATES))
+
         for ent_type, new_nodes in new_nodes_by_type.items():
             if not new_nodes or ent_type in excluded_types:
                 continue
+            if len(candidate_pairs) >= max_candidates:
+                logging.info(
+                    "[P3] Char-level candidate set reached cap (%d) before type=%s, skipping remaining",
+                    max_candidates, ent_type,
+                )
+                break
 
             existing_names = await _fetch_existing_names_by_type(tenant_id, kb_id, ent_type)
             existing_names = existing_names - set(new_nodes)
 
-            for node_name in new_nodes:
-                for existing_name in existing_names:
-                    if is_similarity_str(node_name, existing_name):
+            for batch_start in range(0, len(new_nodes), char_batch):
+                if len(candidate_pairs) >= max_candidates:
+                    break
+                batch_new = new_nodes[batch_start:batch_start + char_batch]
+                for node_name in batch_new:
+                    for existing_name in existing_names:
+                        if not is_similarity_str(node_name, existing_name):
+                            continue
                         a, b = (
                             (node_name, existing_name)
                             if node_name < existing_name
@@ -1443,6 +1467,10 @@ async def resolve_entities_incremental(
                         )
                         candidate_pairs.add((a, b))
                         candidate_neighbors.add(existing_name)
+                        if len(candidate_pairs) >= max_candidates:
+                            break
+                    if len(candidate_pairs) >= max_candidates:
+                        break
 
     if not candidate_pairs:
         logging.info("[P3] No candidates found, skipping resolution.")

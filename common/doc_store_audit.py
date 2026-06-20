@@ -36,6 +36,10 @@ Design goals
 * Always-on, no opt-out flag: the wrapper is intentionally not gated by
   an env var; the cost is one logging call per delete and the value of
   auditability is too high to leave it off by default.
+* Privacy preserving: only ``condition`` **keys** and matched keyword
+  **values** (e.g. ``"subgraph"``) are logged. The actual ``source_id`` /
+  ``doc_id`` values inside ``condition`` are never emitted, so no document
+  content or tenant-specific identifiers are exposed in audit logs.
 
 Sample log line
 ===============
@@ -47,13 +51,15 @@ Sample log line
 
 Where to install
 ================
-At the bottom of ``common/settings.py`` immediately after ``docStoreConn``
-is assigned in ``init_settings`` (it covers the API server, the task
-executor, the admin service and the data sync service in one place).
+In ``common/settings.py`` after ``docStoreConn`` is assigned in
+``init_settings`` but before ``Dealer`` / ``KGSearch`` are instantiated
+(it covers the API server, the task executor, the admin service and the
+data sync service in one place).
 """
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 import os
@@ -78,6 +84,10 @@ _KG_KEYWORDS: frozenset[str] = frozenset({
 })
 
 _INSTALL_FLAG = "_ragflow_docstore_audit_installed"
+# Marker attribute on the wrapper itself. We use this instead of comparing
+# ``__name__ == "audited_delete"`` because tests / monkeypatching can rewrite
+# ``__name__`` and silently bypass the idempotent-install check.
+_WRAPPER_MARKER = "__ragflow_audit__"
 
 
 def _is_audited(condition: Any) -> tuple[bool, list[str], list[str]]:
@@ -130,6 +140,7 @@ def _caller_location(skip_frames: int = 3) -> str:
 def make_audited_delete(original_delete):
     """Build a wrapper that audits KG deletes but is otherwise identical."""
 
+    @functools.wraps(original_delete)
     def audited_delete(condition, indexName, knowledgebaseId):
         try:
             is_audited, key_fields, matched = _is_audited(condition)
@@ -148,11 +159,10 @@ def make_audited_delete(original_delete):
             _logger.debug("docStoreConn.delete audit hook failed (non-fatal)", exc_info=True)
         return original_delete(condition, indexName, knowledgebaseId)
 
-    # Preserve introspection: mark the wrapper so debugging tools see it
-    # as a distinct function, not as the bare original.
-    audited_delete.__wrapped__ = original_delete  # type: ignore[attr-defined]
-    audited_delete.__name__ = "audited_delete"
-    audited_delete.__doc__ = original_delete.__doc__
+    # Explicit marker attribute used by install() to detect already-wrapped
+    # callables. Robust against monkeypatching of __name__ and against chains
+    # of partial()/functools.wraps that strip marker attributes.
+    setattr(audited_delete, _WRAPPER_MARKER, True)
     return audited_delete
 
 
@@ -171,9 +181,17 @@ def install(docStoreConn) -> bool:
     if original is None or not callable(original):
         _logger.debug("docStoreConn has no callable delete; skipping audit hook install")
         return False
-    # Avoid double-wrapping: if the current delete is already our wrapper
-    # (e.g. import chain re-installed), bail out.
-    if getattr(original, "__name__", "") == "audited_delete":
+    # Avoid double-wrapping: check the explicit marker attribute (P2-13) instead
+    # of __name__ string match. Falls back to inspect.unwrap so chains of
+    # functools.wraps-decorated wrappers are also detected.
+    already_audited = getattr(original, _WRAPPER_MARKER, False)
+    if not already_audited:
+        try:
+            unwrapped = inspect.unwrap(original)
+            already_audited = getattr(unwrapped, _WRAPPER_MARKER, False)
+        except ValueError:
+            already_audited = False
+    if already_audited:
         setattr(docStoreConn, _INSTALL_FLAG, True)
         return False
     docStoreConn.delete = make_audited_delete(original)

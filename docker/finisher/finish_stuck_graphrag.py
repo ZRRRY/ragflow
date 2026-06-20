@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 #
 #  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
 #
@@ -94,6 +93,26 @@ def load_service_conf():
 
 
 # ---------------------------------------------------------------------------
+# P2-17: task.update_time 列类型探测 (BigInt 毫秒 vs DATETIME 秒)
+# ---------------------------------------------------------------------------
+# 默认假设 BigInt 毫秒时间戳 (与官方 v0.26.0 一致)。若运维把列改成 DATETIME,
+# 设置 TASK_UPDATE_TIME_FORMAT=datetime 后改用 datetime.now()。
+TASK_UPDATE_TIME_FORMAT = os.environ.get("TASK_UPDATE_TIME_FORMAT", "bigint_ms")
+
+
+def _task_update_time_now() -> int | str:
+    """Return the current timestamp in the format expected by task.update_time.
+
+    Default ``bigint_ms``: ``int(time.time() * 1000)`` (epoch milliseconds).
+    Alternative ``datetime``: ``datetime.now().strftime("%Y-%m-%d %H:%M:%S")``.
+    """
+    if TASK_UPDATE_TIME_FORMAT == "datetime":
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return int(time.time() * 1000)
+
+
+# ---------------------------------------------------------------------------
 # 连接帮助函数:解析 conf 里的 host:port 形式
 # ---------------------------------------------------------------------------
 def _split_host_port(value, default_port):
@@ -151,17 +170,28 @@ def get_kb_tenant_id(conf, kb_id):
         conn.close()
 
 
-def list_stuck_tasks(conf, kb_id):
-    """找出 progress ∈ (0, 1) 的 graphrag 任务。
+def list_stuck_tasks(conf, kb_id, stuck_minutes=None):
+    """找出 progress ∈ (0, 1) 且 update_time 距今超过 stuck_minutes 的 graphrag 任务。
 
     Task 表本身没有 kb_id 字段,关联走反查:
     knowledgebase.graphrag_task_id -> task.id
+
+    stuck_minutes:
+      None  - 不过滤 update_time(保留原行为)
+      N>0   - 仅返回 update_time < now - N 分钟 的 task,避免误命中正在跑的正常任务
     """
     conn = mysql_connect(conf)
     try:
         with conn.cursor() as cur:
+            if stuck_minutes is not None and stuck_minutes > 0:
+                cutoff_ms = int((time.time() - stuck_minutes * 60) * 1000)
+                where_extra = "AND t.update_time < %s"
+                params = (kb_id, cutoff_ms)
+            else:
+                where_extra = ""
+                params = (kb_id,)
             cur.execute(
-                """
+                f"""
                 SELECT t.id, t.doc_id, t.task_type, t.progress, t.progress_msg,
                        t.create_time, t.update_time
                 FROM knowledgebase k
@@ -169,9 +199,10 @@ def list_stuck_tasks(conf, kb_id):
                 WHERE k.id = %s
                   AND t.progress > 0
                   AND t.progress < 1
+                  {where_extra}
                 ORDER BY t.create_time DESC
                 """,
-                (kb_id,),
+                params,
             )
             rows = cur.fetchall()
     finally:
@@ -193,8 +224,8 @@ def list_stuck_tasks(conf, kb_id):
     return out
 
 
-def mark_task_done(conf, task_id, progress_msg):
-    """把 task.progress 改成 1.0。"""
+def mark_task_done(conf, task_id, kb_id, progress_msg):
+    """把 task.progress 改成 1.0。WHERE 二次校验 task.kb 关联防误改。"""
     conn = mysql_connect(conf)
     n = 0
     try:
@@ -206,8 +237,11 @@ def mark_task_done(conf, task_id, progress_msg):
                     progress_msg = %s,
                     update_time = %s
                 WHERE id = %s
+                  AND id IN (
+                      SELECT graphrag_task_id FROM knowledgebase WHERE id = %s
+                  )
                 """,
-                (progress_msg, int(time.time() * 1000), task_id),
+                (progress_msg, _task_update_time_now(), task_id, kb_id),
             )
         conn.commit()
     finally:
@@ -230,7 +264,7 @@ def os_count(conf, tenant_id, query, kb_id=None):
         host_list = list(hosts)
 
     username = os_cfg.get("username", "admin")
-    password = os_cfg.get("password", "")
+    password = os_cfg.get("password") or os.environ.get("OPENSEARCH_PASSWORD", "")
     verify = bool(os_cfg.get("verify_certs", False))
 
     index = f"ragflow_{tenant_id}"
@@ -239,30 +273,36 @@ def os_count(conf, tenant_id, query, kb_id=None):
         must.append({"term": {"kb_id": kb_id}})
     body = {"query": {"bool": {"must": must}}}
 
+    max_retries = 3
     last_err = None
     for host in host_list:
         # 容错:有时是 http://x:9200,有时是裸 x:9200
         if "://" not in host:
             host = "http://" + host
         url = f"{host.rstrip('/')}/{index}/_count"
-        try:
-            resp = requests.post(
-                url,
-                auth=(username, password) if password else None,
-                json=body,
-                timeout=10,
-                verify=verify,
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
-            )
-            if resp.status_code == 200:
-                return resp.json().get("count", 0)
-            if resp.status_code == 404:
-                # 索引不存在 = 0
-                return 0
-            last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
-        except Exception as e:
-            last_err = repr(e)
-            continue
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(
+                    url,
+                    auth=(username, password) if password else None,
+                    json=body,
+                    timeout=10,
+                    verify=verify,
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("count", 0)
+                if resp.status_code == 404:
+                    # 索引不存在 = 0
+                    return 0
+                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            except Exception as e:
+                last_err = repr(e)
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                log.warning("OS count 重试 host=%s attempt=%d/%d wait=%ds err=%s",
+                            host, attempt + 1, max_retries, wait, last_err)
+                time.sleep(wait)
     log.error("OS count 失败: index=%s query=%s kb_id=%s err=%s", index, query, kb_id, last_err)
     return -1
 
@@ -291,7 +331,7 @@ def os_list_ragflow_indices(conf):
     if not base:
         return []
     username = os_cfg.get("username", "admin")
-    password = os_cfg.get("password", "")
+    password = os_cfg.get("password") or os.environ.get("OPENSEARCH_PASSWORD", "")
     verify = bool(os_cfg.get("verify_certs", False))
     auth = (username, password) if password else None
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -436,8 +476,11 @@ def cmd_check(conf, kb_id, os_kb_id):
     return 0
 
 
-def cmd_finish(conf, kb_id, os_kb_id, dry_run):
-    """把卡住的 task 标 done,默认 dry-run。"""
+def cmd_finish(conf, kb_id, os_kb_id, dry_run, stuck_minutes):
+    """把卡住的 task 标 done,默认 dry-run。
+
+    stuck_minutes: 仅 update_time 距今超过 N 分钟的 task 会被 finish,避免误命中正在跑的正常任务。
+    """
     try:
         tenant_id = get_kb_tenant_id(conf, kb_id)
     except Exception as e:
@@ -464,12 +507,16 @@ def cmd_finish(conf, kb_id, os_kb_id, dry_run):
     log.info("将把 task.progress 设为 1.0,progress_msg = %r", progress_msg)
 
     try:
-        tasks = list_stuck_tasks(conf, kb_id)
+        tasks = list_stuck_tasks(conf, kb_id, stuck_minutes=stuck_minutes)
     except Exception as e:
         log.error("读 MySQL 失败: %s", e)
         return 1
+    modified_count = 0
     if not tasks:
-        log.info("没有 progress ∈ (0,1) 的 task,无需 finish。")
+        if stuck_minutes:
+            log.info("没有 progress ∈ (0,1) 且 update_time 超过 %d 分钟的 task,无需 finish。", stuck_minutes)
+        else:
+            log.info("没有 progress ∈ (0,1) 的 task,无需 finish。")
     else:
         for t in tasks:
             log.info(
@@ -480,8 +527,9 @@ def cmd_finish(conf, kb_id, os_kb_id, dry_run):
                 log.info("     [dry-run] 跳过 UPDATE")
             else:
                 try:
-                    n = mark_task_done(conf, t["id"], progress_msg)
+                    n = mark_task_done(conf, t["id"], kb_id, progress_msg)
                     log.info("     UPDATE 影响行数: %d", n)
+                    modified_count += n
                 except Exception as e:
                     log.error("     UPDATE 失败: %s", e)
                     return 1
@@ -499,6 +547,10 @@ def cmd_finish(conf, kb_id, os_kb_id, dry_run):
         log.info("    - %s", k)
 
     log.info("=" * 70)
+    if not dry_run and modified_count == 0:
+        # P3-2: --apply 模式下没有任何 task 被修改,返回非 0 让 CI/告警感知"无效果"。
+        log.warning("--apply 已设置,但没有任何 task 被修改。返回退出码 4。")
+        return 4
     return 0
 
 
@@ -543,6 +595,13 @@ def main():
              "当 MySQL 里 task 关联的 KB 跟 OS 真实写数据的 tenant 索引不一致时,"
              "用这个参数指向 OS 那边真实有数据的 tenant_id,典型场景:KB 重建/迁移过。",
     )
+    p.add_argument(
+        "--stuck-minutes",
+        type=int,
+        default=int(os.environ.get("STUCK_TASK_GRACE_MINUTES", "30")),
+        help="仅 update_time 距今超过 N 分钟的 task 才会被 finish (默认 30,可用 STUCK_TASK_GRACE_MINUTES 环境变量覆盖)。"
+             "避免误命中 progress 在 (0,1) 之间但实际正在跑的正常任务。设为 0 表示不过滤。",
+    )
     args = p.parse_args()
 
     if args.apply and args.dry_run:
@@ -570,7 +629,7 @@ def main():
     if args.action == "check":
         return cmd_check(conf, args.kb_id, os_kb_id)
     if args.action == "finish":
-        return cmd_finish(conf, args.kb_id, os_kb_id, dry_run=dry_run)
+        return cmd_finish(conf, args.kb_id, os_kb_id, dry_run=dry_run, stuck_minutes=args.stuck_minutes)
     if args.action == "cleanup":
         return cmd_cleanup(conf, args.kb_id, dry_run=dry_run)
     return 0

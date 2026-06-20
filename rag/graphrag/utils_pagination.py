@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, AsyncIterator
 
 from common.misc_utils import thread_pool_exec
 from rag.nlp import search
@@ -52,10 +52,17 @@ def _build_query_body(filters: dict, sort_field: str, page_size: int,
         page_size: 每页大小
         search_after: 上一批最后一条的 sort 值；None 表示第一页
     """
+    # search_after requires a globally unique sort tuple. The primary field is
+    # a business keyword (entity_kwd / from_entity_kwd) which can have duplicates
+    # across documents; ``_id`` is appended as a tiebreaker so pagination never
+    # stalls or skips rows when the primary sort value repeats.
     body: dict[str, Any] = {
         "query": {"bool": {"filter": _filters_to_clauses(filters)}},
         "size": page_size,
-        "sort": [{sort_field: {"order": "asc"}}],
+        "sort": [
+            {sort_field: {"order": "asc"}},
+            {"_id": {"order": "asc"}},
+        ],
     }
     if search_after:
         body["search_after"] = search_after

@@ -233,3 +233,6 @@ internal/cpp/cmake-build-debug/
 bin/*
 !bin/.gitkeep
 .claude/settings.local.json
+
+# GraphRAG review documents
+docs/graphrag_review/

@@ -44,34 +44,6 @@ DEFAULT_RESOLUTION_RESULT_DELIMITER = "&&"
 EXCLUDED_RESOLUTION_TYPES = {"书籍", "章节"}
 
 
-def _has_digit_in_2gram_diff(a, b):
-    def to_2gram_set(s):
-        return {s[i:i + 2] for i in range(len(s) - 1)}
-
-    set_a = to_2gram_set(a)
-    set_b = to_2gram_set(b)
-    diff = set_a ^ set_b
-    return any(any(c.isdigit() for c in pair) for pair in diff)
-
-
-def is_similarity_str(a, b):
-    """Module-level character-level similarity check."""
-    if _has_digit_in_2gram_diff(a, b):
-        return False
-
-    if is_english(a) and is_english(b):
-        if editdistance.eval(a, b) <= min(len(a), len(b)) // 2:
-            return True
-        return False
-
-    a, b = set(a), set(b)
-    max_l = max(len(a), len(b))
-    if max_l < 4:
-        return len(a & b) > 1
-
-    return len(a & b) * 1.0 / max_l >= 0.8
-
-
 _EXCLUDED_TYPE_ALIASES = {
     "书籍": {"书籍", "book", "books", "Book", "Books", "BOOK"},
     "章节": {"章节", "chapter", "chapters", "Chapter", "Chapters", "CHAPTER",
@@ -370,28 +342,58 @@ class EntityResolution(Extractor):
 
         return ans_list
 
-    def _has_digit_in_2gram_diff(self, a, b):
-        def to_2gram_set(s):
-            return {s[i:i+2] for i in range(len(s) - 1)}
-
-        set_a = to_2gram_set(a)
-        set_b = to_2gram_set(b)
-        diff = set_a ^ set_b
-
-        return any(any(c.isdigit() for c in pair) for pair in diff)
-
     def is_similarity(self, a, b):
-        if self._has_digit_in_2gram_diff(a, b):
-            return False
+        return is_similarity_str(a, b)
 
-        if is_english(a) and is_english(b):
-            if editdistance.eval(a, b) <= min(len(a), len(b)) // 2:
-                return True
-            return False
 
-        a, b = set(a), set(b)
-        max_l = max(len(a), len(b))
-        if max_l < 4:
-            return len(a & b) > 1
+def is_similarity_str(a: str, b: str) -> bool:
+    """Return True if two entity names are likely referring to the same entity.
 
-        return len(a & b)*1./max_l >= 0.8
+    Stateless version of ``EntityResolution.is_similarity``; kept at module level
+    so incremental resolution paths can import it without instantiating the
+    extractor (P3-1).
+    """
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    if _has_digit_in_2gram_diff(a, b):
+        return False
+
+    if is_english(a) and is_english(b):
+        if editdistance.eval(a, b) <= min(len(a), len(b)) // 2:
+            return True
+        return False
+
+    a, b = set(a), set(b)
+    max_l = max(len(a), len(b))
+    if max_l < 4:
+        return len(a & b) > 1
+
+    return len(a & b)*1./max_l >= 0.8
+
+
+def _has_digit_in_2gram_diff(a: str, b: str) -> bool:
+    """Return True if any 2-gram in the symmetric difference contains a digit.
+
+    Guards against treating ``foo2024`` / ``foo2025`` as the same entity —
+    digits in the differing 2-grams are a strong signal that the strings
+    encode distinct identifiers.
+
+    Edge cases:
+      - None / non-str inputs: treated as not similar (return False).
+      - len < 2: 2-gram set is empty (range(N-1) is empty for N<=1),
+        so the symmetric diff is empty and we return False.
+    """
+    if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+        return False
+
+    def to_2gram_set(s):
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+
+    set_a = to_2gram_set(a)
+    set_b = to_2gram_set(b)
+    diff = set_a ^ set_b
+
+    return any(
+        isinstance(pair, str) and len(pair) >= 2 and any(c.isdigit() for c in pair)
+        for pair in diff
+    )

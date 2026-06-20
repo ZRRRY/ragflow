@@ -504,17 +504,38 @@ class DocumentService(CommonService):
                 # official path both switches are off, so we keep the v0.26.0 behavior exactly.
                 delete_subgraph = GraphRAGConfig.DELETE_SUBGRAPH_ON_DOC_DELETE
                 if delete_subgraph:
-                    settings.docStoreConn.delete(
+                    # Phase 2.5 safety: source_id is a list field, and term-filter
+                    # behavior on missing/typed values is backend-dependent. Resolve
+                    # matching subgraph chunk IDs explicitly so we never accidentally
+                    # delete every subgraph in the KB (or none of them).
+                    subgraph_res = settings.docStoreConn.search(
+                        ["_id"],
+                        [],
                         {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["subgraph"], "source_id": doc.id},
+                        [],
+                        OrderByExpr(),
+                        0,
+                        10000,
                         chunk_index_name,
-                        doc.kb_id,
+                        [doc.kb_id],
                     )
+                    subgraph_ids = list(subgraph_res.ids or [])
+                    if subgraph_ids:
+                        settings.docStoreConn.delete(
+                            {"id": subgraph_ids},
+                            chunk_index_name,
+                            doc.kb_id,
+                        )
 
                 graph_source = settings.docStoreConn.get_fields(
-                    settings.docStoreConn.search(["source_id"], [], {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, [], OrderByExpr(), 0, 1, chunk_index_name, [doc.kb_id]),
+                    settings.docStoreConn.search(["source_id"], [], {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, [], OrderByExpr(), 0, 100, chunk_index_name, [doc.kb_id]),
                     ["source_id"],
                 )
-                if len(graph_source) > 0 and doc.id in list(graph_source.values())[0]["source_id"]:
+                doc_in_graph_source = any(
+                    doc.id in row.get("source_id", [])
+                    for row in graph_source.values()
+                )
+                if doc_in_graph_source:
                     kg_types = ["entity", "relation", "graph", "community_report"]
                     if not delete_subgraph:
                         # v0.26.0 also removes source_id from subgraph chunks before deleting orphans.

@@ -18,6 +18,7 @@ import os
 import re
 import time
 from collections import defaultdict
+from copy import deepcopy
 from hashlib import md5
 from typing import Any, Callable, Set, Tuple
 
@@ -46,6 +47,33 @@ GRAPH_FIELD_SEP = "<SEP>"
 ErrorHandlerFn = Callable[[BaseException | None, str | None, dict | None], None]
 
 chat_limiter = LoopLocalSemaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)))
+
+
+async def _post_insert_refresh(tenant_id: str, callback=None, label: str = "set_graph"):
+    """Refresh the doc store index after a bulk insert so downstream
+    queries see the new data immediately.
+
+    Opt out via ``SET_GRAPH_DELTA_REFRESH_AFTER_INSERT=0`` to rely on the
+    default OpenSearch refresh_interval (1s). Used by both the
+    monolithic and delta ``set_graph`` paths so they share a single
+    refresh policy.
+    """
+    if not GraphRAGConfig.SET_GRAPH_DELTA_REFRESH_AFTER_INSERT:
+        return
+    refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
+    if refresh_fn is None:
+        logging.debug(
+            "%s: docStoreConn has no refresh_idx; relying on default refresh_interval",
+            label,
+        )
+        return
+    try:
+        await thread_pool_exec(refresh_fn, search.index_name(tenant_id))
+    except Exception:
+        logging.exception(
+            "%s: post-insert refresh_idx failed (will rely on default refresh_interval)",
+            label,
+        )
 
 # Doc-store insert batching for GraphRAG subgraph/node/edge/community_report
 # chunks.  Defaults (64 docs per batch, up to 4 batches in flight) mirror the
@@ -536,7 +564,12 @@ async def query_merge_state(
     kb_id: str,
     doc_id: str,
 ) -> dict | None:
-    """查询文档的最新合并状态。返回 None 表示无记录。"""
+    """查询文档的最新合并状态。返回 None 表示无记录。
+
+    由于 ``write_merge_state`` 删除旧记录是非关键操作，异常时可能残留多
+    条同 ``doc_id`` 的 ``merge_state`` 文档。这里取 ``updated_at`` 最大
+    的一条，确保行为确定（P3-2）。
+    """
     condition = {
         "knowledge_graph_kwd": ["merge_state"],
         "source_id": [doc_id],
@@ -545,14 +578,21 @@ async def query_merge_state(
         res = await thread_pool_exec(
             settings.docStoreConn.search,
             ["content_with_weight"], [], condition, [], OrderByExpr(),
-            0, 1, search.index_name(tenant_id), [kb_id],
+            0, 10, search.index_name(tenant_id), [kb_id],
         )
         fields = settings.docStoreConn.get_fields(res, ["content_with_weight"])
+        latest_meta = None
+        latest_ts = -1.0
         for row in fields.values():
             try:
-                return json.loads(row["content_with_weight"])
+                meta = json.loads(row["content_with_weight"])
             except Exception:
                 continue
+            ts = float(meta.get("updated_at", 0) or 0)
+            if ts > latest_ts:
+                latest_ts = ts
+                latest_meta = meta
+        return latest_meta
     except Exception:
         logging.exception("query_merge_state failed for doc %s", doc_id)
     return None
@@ -654,14 +694,20 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
         # Fallback: 旧 size 截断路径
         return await _query_existing_relations_legacy(tenant_id, kb_id, edge_pairs)
 
-    BATCH_SIZE = 50
+    # INPUT_BATCH_SIZE: 每次喂入 query 的 edge_pairs 数量(输入维度)。
+    # 注意:实际 ES 单次 search_after round-trip 的 filter 范围 =
+    # |union(batch from_nodes ∪ to_nodes)|(可能远大于 INPUT_BATCH_SIZE,
+    # 例如 50 对 (A,B) 去重后可能 80 个 unique node)。
+    # ES round-trip 的 page_size 由下方常量 SEARCH_AFTER_PAGE_SIZE 控制。
+    INPUT_BATCH_SIZE = 50
+    SEARCH_AFTER_PAGE_SIZE = 1000
     index_name = search.index_name(tenant_id)
     existing: dict = {}
 
     # 每个 batch 单独发 search_after 翻页查询，filter 与旧实现保持一致
-    # (from_entity_kwd ∈ batch_nodes AND to_entity_kwd ∈ batch_nodes)
-    for i in range(0, len(edge_pairs), BATCH_SIZE):
-        batch = edge_pairs[i:i + BATCH_SIZE]
+    # (from_entity_kwd ∈ all_nodes AND to_entity_kwd ∈ all_nodes)
+    for i in range(0, len(edge_pairs), INPUT_BATCH_SIZE):
+        batch = edge_pairs[i:i + INPUT_BATCH_SIZE]
         all_nodes = list(set(u for u, v in batch) | set(v for u, v in batch))
 
         filters = {
@@ -676,7 +722,7 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
                 kb_id=kb_id,
                 fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
                 sort_field="from_entity_kwd",
-                page_size=1000,
+                page_size=SEARCH_AFTER_PAGE_SIZE,
             )
         except Exception as e:
             logging.warning("query_existing_relations batch %d search_after failed: %s", i, e)
@@ -744,13 +790,16 @@ async def query_node_relations(tenant_id, kb_id, node_names):
     if not _supports_search_after(conn):
         return await _query_node_relations_legacy(tenant_id, kb_id, node_names)
 
-    BATCH_SIZE = 100
+    # INPUT_BATCH_SIZE: 每次喂入的 node 数量(输入维度)。
+    # ES 单次 round-trip 的 page_size 由下方常量 SEARCH_AFTER_PAGE_SIZE 控制。
+    INPUT_BATCH_SIZE = 100
+    SEARCH_AFTER_PAGE_SIZE = 1000
     index_name = search.index_name(tenant_id)
     all_fields: list[dict] = []
     seen: set = set()
 
-    for i in range(0, len(node_names), BATCH_SIZE):
-        batch = node_names[i:i + BATCH_SIZE]
+    for i in range(0, len(node_names), INPUT_BATCH_SIZE):
+        batch = node_names[i:i + INPUT_BATCH_SIZE]
 
         # Query by from_entity_kwd
         try:
@@ -763,7 +812,7 @@ async def query_node_relations(tenant_id, kb_id, node_names):
                 kb_id=kb_id,
                 fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
                 sort_field="from_entity_kwd",
-                page_size=1000,
+                page_size=SEARCH_AFTER_PAGE_SIZE,
             )
         except Exception as e:
             logging.warning("query_node_relations from-batch %d search_after failed: %s", i, e)
@@ -780,7 +829,7 @@ async def query_node_relations(tenant_id, kb_id, node_names):
                 kb_id=kb_id,
                 fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
                 sort_field="to_entity_kwd",
-                page_size=1000,
+                page_size=SEARCH_AFTER_PAGE_SIZE,
             )
         except Exception as e:
             logging.warning("query_node_relations to-batch %d search_after failed: %s", i, e)
@@ -872,8 +921,68 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
 
 
 async def does_graph_contains(tenant_id, kb_id, doc_id):
-    # Legacy path: check monolithic graph chunk
+    # Phase 2.4: single ES round-trip via bool.should, avoiding the previous
+    # 2× round-trip pattern (one for monolithic graph JSON, one for per-doc subgraph).
+    # Two clauses cover both worlds:
+    #   1) monolithic path: knowledge_graph_kwd=graph AND source_id contains doc_id
+    #   2) incremental path: knowledge_graph_kwd=subgraph AND source_id=doc_id
+    # Backends without native should (Infinity/OceanBase) keep the legacy 2× path.
     fields = ["source_id"]
+    index_name = search.index_name(tenant_id)
+
+    if GraphRAGConfig.USE_INCREMENTAL_GRAPH and hasattr(settings.docStoreConn, "os"):
+        raw = settings.docStoreConn.os
+        body = {
+            "size": 1,
+            "query": {
+                "bool": {
+                    "should": [
+                        {
+                            "bool": {
+                                "must": [
+                                    {"term": {"knowledge_graph_kwd": "graph"}},
+                                    {"term": {"removed_kwd": "N"}},
+                                ]
+                            }
+                        },
+                        {
+                            "bool": {
+                                "must": [
+                                    {"term": {"knowledge_graph_kwd": "subgraph"}},
+                                    {"term": {"source_id": doc_id}},
+                                ]
+                            }
+                        },
+                    ],
+                    "minimum_should_match": 1,
+                    "filter": [{"term": {"kb_id": kb_id}}],
+                }
+            },
+        }
+        try:
+            res = await thread_pool_exec(raw.search, index=index_name, body=body)
+        except Exception as e:
+            logging.warning("does_graph_contains combined query failed: %s; falling back to legacy", e)
+            return await _does_graph_contains_legacy(tenant_id, kb_id, doc_id, fields)
+
+        # 必须仍然校验 monolithic chunk 是否真的包含 doc_id (因为 source_id 是 list 字段)
+        hits = res.get("hits", {}).get("hits", [])
+        for h in hits:
+            kw = h.get("_source", {}).get("knowledge_graph_kwd")
+            if kw == "subgraph":
+                return True
+            if kw == "graph":
+                src = h.get("_source", {}).get("source_id") or []
+                if doc_id in (src if isinstance(src, list) else [src]):
+                    return True
+        return False
+
+    # 官方默认路径(无增量):只查 monolithic 一路
+    return await _does_graph_contains_legacy(tenant_id, kb_id, doc_id, fields, incremental=False)
+
+
+async def _does_graph_contains_legacy(tenant_id, kb_id, doc_id, fields, incremental: bool = True):
+    """Legacy 2× round-trip fallback used when combined bool.should is unavailable."""
     condition = {
         "knowledge_graph_kwd": ["graph"],
         "removed_kwd": "N",
@@ -881,7 +990,7 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
     res = await thread_pool_exec(
         settings.docStoreConn.search,
         fields, [], condition, [], OrderByExpr(),
-        0, 1, search.index_name(tenant_id), [kb_id]
+        0, 1, search.index_name(tenant_id), [kb_id],
     )
     fields2 = settings.docStoreConn.get_fields(res, fields)
     for chunk_id in fields2.keys():
@@ -889,8 +998,7 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
         if doc_id in graph_doc_ids:
             return True
 
-    # Incremental path: check per-document subgraph chunks
-    if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
+    if incremental and GraphRAGConfig.USE_INCREMENTAL_GRAPH:
         condition = {
             "knowledge_graph_kwd": ["subgraph"],
             "source_id": doc_id,
@@ -898,7 +1006,7 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
         res = await thread_pool_exec(
             settings.docStoreConn.search,
             fields, [], condition, [], OrderByExpr(),
-            0, 1, search.index_name(tenant_id), [kb_id]
+            0, 1, search.index_name(tenant_id), [kb_id],
         )
         fields2 = settings.docStoreConn.get_fields(res, fields)
         return len(fields2) > 0
@@ -929,6 +1037,11 @@ async def get_graph_from_index(tenant_id, kb_id):
     seen_sources = set()
     total_entities = 0
     total_relations = 0
+
+    # search_with_scroll is only implemented by OpenSearch.  ES / Infinity
+    # callers fall back to None and let the caller pick the monolithic path.
+    if not hasattr(settings.docStoreConn, "search_with_scroll"):
+        return None
 
     # ------------------------------------------------------------------
     # 1. Pull all entity chunks via scroll (bypass max_result_window)
@@ -1050,13 +1163,18 @@ async def get_graph_from_index_for_visualization(
         }
     }
 
+    # ES / Infinity doc store has no search_with_scroll; fall back to None so
+    # callers handle "unsupported backend" uniformly.
+    if not hasattr(settings.docStoreConn, "search_with_scroll"):
+        return None
+
     es_res = await thread_pool_exec(
         settings.docStoreConn.search_with_scroll,
         search.index_name(tenant_id),
         ent_query,
         ent_flds,
         batch_size=1000,
-        max_results=scan_limit,
+        max_pages=max(1, scan_limit // 1000),
     )
     es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
 
@@ -1275,7 +1393,7 @@ async def _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label):
             missed_texts.append(embed_text)
 
     if missed_texts:
-        batch_size = 64
+        batch_size = GraphRAGConfig.EMBED_BATCH_SIZE
         total = len(missed_texts)
 
         async def _embed_one_batch(i):
@@ -1459,6 +1577,7 @@ async def _set_graph_monolithic(tenant_id: str, kb_id: str, embd_mdl, graph: nx.
     start = del_now
 
     await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert chunks")
+    await _post_insert_refresh(tenant_id, callback=callback, label="set_graph_monolithic")
     now = asyncio.get_running_loop().time()
     if callback:
         callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
@@ -1598,20 +1717,7 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
     start = del_now
 
     await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert chunks")
-    # Phase 2.1: 全部 batch 写完后主动 refresh 一次。
-    # insert 内部已经改 refresh="false"，避免 per-batch 等 1-2s。
-    # 这里 refresh 让后续 query（resolution / community 阶段读图）能立刻看到新数据。
-    if chunks:
-        try:
-            refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
-            if refresh_fn is not None:
-                await thread_pool_exec(refresh_fn, search.index_name(tenant_id))
-            else:
-                # 兜底：Infinity 等其他 doc store 可能没有 refresh_idx 接口
-                # 退而依赖默认 refresh_interval
-                logging.debug("docStoreConn has no refresh_idx; relying on default refresh_interval")
-        except Exception:
-            logging.exception("post-insert refresh_idx failed (will rely on default refresh_interval)")
+    await _post_insert_refresh(tenant_id, callback=callback, label="set_graph_delta")
     now = asyncio.get_running_loop().time()
     if callback:
         callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
@@ -1670,6 +1776,41 @@ def merge_tuples(list1, list2):
             if not already_match_flag:
                 result.append(tup)
     return result
+
+
+def n_neighbor(graph: nx.Graph, node, n_hop: int = 2):
+    """Enumerate paths of up to ``n_hop`` edges starting at ``node`` together
+    with the edge weight along each step.
+
+    Returns a list of ``{"path": (n0, n1, ...), "weights": [w0, w1, ...]}``
+    dicts (``len(weights) == len(path) - 1``).  This is the structure consumed
+    by :class:`rag.graphrag.search.KGSearch` for n-hop relation enrichment and
+    is stored per entity chunk as ``n_hop_with_weight``.
+    """
+    source_edge = list(graph.edges(node))
+    if not source_edge:
+        return []
+    count = 1
+    while count < n_hop:
+        count += 1
+        sc_edge = deepcopy(source_edge)
+        source_edge = []
+        for pair in sc_edge:
+            append_edge = list(graph.edges(pair[-1]))
+            for tuples in merge_tuples([pair], append_edge):
+                source_edge.append(tuples)
+    wts = nx.get_edge_attributes(graph, "weight")
+    nbrs = []
+    for path in source_edge:
+        nbr = {"path": path, "weights": []}
+        for i in range(len(path) - 1):
+            f, t = path[i], path[i + 1]
+            w = wts.get((f, t))
+            if w is None:
+                w = wts.get((t, f), 0)
+            nbr["weights"].append(w)
+        nbrs.append(nbr)
+    return nbrs
 
 
 async def get_entity_type2samples(idxnms, kb_ids: list):

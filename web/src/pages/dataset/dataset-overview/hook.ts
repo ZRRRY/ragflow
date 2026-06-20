@@ -41,9 +41,13 @@ const useFetchOverviewTotal = () => {
 };
 
 // Mirrors the file-count strategy used in this page: fetched once on mount
-// with no active polling — see useFetchDocumentList(false). The dataset
-// detail (which carries chunk_count) is invalidated by the document list
-// when docs change, so the count refreshes on cache invalidation only.
+// with no active polling. The chunk_count comes from the KB detail endpoint
+// and is refetched on stale window expiry / manual invalidation. There is
+// currently NO explicit link from useFetchDocumentList's query key to this
+// query — earlier drafts claimed otherwise but the wiring was never added.
+// If on-demand refresh after doc changes is required, wire it explicitly
+// via queryClient.invalidateQueries(DatasetOverviewKeys.chunkCount(id)) in
+// the document-mutation hooks.
 const useFetchDatasetChunkCount = () => {
   const [searchParams] = useSearchParams();
   const { id } = useParams();

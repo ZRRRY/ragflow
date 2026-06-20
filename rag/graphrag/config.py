@@ -5,6 +5,9 @@
 
 所有布尔开关默认关闭（0），确保现有部署行为与官方 v0.26.0 完全一致。
 可通过环境变量或 KB 级解析器配置逐步开启。
+
+注意：所有开关在**导入时**从环境变量读取一次，模块导入后再修改环境变量
+不会生效。需要热加载请使用 ``GraphRAGConfig.reload()``。
 """
 
 import logging
@@ -27,8 +30,6 @@ class GraphRAGConfig:
     # -----------------------------------------------------------------------------
     # Merge 阶段是否使用增量 merge：1=仅合并新增 subgraph，0=官方默认全图 merge
     USE_INCREMENTAL_MERGE = os.environ.get("USE_INCREMENTAL_MERGE", "0") == "1"
-    # 增量 merge 时 CAS 冲突最大重试次数
-    MERGE_CAS_MAX_RETRIES = int(os.environ.get("MERGE_CAS_MAX_RETRIES", "10"))
     # 文档删除时是否立即清理 subgraph：增量路径下自动开启，保持官方默认关闭
     DELETE_SUBGRAPH_ON_DOC_DELETE = USE_INCREMENTAL_GRAPH or USE_INCREMENTAL_MERGE
 
@@ -56,6 +57,20 @@ class GraphRAGConfig:
     # 实体消解最大并发任务数
     RESOLUTION_MAX_CONCURRENT_TASKS = int(
         os.environ.get("RESOLUTION_MAX_CONCURRENT_TASKS", "5")
+    )
+    # 节点/边 embedding 批量调用大小（与 GRAPHRAG_INSERT_BULK_SIZE 风格一致）
+    EMBED_BATCH_SIZE = int(os.environ.get("GRAPHRAG_EMBED_BATCH_SIZE", "64"))
+    # 字符级 fallback：每批新节点数（与 existing_names 形成 batch×|existing| 的笛卡尔积）
+    RESOLUTION_CHAR_BATCH_SIZE = int(os.environ.get("RESOLUTION_CHAR_BATCH_SIZE", "50"))
+    # 字符级 fallback：候选对总数上限，达到后停止扫描（防 OOM）
+    RESOLUTION_CHAR_MAX_CANDIDATES = int(
+        os.environ.get("RESOLUTION_CHAR_MAX_CANDIDATES", "5000")
+    )
+    # set_graph_delta 末尾是否主动 refresh（与 bulk refresh="false" 配套）。
+    # 1=insert 后立即 refresh（下游 query 立即可见，~1s 阻塞开销）
+    # 0=依赖 OS 默认 refresh_interval（1s 自然 flush，下游 query 短暂 stale）
+    SET_GRAPH_DELTA_REFRESH_AFTER_INSERT = (
+        os.environ.get("SET_GRAPH_DELTA_REFRESH_AFTER_INSERT", "1") == "1"
     )
 
     # -----------------------------------------------------------------------------
@@ -120,7 +135,15 @@ class GraphRAGConfig:
     KEEP_RESOLUTION = os.environ.get("GRAPHRAG_KEEP_RESOLUTION", "1") == "1"
 
     @classmethod
-    def log_flags(cls):
+    def log_flags(cls, force: bool = False):
+        """打印当前生效的所有开关。仅在主进程自动调用,worker 不重复打。
+
+        默认情况下,仅当主进程显式调用时才打印(通过 ``_is_main_process``
+        守护)。可在进程入口(如 ``api/ragflow_server.py`` / ``task_executor.py``
+        的 ``main()``)显式调用一次。
+        """
+        if not force and not cls._is_main_process():
+            return
         logger.info(
             "GraphRAGConfig: incremental_graph=%s incremental_merge=%s "
             "delete_subgraph_on_doc_delete=%s "
@@ -159,6 +182,48 @@ class GraphRAGConfig:
             cls.KEEP_RESOLUTION,
         )
 
+    @classmethod
+    def _is_main_process(cls) -> bool:
+        try:
+            from multiprocessing import current_process
+            return current_process().name == "MainProcess"
+        except Exception:
+            return True
 
-# 导入时打印一次，方便运维在首行日志就看到生效配置
-GraphRAGConfig.log_flags()
+    @classmethod
+    def reload(cls):
+        """重新从环境变量读取所有开关。仅在测试场景使用,生产部署需重启。"""
+        cls.USE_INCREMENTAL_GRAPH = os.environ.get("USE_INCREMENTAL_GRAPH", "0") == "1"
+        cls.USE_INCREMENTAL_MERGE = os.environ.get("USE_INCREMENTAL_MERGE", "0") == "1"
+        cls.DELETE_SUBGRAPH_ON_DOC_DELETE = cls.USE_INCREMENTAL_GRAPH or cls.USE_INCREMENTAL_MERGE
+        cls.USE_INCREMENTAL_RESOLUTION = os.environ.get("USE_INCREMENTAL_RESOLUTION", "0") == "1"
+        cls.USE_KNN_FOR_RESOLUTION = os.environ.get("USE_KNN_FOR_RESOLUTION", "0") == "1"
+        cls.ENTITY_RESOLUTION_TOP_K = int(os.environ.get("ENTITY_RESOLUTION_TOP_K", "20"))
+        cls.ENTITY_RESOLUTION_SIM_THRESHOLD = float(os.environ.get("ENTITY_RESOLUTION_SIM_THRESHOLD", "0.7"))
+        cls.ENTITY_RESOLUTION_KNN_CONCURRENCY = int(os.environ.get("ENTITY_RESOLUTION_KNN_CONCURRENCY", "8"))
+        cls.RESOLUTION_BATCH_SIZE = int(os.environ.get("RESOLUTION_BATCH_SIZE", "100"))
+        cls.RESOLUTION_MAX_CONCURRENT_TASKS = int(os.environ.get("RESOLUTION_MAX_CONCURRENT_TASKS", "5"))
+        cls.EMBED_BATCH_SIZE = int(os.environ.get("GRAPHRAG_EMBED_BATCH_SIZE", "64"))
+        cls.RESOLUTION_CHAR_BATCH_SIZE = int(os.environ.get("RESOLUTION_CHAR_BATCH_SIZE", "50"))
+        cls.RESOLUTION_CHAR_MAX_CANDIDATES = int(os.environ.get("RESOLUTION_CHAR_MAX_CANDIDATES", "5000"))
+        cls.USE_ASYNC_COMMUNITY = os.environ.get("USE_ASYNC_COMMUNITY", "0") == "1"
+        cls.USE_ASYNC_KG_PHASES = os.environ.get("USE_ASYNC_KG_PHASES", "0") == "1"
+        cls.KG_POSTPROCESS_QUEUE = os.environ.get("KG_POSTPROCESS_QUEUE", "graphrag:postprocess")
+        cls.RECONCILE_STUCK_ON_BOOT = os.environ.get("RECONCILE_STUCK_ON_BOOT", "0") == "1"
+        cls.STUCK_TASK_GRACE_MINUTES = int(os.environ.get("STUCK_TASK_GRACE_MINUTES", "30"))
+        cls.STUCK_TASK_MIN_NODES = int(os.environ.get("STUCK_TASK_MIN_NODES", "3"))
+        cls.STUCK_TASK_MIN_EDGES = int(os.environ.get("STUCK_TASK_MIN_EDGES", "3"))
+        cls.HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
+        cls.HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "90"))
+        cls.KG_MAX_SAFE_RESUME_NODES = int(os.environ.get("KG_MAX_SAFE_RESUME_NODES", "5000"))
+        cls.GRAPHRAG_MAX_PARALLEL_DOCS = int(os.environ.get("GRAPHRAG_MAX_PARALLEL_DOCS", "4"))
+        cls.USE_CHAPTER_GRAPH = os.environ.get("USE_CHAPTER_GRAPH", "0") == "1"
+        cls.KEEP_SUBGRAPH = os.environ.get("GRAPHRAG_KEEP_SUBGRAPH", "1") == "1"
+        cls.KEEP_MERGE = os.environ.get("GRAPHRAG_KEEP_MERGE", "1") == "1"
+        cls.KEEP_RESOLUTION = os.environ.get("GRAPHRAG_KEEP_RESOLUTION", "1") == "1"
+        logger.info("GraphRAGConfig.reload() applied; current flags logged via log_flags().")
+        cls.log_flags(force=True)
+
+
+# 不在 import 时自动打印,避免 worker 启动时重复污染日志。
+# 需要诊断时显式调用 GraphRAGConfig.log_flags(force=True)。

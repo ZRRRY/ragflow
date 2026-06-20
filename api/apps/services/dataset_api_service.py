@@ -414,8 +414,18 @@ async def _fetch_raw_knowledge_graph(dataset_id: str, tenant_id: str):
 
     This is the official v0.26.0 default path. The incremental path uses
     ``get_graph_from_index_for_visualization`` directly in ``get_knowledge_graph``.
+
+    Defensive depth: re-check ``KnowledgebaseService.accessible`` here so this
+    helper is safe to call from any new entry point (not only ``get_knowledge_graph``),
+    preventing accidental authz bypass if the caller forgets the check.
     """
+    # 防御性深度权限校验:避免被其他入口绕过 (P2-9 安全回归修复)
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return {"graph": {}, "mind_map": {}}
+
     _, kb = KnowledgebaseService.get_by_id(dataset_id)
+    if not kb:
+        return {"graph": {}, "mind_map": {}}
 
     obj = {"graph": {}, "mind_map": {}}
     from rag.nlp import search

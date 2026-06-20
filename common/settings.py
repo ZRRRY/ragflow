@@ -375,8 +375,15 @@ def init_settings():
         STORAGE_IMPL = storage_impl
 
     global retriever, kg_retriever
-    from common.doc_store_audit import install as install_docstore_audit
-    install_docstore_audit(docStoreConn)
+    # P2-14: 兜底 audit hook 的 import 异常。doc_store_audit 模块自身的 import 失败
+    # 不应阻止 API server 启动 (audit hook 是 best-effort 可观测性,非核心路径)。
+    try:
+        from common.doc_store_audit import install as install_docstore_audit
+        install_docstore_audit(docStoreConn)
+    except ImportError as e:
+        logging.warning(f"doc_store_audit hook unavailable, skipping install: {e}")
+    except Exception as e:
+        logging.exception(f"doc_store_audit install failed, continuing without audit: {e}")
 
     retriever = search.Dealer(docStoreConn)
     from rag.graphrag import search as kg_search
