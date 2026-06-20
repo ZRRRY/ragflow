@@ -137,6 +137,9 @@ web_modules/
 # Output of 'npm pack'
 *.tgz
 
+# Claude Code plans / state — local-only artifacts
+.claude/
+
 # Yarn Integrity file
 .yarn-integrity
 
@@ -236,3 +239,8 @@ bin/*
 
 # GraphRAG review documents
 docs/graphrag_review/
+
+# Local agent tooling state (per-developer; not for commit)
+.run/
+.omc/
+.marscode/
