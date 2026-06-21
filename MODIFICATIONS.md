@@ -288,111 +288,12 @@
 
 ---
 
-## 后续开发维护规范
+## 更新规则
 
-> 本文档于 2026-06-20 根据分支重构结果补充。当前分支结构：
-> - `main` → 纯净 `v0.26.1` release（跟踪 `myfork/main`）
-> - `dev` → `v0.26.1` + 自定义 GraphRAG 增量优化补丁 + patch 管理（跟踪 `myfork/dev`）
-> - `backup-20260620` → 原始补丁提交 `41946525f`（冻结，不再更新）
+每次修改 `E:/Library/ragflow` 中的代码时，请按以下步骤更新本文件：
 
-### 核心原则
-
-**能不修改官方文件，就不修改官方文件。** 优先通过新增自定义模块实现功能。
-
-### 1. 修改代码前的检查清单
-
-- [ ] 这个功能是否可以通过新增 `*_extras.py` / `*_patch.py` / `*-extras.ts` 实现？
-- [ ] 是否可以通过 `.env.local` / `docker-compose.override.yml` 配置化？
-- [ ] 是否可以通过子类化继承官方类实现？
-- [ ] 是否可以通过 Monkey Patch 在运行时替换？
-
-只有当以上方法都不可行时，才允许修改官方文件。
-
-### 2. 必须修改官方文件时的规范
-
-#### ① 加标准化 `CUSTOM` 标记
-
-```python
-# === CUSTOM BEGIN [feature-name] ===
-# 原因：官方未提供 XX 扩展点
-# 日期：2026-06-20
-# 关联：your-custom-module.py
-你的代码()
-# === CUSTOM END [feature-name] ===
-```
-
-#### ② 同步更新 patch
-
-```bash
-# 方式一：更新单个 patch
-git diff main...HEAD -- path/to/official/file.py > patches/path_to_official_file.py.patch
-
-# 方式二：重新生成所有 patch
-bash patches/regenerate_patches.sh
-```
-
-#### ③ 验证 patch 还能打到官方代码上
-
-```bash
-git checkout -b patch-test main
-bash patches/apply_patches.sh --check
-git checkout dev
-git branch -D patch-test
-```
-
-### 3. 新增自定义模块的命名规则
-
-| 后缀 | 用途 | 示例 |
-|---|---|---|
-| `*_extras.py` | 附加逻辑 / service / helper | `dataset_api_extras.py` |
-| `*_patch.py` | Monkey Patch 模块 | `redis_conn_patch.py` |
-| `*-extras.ts` | 前端附加模块 | `hook-extras.ts` |
-
-自定义模块的文件名应尽量和对应官方文件同名镜像。
-
-### 4. 官方更新时的标准流程
-
-```bash
-# 1. 同步官方 release
-git fetch origin
-git checkout main
-git reset --hard v0.27.0          # 替换为新 release tag
-git push -f myfork main
-
-# 2. 合并到 dev（永远用 merge，不要用 rebase）
-git checkout dev
-git merge main
-
-# 3. 重点解决带 CUSTOM 标记的官方文件冲突
-# 4. 重新生成 patch
-bash patches/regenerate_patches.sh
-
-# 5. 提交并推送
-git add -A
-git commit -m "sync: merge v0.27.0 and regenerate patches"
-git push myfork dev
-```
-
-### 5. 提交前自查
-
-```bash
-# 当前改了哪些官方文件？
-git diff --name-only main
-
-# 理想情况 ≤12 个，且都有 CUSTOM 标记
-# 如果新增了第 13 个官方文件，停下来评估是否能抽离
-```
-
-### 6. backup 分支
-
-`backup-20260620` 是原始补丁的 frozen 备份，**不要再更新或删除**。如果 `dev` 搞坏，可以从这里重建。
-
-### 7. 旧「文件修改清单」更新规则
-
-每次修改代码时，仍按以下步骤维护上方的「文件修改清单」表格：
-
-1. 找到对应文件行，更新「改动摘要」、「验证状态」、「备注/TODO」。
-2. 新增文件时在表格末尾追加一行。
-3. 涉及环境变量开关时同步更新「关键环境变量开关」表格。
-4. 完成验证后在「验证记录」表格中追加一行。
-5. 有新的待处理事项时在「待处理事项」中追加 TODO。
+1. 在「文件修改清单」表格中找到对应文件，更新「改动摘要」、「验证状态」、「备注/TODO」。
+2. 如果是新增文件，在表格末尾新增一行。
+3. 如果修改涉及环境变量开关，同步更新「关键环境变量开关」表格。
+4. 完成验证后，在「验证记录」表格中追加一行。
+5. 有新的待处理事项时，在「待处理事项」中追加 TODO。
