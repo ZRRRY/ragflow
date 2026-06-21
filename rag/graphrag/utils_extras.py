@@ -772,6 +772,10 @@ async def _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback=No
         # Preserve the fields expected by v0.26.0 KGSearch / UI
         chunk["rank_flt"] = float(node_attrs.get("pagerank", 0) or 0)
         chunk["n_hop_with_weight"] = json.dumps(_utils.n_neighbor(graph, node) or [], ensure_ascii=False)
+        # 书籍/章节类结构节点不需要语义向量，直接入库；不进入批量 embedding。
+        if GraphRAGConfig.should_skip_embedding(node_attrs.get("entity_type")):
+            chunks.append(chunk)
+            continue
         items.append((chunk, node, node))
 
     await _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label="nodes")
@@ -802,6 +806,12 @@ async def _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback=No
             "removed_kwd": "N",
         }
         chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
+        # 与书籍/章节相关的结构关系不需要语义向量，直接入库；不进入批量 embedding。
+        from_type = graph.nodes[from_node].get("entity_type")
+        to_type = graph.nodes[to_node].get("entity_type")
+        if GraphRAGConfig.should_skip_embedding(from_type) or GraphRAGConfig.should_skip_embedding(to_type):
+            chunks.append(chunk)
+            continue
         cache_key = f"{from_node}->{to_node}"
         embed_text = f"{cache_key}: {edge_attrs.get('description', '')}"
         items.append((chunk, cache_key, embed_text))
@@ -1092,7 +1102,6 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
     #   1) monolithic path: knowledge_graph_kwd=graph AND source_id contains doc_id
     #   2) incremental path: knowledge_graph_kwd=subgraph AND source_id=doc_id
     # Backends without native should (Infinity/OceanBase) keep the legacy 2× path.
-    fields = ["source_id"]
     index_name = search.index_name(tenant_id)
 
     if GraphRAGConfig.USE_INCREMENTAL_GRAPH and hasattr(settings.docStoreConn, "os"):

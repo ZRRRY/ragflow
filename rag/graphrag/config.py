@@ -45,33 +45,23 @@ class GraphRAGConfig:
     # KNN 召回 Top-K
     ENTITY_RESOLUTION_TOP_K = int(os.environ.get("ENTITY_RESOLUTION_TOP_K", "20"))
     # KNN 相似度阈值
-    ENTITY_RESOLUTION_SIM_THRESHOLD = float(
-        os.environ.get("ENTITY_RESOLUTION_SIM_THRESHOLD", "0.7")
-    )
+    ENTITY_RESOLUTION_SIM_THRESHOLD = float(os.environ.get("ENTITY_RESOLUTION_SIM_THRESHOLD", "0.7"))
     # KNN 查询并发数
-    ENTITY_RESOLUTION_KNN_CONCURRENCY = int(
-        os.environ.get("ENTITY_RESOLUTION_KNN_CONCURRENCY", "8")
-    )
+    ENTITY_RESOLUTION_KNN_CONCURRENCY = int(os.environ.get("ENTITY_RESOLUTION_KNN_CONCURRENCY", "8"))
     # 实体消解批大小
     RESOLUTION_BATCH_SIZE = int(os.environ.get("RESOLUTION_BATCH_SIZE", "100"))
     # 实体消解最大并发任务数
-    RESOLUTION_MAX_CONCURRENT_TASKS = int(
-        os.environ.get("RESOLUTION_MAX_CONCURRENT_TASKS", "5")
-    )
+    RESOLUTION_MAX_CONCURRENT_TASKS = int(os.environ.get("RESOLUTION_MAX_CONCURRENT_TASKS", "5"))
     # 节点/边 embedding 批量调用大小（与 GRAPHRAG_INSERT_BULK_SIZE 风格一致）
     EMBED_BATCH_SIZE = int(os.environ.get("GRAPHRAG_EMBED_BATCH_SIZE", "64"))
     # 字符级 fallback：每批新节点数（与 existing_names 形成 batch×|existing| 的笛卡尔积）
     RESOLUTION_CHAR_BATCH_SIZE = int(os.environ.get("RESOLUTION_CHAR_BATCH_SIZE", "50"))
     # 字符级 fallback：候选对总数上限，达到后停止扫描（防 OOM）
-    RESOLUTION_CHAR_MAX_CANDIDATES = int(
-        os.environ.get("RESOLUTION_CHAR_MAX_CANDIDATES", "5000")
-    )
+    RESOLUTION_CHAR_MAX_CANDIDATES = int(os.environ.get("RESOLUTION_CHAR_MAX_CANDIDATES", "5000"))
     # set_graph_delta 末尾是否主动 refresh（与 bulk refresh="false" 配套）。
     # 1=insert 后立即 refresh（下游 query 立即可见，~1s 阻塞开销）
     # 0=依赖 OS 默认 refresh_interval（1s 自然 flush，下游 query 短暂 stale）
-    SET_GRAPH_DELTA_REFRESH_AFTER_INSERT = (
-        os.environ.get("SET_GRAPH_DELTA_REFRESH_AFTER_INSERT", "1") == "1"
-    )
+    SET_GRAPH_DELTA_REFRESH_AFTER_INSERT = os.environ.get("SET_GRAPH_DELTA_REFRESH_AFTER_INSERT", "1") == "1"
 
     # -----------------------------------------------------------------------------
     # Phase 4 – 异步 Community 开关
@@ -134,6 +124,43 @@ class GraphRAGConfig:
     # 重跑时是否保留 resolution 产物。默认 1，与官方 v0.26.0（不清空）保持一致。
     KEEP_RESOLUTION = os.environ.get("GRAPHRAG_KEEP_RESOLUTION", "1") == "1"
 
+    # -------------------------------------------------------------------------
+    # 书籍/章节类实体在 merge/set_graph 阶段跳过 vector embedding
+    # -------------------------------------------------------------------------
+    # 这些结构型节点不需要语义向量检索；跳过可节省 embedding 调用与存储。
+    NO_EMBED_ENTITY_TYPES = frozenset({"书籍", "章节"})
+    _NO_EMBED_TYPE_ALIASES = {
+        "书籍": frozenset({"书籍", "book", "books", "Book", "Books", "BOOK"}),
+        "章节": frozenset(
+            {
+                "章节",
+                "chapter",
+                "chapters",
+                "Chapter",
+                "Chapters",
+                "CHAPTER",
+                "section",
+                "sections",
+                "Section",
+                "Sections",
+                "SECTION",
+            }
+        ),
+    }
+
+    @staticmethod
+    def should_skip_embedding(entity_type: str | None) -> bool:
+        """Return True for book/chapter-like entity types."""
+        if not entity_type:
+            return False
+        if entity_type in GraphRAGConfig.NO_EMBED_ENTITY_TYPES:
+            return True
+        et_lower = entity_type.lower()
+        for aliases in GraphRAGConfig._NO_EMBED_TYPE_ALIASES.values():
+            if et_lower in {a.lower() for a in aliases}:
+                return True
+        return False
+
     @classmethod
     def log_flags(cls, force: bool = False):
         """打印当前生效的所有开关。仅在主进程自动调用,worker 不重复打。
@@ -186,6 +213,7 @@ class GraphRAGConfig:
     def _is_main_process(cls) -> bool:
         try:
             from multiprocessing import current_process
+
             return current_process().name == "MainProcess"
         except Exception:
             return True
@@ -234,3 +262,13 @@ class GraphRAGConfig:
 # 关联：rag/utils/redis_conn_patch.py
 from rag.utils import redis_conn_patch  # noqa: F401
 # === CUSTOM END [redis-conn-monkey-patch] ===
+
+# === CUSTOM BEGIN [siliconflow-timeout-patch] ===
+# 原因：SiliconFlow Embedding 在 GraphRAG 批量请求时 30s 容易超时，
+#      通过 monkey patch 注入可配置超时，避免直接修改官方 embedding_model.py。
+# 日期：2026-06-21
+# 关联：rag/llm/siliconflow_timeout_patch.py
+from rag.llm.siliconflow_timeout_patch import install as install_siliconflow_timeout_patch
+
+install_siliconflow_timeout_patch()
+# === CUSTOM END [siliconflow-timeout-patch] ===

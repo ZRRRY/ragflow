@@ -399,18 +399,24 @@ async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks, nhop_neig
         "available_int": 0,
     }
     chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
-    ebd = get_embed_cache(embd_mdl.llm_name, ent_name)
-    if ebd is None:
-        async with chat_limiter:
-            timeout = 3 if enable_timeout_assertion else 30000000
-            ebd, _ = await asyncio.wait_for(
-                thread_pool_exec(embd_mdl.encode, [ent_name]),
-                timeout=timeout
-            )
-        ebd = ebd[0]
-        set_embed_cache(embd_mdl.llm_name, ent_name, ebd)
-    assert ebd is not None
-    chunk["q_%d_vec" % len(ebd)] = ebd
+    # === CUSTOM BEGIN [chapter-graph-no-embed] ===
+    # 原因：书籍/章节类结构节点不需要语义向量，跳过 embedding 以节省调用。
+    # 日期：2026-06-21
+    # 关联：rag/graphrag/config.py
+    if not GraphRAGConfig.should_skip_embedding(meta.get("entity_type")):
+        ebd = get_embed_cache(embd_mdl.llm_name, ent_name)
+        if ebd is None:
+            async with chat_limiter:
+                timeout = 3 if enable_timeout_assertion else 30000000
+                ebd, _ = await asyncio.wait_for(
+                    thread_pool_exec(embd_mdl.encode, [ent_name]),
+                    timeout=timeout
+                )
+            ebd = ebd[0]
+            set_embed_cache(embd_mdl.llm_name, ent_name, ebd)
+        assert ebd is not None
+        chunk["q_%d_vec" % len(ebd)] = ebd
+    # === CUSTOM END [chapter-graph-no-embed] ===
     chunks.append(chunk)
 
 
@@ -436,7 +442,7 @@ async def get_relation(tenant_id, kb_id, from_ent_name, to_ent_name, size=1):
     return res
 
 
-async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta, chunks):
+async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta, chunks, skip_embedding=False):
     enable_timeout_assertion = os.environ.get("ENABLE_TIMEOUT_ASSERTION")
     chunk = {
         "id": get_uuid(),
@@ -452,22 +458,28 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
         "available_int": 0,
     }
     chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
-    txt = f"{from_ent_name}->{to_ent_name}"
-    ebd = get_embed_cache(embd_mdl.llm_name, txt)
-    if ebd is None:
-        async with chat_limiter:
-            timeout = 3 if enable_timeout_assertion else 300000000
-            ebd, _ = await asyncio.wait_for(
-                thread_pool_exec(
-                    embd_mdl.encode,
-                    [txt + f": {meta['description']}"]
-                ),
-                timeout=timeout
-            )
-        ebd = ebd[0]
-        set_embed_cache(embd_mdl.llm_name, txt, ebd)
-    assert ebd is not None
-    chunk["q_%d_vec" % len(ebd)] = ebd
+    # === CUSTOM BEGIN [chapter-graph-no-embed] ===
+    # 原因：与书籍/章节相关的结构关系不需要语义向量，跳过 embedding。
+    # 日期：2026-06-21
+    # 关联：rag/graphrag/config.py
+    if not skip_embedding:
+        txt = f"{from_ent_name}->{to_ent_name}"
+        ebd = get_embed_cache(embd_mdl.llm_name, txt)
+        if ebd is None:
+            async with chat_limiter:
+                timeout = 3 if enable_timeout_assertion else 300000000
+                ebd, _ = await asyncio.wait_for(
+                    thread_pool_exec(
+                        embd_mdl.encode,
+                        [txt + f": {meta['description']}"]
+                    ),
+                    timeout=timeout
+                )
+            ebd = ebd[0]
+            set_embed_cache(embd_mdl.llm_name, txt, ebd)
+        assert ebd is not None
+        chunk["q_%d_vec" % len(ebd)] = ebd
+    # === CUSTOM END [chapter-graph-no-embed] ===
     chunks.append(chunk)
 
 
@@ -602,8 +614,16 @@ async def _set_graph_impl(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
         edge_attrs = graph.get_edge_data(from_node, to_node)
         if not edge_attrs:
             continue
+        # === CUSTOM BEGIN [chapter-graph-no-embed] ===
+        # 原因：识别与书籍/章节相关的结构关系，透传 skip_embedding 给 graph_edge_to_chunk。
+        # 日期：2026-06-21
+        # 关联：rag/graphrag/config.py
+        from_type = graph.nodes[from_node].get("entity_type")
+        to_type = graph.nodes[to_node].get("entity_type")
+        skip_edge = GraphRAGConfig.should_skip_embedding(from_type) or GraphRAGConfig.should_skip_embedding(to_type)
+        # === CUSTOM END [chapter-graph-no-embed] ===
         tasks.append(asyncio.create_task(
-            graph_edge_to_chunk(kb_id, embd_mdl, from_node, to_node, edge_attrs, chunks)
+            graph_edge_to_chunk(kb_id, embd_mdl, from_node, to_node, edge_attrs, chunks, skip_embedding=skip_edge)
         ))
         if ii % 100 == 9 and callback:
             callback(msg=f"Get embedding of edges: {ii}/{len(change.added_updated_edges)}")
