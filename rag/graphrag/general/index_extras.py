@@ -520,16 +520,6 @@ async def run_graphrag_for_kb(
             sg = subgraphs[doc_id]
             union_nodes.update(set(sg.nodes()))
 
-            if GraphRAGConfig.USE_INCREMENTAL_MERGE:
-                await write_merge_state(
-                    tenant_id,
-                    kb_id,
-                    doc_id,
-                    state="merging",
-                    expected_nodes=len(sg.nodes),
-                    expected_edges=len(sg.edges),
-                )
-
             try:
                 async def merge_subgraph_attempt():
                     if GraphRAGConfig.USE_INCREMENTAL_MERGE:
@@ -539,6 +529,16 @@ async def run_graphrag_for_kb(
                                 msg=f"[GraphRAG] merge_subgraph doc:{doc_id} already merged, skipping retry."
                             )
                             return None
+                        # Only mark as merging when we are actually going to merge,
+                        # otherwise an already-merged doc would be overwritten with "merging".
+                        await write_merge_state(
+                            tenant_id,
+                            kb_id,
+                            doc_id,
+                            state="merging",
+                            expected_nodes=len(sg.nodes),
+                            expected_edges=len(sg.edges),
+                        )
                     else:
                         # Official full-graph path: load global graph and check source_id.
                         current_graph = await get_graph(tenant_id, kb_id)
