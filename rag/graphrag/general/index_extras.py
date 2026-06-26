@@ -603,6 +603,16 @@ async def run_graphrag_for_kb(
             resolution_pending = with_resolution
             community_pending = with_community
             callback(msg=f"[GraphRAG] dataset:{kb_id} cleared phase markers after merge.")
+
+        # Phase 2.5: recompute global PageRank once after all subgraphs are merged.
+        if (
+            GraphRAGConfig.RECALC_GLOBAL_PAGERANK_AFTER_MERGE
+            and GraphRAGConfig.USE_INCREMENTAL_MERGE
+            and ok_docs
+        ):
+            await recalc_global_pagerank(
+                tenant_id, kb_id, embedding_model, callback, task_id=task_id
+            )
     finally:
         try:
             _held = asyncio.get_running_loop().time() - lock_held_t0
@@ -1131,6 +1141,130 @@ async def generate_subgraph(
     now = asyncio.get_running_loop().time()
     callback(msg=f"generated subgraph for doc {doc_id} in {now - start:.2f} seconds.")
     return subgraph
+
+
+async def recalc_global_pagerank(
+    tenant_id: str,
+    kb_id: str,
+    embedding_model,
+    callback,
+    task_id: str = "",
+):
+    """After all subgraphs are merged, load the global graph once, recompute
+    PageRank on the complete topology, and write the updated values back to all
+    entity chunks.
+
+    This compensates for ``merge_subgraph_incremental`` which intentionally
+    skips global PageRank to avoid loading the full graph for every document.
+    """
+    _has_cancel_and_exit(
+        task_id, f"Task {task_id} cancelled before global pagerank recalc.", callback
+    )
+    start = asyncio.get_running_loop().time()
+    callback(msg=f"[GraphRAG] dataset:{kb_id} start global pagerank recalc.")
+
+    # 1. Load the global graph.
+    graph = await get_graph(tenant_id, kb_id)
+    if graph is None or len(graph.nodes) == 0:
+        callback(msg=f"[GraphRAG] dataset:{kb_id} no global graph; skip pagerank recalc.")
+        return
+
+    # 2. Compute global PageRank.
+    pr = nx.pagerank(graph)
+
+    # 3. Fetch all entity chunks while preserving full _source (including vectors).
+    if not hasattr(settings.docStoreConn, "search_with_scroll"):
+        callback(
+            msg=f"[GraphRAG] dataset:{kb_id} backend lacks search_with_scroll; skip pagerank recalc."
+        )
+        return
+
+    query_body = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"kb_id": [kb_id]}},
+                    {"terms": {"knowledge_graph_kwd": ["entity"]}},
+                ]
+            }
+        }
+    }
+    try:
+        res = await thread_pool_exec(
+            settings.docStoreConn.search_with_scroll,
+            search.index_name(tenant_id),
+            query_body,
+            [],
+        )
+    except Exception as e:
+        logging.exception("Failed to load entity chunks for pagerank recalc: %s", e)
+        callback(msg=f"[GraphRAG] dataset:{kb_id} failed to load entities for pagerank recalc: {e!r}")
+        return
+
+    hits = res.get("hits", {}).get("hits", [])
+    if not hits:
+        callback(msg=f"[GraphRAG] dataset:{kb_id} no entity chunks found; skip pagerank recalc.")
+        return
+
+    # 4. Build updated chunks preserving every field from _source.
+    updated_chunks = []
+    skipped = 0
+    for hit in hits:
+        _has_cancel_and_exit(
+            task_id, f"Task {task_id} cancelled during pagerank recalc.", callback
+        )
+        cid = hit.get("_id")
+        source = hit.get("_source", {})
+        if not cid:
+            skipped += 1
+            continue
+
+        entity_name = source.get("entity_kwd")
+        if isinstance(entity_name, list):
+            entity_name = entity_name[0] if entity_name else None
+        if not entity_name:
+            skipped += 1
+            continue
+
+        try:
+            meta = json.loads(source.get("content_with_weight", "{}"))
+        except Exception:
+            skipped += 1
+            continue
+
+        new_pr = float(pr.get(entity_name, 0.0) or 0.0)
+        meta["pagerank"] = new_pr
+
+        new_chunk = dict(source)
+        new_chunk["id"] = cid
+        new_chunk["content_with_weight"] = json.dumps(meta, ensure_ascii=False)
+        new_chunk["rank_flt"] = new_pr
+        updated_chunks.append(new_chunk)
+
+    if not updated_chunks:
+        callback(msg=f"[GraphRAG] dataset:{kb_id} no valid entity chunks to update.")
+        return
+
+    # 5. Bulk overwrite entity chunks.
+    await insert_chunks_bounded(
+        updated_chunks, tenant_id, kb_id,
+        callback=callback, label="Update entity pagerank"
+    )
+
+    # 6. Best-effort refresh so downstream queries see new ranks immediately.
+    refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
+    if refresh_fn is not None:
+        try:
+            await thread_pool_exec(refresh_fn, search.index_name(tenant_id))
+        except Exception:
+            logging.exception("refresh_idx failed after pagerank recalc (non-fatal)")
+
+    now = asyncio.get_running_loop().time()
+    callback(
+        msg=f"[GraphRAG] dataset:{kb_id} global pagerank recalc done: "
+            f"updated {len(updated_chunks)} entities, skipped {skipped}, "
+            f"in {now - start:.2f}s."
+    )
 
 
 async def merge_subgraph_incremental(

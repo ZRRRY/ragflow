@@ -34,6 +34,16 @@ class GraphRAGConfig:
     DELETE_SUBGRAPH_ON_DOC_DELETE = USE_INCREMENTAL_GRAPH or USE_INCREMENTAL_MERGE
 
     # -----------------------------------------------------------------------------
+    # Phase 2.5 – 增量合并后全局 PageRank 重算
+    # -----------------------------------------------------------------------------
+    # 增量 merge 全部完成后，是否加载一次全局图并重新计算 PageRank 写回索引。
+    # 1=开启（merge 阶段末尾增加一次全图加载与全量 entity 更新）。
+    # 0=关闭（保持现有行为：增量 merge 不更新全局 PageRank）。
+    RECALC_GLOBAL_PAGERANK_AFTER_MERGE = os.environ.get(
+        "RECALC_GLOBAL_PAGERANK_AFTER_MERGE", "0"
+    ) == "1"
+
+    # -----------------------------------------------------------------------------
     # Phase 3 – 增量实体消解开关
     # -----------------------------------------------------------------------------
     # 实体消解是否使用增量 resolution：1=按 entity_type 分批消解，0=官方默认全图消解
@@ -174,6 +184,7 @@ class GraphRAGConfig:
         logger.info(
             "GraphRAGConfig: incremental_graph=%s incremental_merge=%s "
             "delete_subgraph_on_doc_delete=%s "
+            "recalc_global_pagerank_after_merge=%s "
             "incremental_resolution=%s async_community=%s "
             "async_kg_phases=%s "
             "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d "
@@ -186,6 +197,7 @@ class GraphRAGConfig:
             cls.USE_INCREMENTAL_GRAPH,
             cls.USE_INCREMENTAL_MERGE,
             cls.DELETE_SUBGRAPH_ON_DOC_DELETE,
+            cls.RECALC_GLOBAL_PAGERANK_AFTER_MERGE,
             cls.USE_INCREMENTAL_RESOLUTION,
             cls.USE_ASYNC_COMMUNITY,
             cls.USE_ASYNC_KG_PHASES,
@@ -224,6 +236,9 @@ class GraphRAGConfig:
         cls.USE_INCREMENTAL_GRAPH = os.environ.get("USE_INCREMENTAL_GRAPH", "0") == "1"
         cls.USE_INCREMENTAL_MERGE = os.environ.get("USE_INCREMENTAL_MERGE", "0") == "1"
         cls.DELETE_SUBGRAPH_ON_DOC_DELETE = cls.USE_INCREMENTAL_GRAPH or cls.USE_INCREMENTAL_MERGE
+        cls.RECALC_GLOBAL_PAGERANK_AFTER_MERGE = os.environ.get(
+            "RECALC_GLOBAL_PAGERANK_AFTER_MERGE", "0"
+        ) == "1"
         cls.USE_INCREMENTAL_RESOLUTION = os.environ.get("USE_INCREMENTAL_RESOLUTION", "0") == "1"
         cls.USE_KNN_FOR_RESOLUTION = os.environ.get("USE_KNN_FOR_RESOLUTION", "0") == "1"
         cls.ENTITY_RESOLUTION_TOP_K = int(os.environ.get("ENTITY_RESOLUTION_TOP_K", "20"))

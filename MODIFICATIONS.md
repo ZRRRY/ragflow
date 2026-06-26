@@ -69,6 +69,11 @@
 | `USE_INCREMENTAL_MERGE` | `1`（代码默认 `0`） | Merge 阶段：1=仅合并新增 subgraph，0=官方默认全图 merge |
 | `GRAPHRAG_MERGE_TIMEOUT_SECONDS` | `1800` | Merge 阶段单步超时（秒） |
 
+### Phase 2.5：增量合并后全局 PageRank 重算
+| 环境变量 | 默认值 | 控制功能 |
+|----------|--------|----------|
+| `RECALC_GLOBAL_PAGERANK_AFTER_MERGE` | `0` | 增量 merge 全部完成后是否加载一次全图重算 PageRank 并写回 entity chunks：1=开启，0=关闭。需同时开启 `USE_INCREMENTAL_MERGE=1`；仅 OpenSearch 后端（`search_with_scroll` 可用）实际生效，其他后端自动 skip。`merge_subgraph_incremental` 故意跳过全局 PageRank 以避免逐文档加载全图；本开关提供一次性补偿。 |
+
 ### Phase 3：增量实体消解
 | 环境变量 | 默认值 | 控制功能 |
 |----------|--------|----------|
@@ -258,6 +263,7 @@
 | 2.22 | `EntityResolution` 默认不排除类型 | `rag/graphrag/entity_resolution.py` 中 `excluded_types=None` 时为空 set；增量路径显式传入 `build_excluded_types` | ✅ 已完成 |
 | 2.23 | `rebuild_graph` 分页大小 | `rag/graphrag/utils.py` 中 `rebuild_graph` 的 `bs` 从 5000 还原为官方 256 | ✅ 已完成 |
 | 2.24 | `get_knowledge_graph` 增量路径可视化优化 | `USE_INCREMENTAL_GRAPH=1` 时走 `get_graph_from_index_for_visualization` 采样路径；节点 256 / 边 128 与官方一致；`rag/graphrag/utils.py` 新增该函数 | ✅ 已完成 |
+| 2.25 | 增量 merge 后全局 PageRank 重算 | `rag/graphrag/config.py` 新增 `RECALC_GLOBAL_PAGERANK_AFTER_MERGE`（默认 `0`）；`rag/graphrag/general/index_extras.py` 新增 `recalc_global_pagerank()`，在 `run_graphrag_for_kb` merge 全部完成后调用一次。`merge_subgraph_incremental` 故意跳过全局 PageRank 以避免逐文档加载全图；本开关提供一次性补偿。仅 OpenSearch 后端实际生效（依赖 `search_with_scroll`），ES / Infinity 自动 skip | ✅ 已完成 |
 | 3.2 | `docker/docker-compose-base.yml` OpenSearch JVM 内存 | 新增 `OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g` | ✅ 已完成 |
 | 4.2 | `dataset_api.py` 删除图路由 | 当前工作区**新增** `DELETE /datasets/<id>/graph` 路由，以兼容官方 v0.26.0 前端删除按钮；前端删除图谱相关代码当前未修改 | ✅ 已完成 |
 
