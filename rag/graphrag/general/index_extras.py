@@ -1163,16 +1163,91 @@ async def recalc_global_pagerank(
     start = asyncio.get_running_loop().time()
     callback(msg=f"[GraphRAG] dataset:{kb_id} start global pagerank recalc.")
 
-    # 1. Load the global graph.
-    graph = await get_graph(tenant_id, kb_id)
+    # 1. Load the global graph with structural nodes (book / chapter) filtered
+    # out at load time. Both the persisted snapshot and PageRank use this
+    # filtered graph so that structural nodes never participate in the global
+    # graph or its ranking.
+    has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
+    callback(
+        msg=f"[GraphRAG] dataset:{kb_id} pagerank recalc: docStoreConn has search_with_scroll={has_scroll}."
+    )
+
+    if not has_scroll and type(settings.docStoreConn).__name__ == "ESConnection":
+        try:
+            from common.doc_store.es_conn_extras import install as install_es_conn_extras
+            install_es_conn_extras()
+            has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
+            callback(
+                msg=f"[GraphRAG] dataset:{kb_id} pagerank recalc: re-installed es extras, "
+                    f"search_with_scroll={has_scroll}."
+            )
+        except Exception as e:
+            logging.exception("Failed to install es_conn_extras: %s", e)
+            callback(msg=f"[GraphRAG] dataset:{kb_id} failed to install es extras: {e!r}")
+
+    if has_scroll:
+        try:
+            graph = await get_graph_from_index(
+                tenant_id,
+                kb_id,
+                exclude_entity_types=GraphRAGConfig.NO_EMBED_ENTITY_TYPES,
+            )
+            callback(
+                msg=f"[GraphRAG] dataset:{kb_id} get_graph_from_index returned "
+                    f"{'None' if graph is None else f'graph(nodes={len(graph.nodes)}, edges={len(graph.edges)})'}"
+            )
+        except Exception as e:
+            logging.exception("get_graph_from_index failed for pagerank recalc: %s", e)
+            callback(msg=f"[GraphRAG] dataset:{kb_id} get_graph_from_index failed: {e!r}")
+            graph = None
+    else:
+        graph = None
+
+    if graph is None:
+        try:
+            graph = await get_graph(tenant_id, kb_id)
+            callback(
+                msg=f"[GraphRAG] dataset:{kb_id} get_graph fallback returned "
+                    f"{'None' if graph is None else f'graph(nodes={len(graph.nodes)}, edges={len(graph.edges)})'}"
+            )
+        except Exception as e:
+            logging.exception("get_graph fallback failed for pagerank recalc: %s", e)
+            callback(msg=f"[GraphRAG] dataset:{kb_id} get_graph fallback failed: {e!r}")
+            graph = None
+
+        if graph is not None:
+            excluded_nodes = {
+                node
+                for node, attrs in graph.nodes(data=True)
+                if GraphRAGConfig.should_skip_embedding(attrs.get("entity_type"))
+            }
+            if excluded_nodes:
+                graph.remove_nodes_from(excluded_nodes)
+                callback(
+                    msg=f"[GraphRAG] dataset:{kb_id} excluded {len(excluded_nodes)} "
+                        f"structural nodes after loading."
+                )
+
     if graph is None or len(graph.nodes) == 0:
         callback(msg=f"[GraphRAG] dataset:{kb_id} no global graph; skip pagerank recalc.")
         return
 
-    # 2. Compute global PageRank.
-    pr = nx.pagerank(graph)
+    callback(
+        msg=f"[GraphRAG] dataset:{kb_id} loaded global graph for pagerank recalc: "
+            f"nodes={len(graph.nodes)} edges={len(graph.edges)}."
+    )
 
-    # 3. Fetch all entity chunks while preserving full _source (including vectors).
+    # 2. Compute global PageRank on the filtered graph.
+    pr = nx.pagerank(graph)
+    callback(
+        msg=f"[GraphRAG] dataset:{kb_id} pagerank computed for {len(pr)} nodes."
+    )
+
+    # 3. Apply the recomputed pagerank to graph nodes.
+    for node_name, pagerank in pr.items():
+        graph.nodes[node_name]["pagerank"] = pagerank
+
+    # 4. Fetch all entity chunks while preserving full _source (including vectors).
     if not hasattr(settings.docStoreConn, "search_with_scroll"):
         callback(
             msg=f"[GraphRAG] dataset:{kb_id} backend lacks search_with_scroll; skip pagerank recalc."
@@ -1206,7 +1281,8 @@ async def recalc_global_pagerank(
         callback(msg=f"[GraphRAG] dataset:{kb_id} no entity chunks found; skip pagerank recalc.")
         return
 
-    # 4. Build updated chunks preserving every field from _source.
+    # 5. Build updated chunks preserving every field from _source.
+    # Structural nodes (book/chapter) keep their original pagerank untouched.
     updated_chunks = []
     skipped = 0
     for hit in hits:
@@ -1232,6 +1308,12 @@ async def recalc_global_pagerank(
             skipped += 1
             continue
 
+        if GraphRAGConfig.should_skip_embedding(meta.get("entity_type")):
+            # Structural nodes (book/chapter) are excluded from the PageRank
+            # graph; leave their stored pagerank as-is.
+            skipped += 1
+            continue
+
         new_pr = float(pr.get(entity_name, 0.0) or 0.0)
         meta["pagerank"] = new_pr
 
@@ -1245,13 +1327,13 @@ async def recalc_global_pagerank(
         callback(msg=f"[GraphRAG] dataset:{kb_id} no valid entity chunks to update.")
         return
 
-    # 5. Bulk overwrite entity chunks.
+    # 6. Bulk overwrite entity chunks.
     await insert_chunks_bounded(
         updated_chunks, tenant_id, kb_id,
         callback=callback, label="Update entity pagerank"
     )
 
-    # 6. Best-effort refresh so downstream queries see new ranks immediately.
+    # 7. Best-effort refresh so downstream queries see new ranks immediately.
     refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
     if refresh_fn is not None:
         try:

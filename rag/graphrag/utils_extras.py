@@ -508,18 +508,24 @@ async def _query_node_relations_legacy(tenant_id, kb_id, node_names):
     return all_fields
 
 
-async def get_graph_from_index(tenant_id, kb_id):
+async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
     """Assemble the global graph from discrete ``entity`` and ``relation``
     chunks stored in the doc store (incremental / decoupled storage mode).
 
     This replaces the monolithic ``knowledge_graph_kwd="graph"`` JSON blob
     with on-the-fly assembly from indexed node/edge documents.
+
+    Args:
+        exclude_entity_types: Optional set of entity types to exclude from the
+            assembled graph (e.g. book/chapter structural nodes). Relations
+            incident to excluded nodes are also dropped.
     """
     graph = nx.Graph()
     graph.graph["source_id"] = []
     seen_sources = set()
     total_entities = 0
     total_relations = 0
+    excluded_nodes = set()
 
     # search_with_scroll is only implemented by OpenSearch.  ES / Infinity
     # callers fall back to None and let the caller pick the monolithic path.
@@ -556,9 +562,16 @@ async def get_graph_from_index(tenant_id, kb_id):
             ent_name = d["entity_kwd"]
             if isinstance(ent_name, list):
                 ent_name = ent_name[0] if ent_name else None
-            if ent_name:
-                graph.add_node(ent_name, **meta)
-                total_entities += 1
+            if not ent_name:
+                continue
+
+            ent_type = meta.get("entity_type")
+            if exclude_entity_types and ent_type in exclude_entity_types:
+                excluded_nodes.add(ent_name)
+                continue
+
+            graph.add_node(ent_name, **meta)
+            total_entities += 1
             for sid in meta.get("source_id", []):
                 seen_sources.add(sid)
         except Exception:
@@ -601,19 +614,26 @@ async def get_graph_from_index(tenant_id, kb_id):
                 from_node = from_node[0] if from_node else None
             if isinstance(to_node, list):
                 to_node = to_node[0] if to_node else None
-            if from_node and to_node and from_node in graph.nodes and to_node in graph.nodes:
+            if (
+                from_node
+                and to_node
+                and from_node not in excluded_nodes
+                and to_node not in excluded_nodes
+                and from_node in graph.nodes
+                and to_node in graph.nodes
+            ):
                 graph.add_edge(from_node, to_node, **meta)
                 total_relations += 1
-            for sid in meta.get("source_id", []):
-                seen_sources.add(sid)
+                for sid in meta.get("source_id", []):
+                    seen_sources.add(sid)
         except Exception:
             logging.exception("Failed to parse relation chunk %s", _cid)
             continue
 
     graph.graph["source_id"] = sorted(seen_sources)
     logging.info(
-        "get_graph_from_index: kb=%s entities=%d relations=%d sources=%d",
-        kb_id, total_entities, total_relations, len(seen_sources),
+        "get_graph_from_index: kb=%s entities=%d relations=%d sources=%d excluded=%d",
+        kb_id, total_entities, total_relations, len(seen_sources), len(excluded_nodes),
     )
     return graph
 

@@ -23,10 +23,13 @@ Methods installed
 =================
 * ``ESConnection.count(condition, index_name, knowledgebase_ids) -> int``
   Count documents matching ``condition`` within the given knowledge bases.
+* ``ESConnection.search_with_scroll(index_names, query_body, fields, ...) -> dict``
+  Scroll-based retrieval for large result sets, mirroring the OpenSearch extra.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 
@@ -37,6 +40,99 @@ from elastic_transport import ConnectionTimeout
 _logger = logging.getLogger(__name__)
 
 _INSTALL_FLAG = "_ragflow_es_conn_extras_installed"
+
+
+def _es_search_with_scroll(
+    self,
+    index_names,
+    query_body: dict,
+    fields: list[str],
+    scroll_timeout="2m",
+    batch_size=1000,
+    max_pages: int = 1000,
+):
+    """Use Elasticsearch scroll API to fetch large result sets safely.
+
+    Mirrors ``OSConnection.search_with_scroll`` so the GraphRAG incremental
+    paths can assemble the global graph on Elasticsearch backends too.
+    """
+    from rag.utils.es_conn import ATTEMPT_TIME
+
+    scroll_id = None
+    try:
+        for _ in range(ATTEMPT_TIME):
+            try:
+                res = self.es.search(
+                    index=index_names,
+                    body=query_body,
+                    scroll=scroll_timeout,
+                    size=batch_size,
+                )
+                break
+            except ConnectionTimeout:
+                self.logger.exception("ES search_with_scroll initial request timeout")
+                self._connect()
+                continue
+            except Exception:
+                raise
+        else:
+            raise Exception("ESConnection.search_with_scroll timeout for initial request.")
+
+        scroll_id = res.get("_scroll_id")
+        hits = res["hits"]["hits"]
+
+        _HITS_CAP = 50000
+        pages_consumed = 1
+        hit_cap_reached = False
+        while pages_consumed < max_pages:
+            for _ in range(ATTEMPT_TIME):
+                try:
+                    page = self.es.scroll(scroll_id=scroll_id, scroll=scroll_timeout)
+                    break
+                except ConnectionTimeout:
+                    self.logger.exception("ES search_with_scroll scroll request timeout")
+                    self._connect()
+                    continue
+                except Exception:
+                    raise
+            else:
+                raise Exception("ESConnection.search_with_scroll timeout for scroll request.")
+
+            page_hits = page["hits"]["hits"]
+            if not page_hits:
+                break
+            hits.extend(page_hits)
+            if len(hits) >= _HITS_CAP:
+                hit_cap_reached = True
+                break
+            scroll_id = page.get("_scroll_id")
+            if not scroll_id:
+                break
+            pages_consumed += 1
+
+        if hit_cap_reached:
+            _logger.warning(
+                "search_with_scroll hit hits_cap=%d (collected %d hits); "
+                "narrow query or add post-filter",
+                _HITS_CAP, len(hits),
+            )
+        elif pages_consumed >= max_pages:
+            _logger.warning(
+                "search_with_scroll hit max_pages=%d cap (collected %d hits); "
+                "narrow query or raise max_pages",
+                max_pages, len(hits),
+            )
+
+        return {"hits": {"hits": hits}}
+    except Exception as e:
+        _logger.exception("ESConnection.search_with_scroll query: %s", json.dumps(query_body))
+        raise e
+    finally:
+        if scroll_id:
+            try:
+                self.es.clear_scroll(scroll_id=scroll_id)
+            except Exception:
+                pass
 
 
 def _es_count(self, condition: dict, index_name: str, knowledgebase_ids: list[str]) -> int:
@@ -120,20 +216,47 @@ def _es_insert(self, documents: list[dict], index_name: str, knowledgebase_id: s
     return result
 
 
-def install() -> None:
-    """Idempotently install custom extras onto ``ESConnection``."""
+def _get_real_es_connection_class():
+    """Return the real ESConnection class, unwrapping the singleton decorator.
+
+    ``rag.utils.es_conn.ESConnection`` is decorated with ``@singleton``, which
+    replaces the class with a factory function.  Monkey-patching the factory
+    function does not affect instances, so we must reach the underlying class.
+    """
     from rag.utils.es_conn import ESConnection
 
-    if getattr(ESConnection, _INSTALL_FLAG, False):
+    if inspect.isclass(ESConnection):
+        return ESConnection
+
+    if inspect.isfunction(ESConnection) and ESConnection.__closure__:
+        for cell in ESConnection.__closure__:
+            val = cell.cell_contents
+            if inspect.isclass(val) and val.__name__ == "ESConnection":
+                return val
+
+    raise RuntimeError(
+        "Could not locate the real ESConnection class inside the singleton wrapper."
+    )
+
+
+def install() -> None:
+    """Idempotently install custom extras onto the real ``ESConnection`` class."""
+    cls = _get_real_es_connection_class()
+
+    if getattr(cls, _INSTALL_FLAG, False):
         return
 
-    if not hasattr(ESConnection, "count"):
-        ESConnection.count = _es_count
+    if not hasattr(cls, "search_with_scroll"):
+        cls.search_with_scroll = _es_search_with_scroll
+        _logger.info("ESConnection.search_with_scroll custom extra installed")
+
+    if not hasattr(cls, "count"):
+        cls.count = _es_count
         _logger.info("ESConnection.count custom extra installed")
 
-    if not hasattr(ESConnection, "_original_insert"):
-        ESConnection._original_insert = ESConnection.insert
-        ESConnection.insert = _es_insert
+    if not hasattr(cls, "_original_insert"):
+        cls._original_insert = cls.insert
+        cls.insert = _es_insert
         _logger.info("ESConnection.insert auto-refresh wrapper installed")
 
-    setattr(ESConnection, _INSTALL_FLAG, True)
+    setattr(cls, _INSTALL_FLAG, True)
