@@ -553,6 +553,7 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
         search.index_name(tenant_id),
         ent_query,
         ent_flds,
+        hits_cap=GraphRAGConfig.SEARCH_WITH_SCROLL_HITS_CAP,
     )
     es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
 
@@ -602,6 +603,7 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
         search.index_name(tenant_id),
         rel_query,
         rel_flds,
+        hits_cap=GraphRAGConfig.SEARCH_WITH_SCROLL_HITS_CAP,
     )
     es_res = settings.docStoreConn.get_fields(es_res, rel_flds)
 

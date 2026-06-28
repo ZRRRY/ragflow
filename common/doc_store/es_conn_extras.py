@@ -32,6 +32,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 
 from elasticsearch import NotFoundError
 from elasticsearch_dsl import Q
@@ -40,6 +41,9 @@ from elastic_transport import ConnectionTimeout
 _logger = logging.getLogger(__name__)
 
 _INSTALL_FLAG = "_ragflow_es_conn_extras_installed"
+
+# Memory guard for scroll-based retrieval. Override via GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP.
+_DEFAULT_HITS_CAP = max(1, int(os.environ.get("GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP", "50000")))
 
 
 def _es_search_with_scroll(
@@ -50,13 +54,20 @@ def _es_search_with_scroll(
     scroll_timeout="2m",
     batch_size=1000,
     max_pages: int = 1000,
+    hits_cap: int | None = None,
 ):
     """Use Elasticsearch scroll API to fetch large result sets safely.
 
     Mirrors ``OSConnection.search_with_scroll`` so the GraphRAG incremental
     paths can assemble the global graph on Elasticsearch backends too.
+
+    Args:
+        hits_cap: Hard upper bound on the number of hits to collect.
+            Defaults to ``GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP`` (50000).
     """
     from rag.utils.es_conn import ATTEMPT_TIME
+
+    cap = hits_cap if hits_cap is not None else _DEFAULT_HITS_CAP
 
     scroll_id = None
     try:
@@ -81,7 +92,6 @@ def _es_search_with_scroll(
         scroll_id = res.get("_scroll_id")
         hits = res["hits"]["hits"]
 
-        _HITS_CAP = 50000
         pages_consumed = 1
         hit_cap_reached = False
         while pages_consumed < max_pages:
@@ -102,7 +112,7 @@ def _es_search_with_scroll(
             if not page_hits:
                 break
             hits.extend(page_hits)
-            if len(hits) >= _HITS_CAP:
+            if len(hits) >= cap:
                 hit_cap_reached = True
                 break
             scroll_id = page.get("_scroll_id")
@@ -114,7 +124,7 @@ def _es_search_with_scroll(
             _logger.warning(
                 "search_with_scroll hit hits_cap=%d (collected %d hits); "
                 "narrow query or add post-filter",
-                _HITS_CAP, len(hits),
+                cap, len(hits),
             )
         elif pages_consumed >= max_pages:
             _logger.warning(

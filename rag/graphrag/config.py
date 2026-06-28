@@ -72,6 +72,9 @@ class GraphRAGConfig:
     # 1=insert 后立即 refresh（下游 query 立即可见，~1s 阻塞开销）
     # 0=依赖 OS 默认 refresh_interval（1s 自然 flush，下游 query 短暂 stale）
     SET_GRAPH_DELTA_REFRESH_AFTER_INSERT = os.environ.get("SET_GRAPH_DELTA_REFRESH_AFTER_INSERT", "1") == "1"
+    # search_with_scroll 单次查询返回 hits 上限，防止大 KB 全图加载时 worker OOM。
+    # 默认值 50000 保持与原硬编码一致；超大 KB 可通过环境变量提高。
+    SEARCH_WITH_SCROLL_HITS_CAP = int(os.environ.get("GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP", "50000"))
 
     # -----------------------------------------------------------------------------
     # Phase 4 – 异步 Community 开关
@@ -192,6 +195,7 @@ class GraphRAGConfig:
             "knn_resolution=%s resolution_top_k=%d resolution_sim_thr=%.2f "
             "knn_concurrency=%d resolution_batch_size=%d resolution_max_concurrent=%d "
             "max_safe_resume_nodes=%d max_parallel_docs=%d "
+            "search_with_scroll_hits_cap=%d "
             "use_chapter_graph=%s "
             "keep_subgraph=%s keep_merge=%s keep_resolution=%s",
             cls.USE_INCREMENTAL_GRAPH,
@@ -215,6 +219,7 @@ class GraphRAGConfig:
             cls.RESOLUTION_MAX_CONCURRENT_TASKS,
             cls.KG_MAX_SAFE_RESUME_NODES,
             cls.GRAPHRAG_MAX_PARALLEL_DOCS,
+            cls.SEARCH_WITH_SCROLL_HITS_CAP,
             cls.USE_CHAPTER_GRAPH,
             cls.KEEP_SUBGRAPH,
             cls.KEEP_MERGE,
@@ -249,6 +254,7 @@ class GraphRAGConfig:
         cls.EMBED_BATCH_SIZE = int(os.environ.get("GRAPHRAG_EMBED_BATCH_SIZE", "64"))
         cls.RESOLUTION_CHAR_BATCH_SIZE = int(os.environ.get("RESOLUTION_CHAR_BATCH_SIZE", "50"))
         cls.RESOLUTION_CHAR_MAX_CANDIDATES = int(os.environ.get("RESOLUTION_CHAR_MAX_CANDIDATES", "5000"))
+        cls.SEARCH_WITH_SCROLL_HITS_CAP = int(os.environ.get("GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP", "50000"))
         cls.USE_ASYNC_COMMUNITY = os.environ.get("USE_ASYNC_COMMUNITY", "0") == "1"
         cls.USE_ASYNC_KG_PHASES = os.environ.get("USE_ASYNC_KG_PHASES", "0") == "1"
         cls.KG_POSTPROCESS_QUEUE = os.environ.get("KG_POSTPROCESS_QUEUE", "graphrag:postprocess")

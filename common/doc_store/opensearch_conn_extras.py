@@ -36,6 +36,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
 import time
 
@@ -45,6 +46,9 @@ from opensearchpy import Q
 _logger = logging.getLogger(__name__)
 
 _INSTALL_FLAG = "_ragflow_opensearch_conn_extras_installed"
+
+# Memory guard for scroll-based retrieval. Override via GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP.
+_DEFAULT_HITS_CAP = max(1, int(os.environ.get("GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP", "50000")))
 
 
 def _should_auto_refresh_after_insert(operations: list[dict], index_name: str) -> bool:
@@ -141,6 +145,7 @@ def _os_search_with_scroll(
     scroll_timeout="2m",
     batch_size=1000,
     max_pages: int = 1000,
+    hits_cap: int | None = None,
 ):
     """Use OpenSearch scroll API to fetch all results safely.
 
@@ -155,7 +160,11 @@ def _os_search_with_scroll(
             documents (~1M). Prevents the scroll loop from hanging
             indefinitely if OpenSearch starts returning empty pages
             without raising (e.g. transient connection blip).
+        hits_cap: Hard upper bound on the number of hits to collect.
+            Defaults to ``GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP`` (50000).
     """
+    cap = hits_cap if hits_cap is not None else _DEFAULT_HITS_CAP
+
     scroll_id = None
     try:
         res = self.os.search(
@@ -169,10 +178,8 @@ def _os_search_with_scroll(
         hits = res["hits"]["hits"]
 
         # Memory guard: a large KB can produce millions of hits per scroll
-        # call.  Cap at 50k hits (~50MB Python heap) to avoid worker OOM
-        # in callers that load the whole result set into a dict.
-        _HITS_CAP = 50000
-
+        # call.  Cap at 50k hits (~50MB Python heap) by default to avoid
+        # worker OOM in callers that load the whole result set into a dict.
         pages_consumed = 1
         hit_cap_reached = False
         while pages_consumed < max_pages:
@@ -181,7 +188,7 @@ def _os_search_with_scroll(
             if not page_hits:
                 break
             hits.extend(page_hits)
-            if len(hits) >= _HITS_CAP:
+            if len(hits) >= cap:
                 hit_cap_reached = True
                 break
             scroll_id = page.get("_scroll_id")
@@ -193,7 +200,7 @@ def _os_search_with_scroll(
             _logger.warning(
                 "search_with_scroll hit hits_cap=%d (collected %d hits); "
                 "narrow query or add post-filter",
-                _HITS_CAP, len(hits),
+                cap, len(hits),
             )
         elif pages_consumed >= max_pages:
             # Reached max_pages without an empty page — log so operators
