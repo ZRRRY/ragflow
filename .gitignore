@@ -52,6 +52,7 @@ uv-x86_64*.tar.gz
 .lh/
 .venv
 docker/data
+docker/docker-compose.override.yml
 
 # OceanBase data and conf
 docker/oceanbase/conf
