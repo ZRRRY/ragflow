@@ -643,25 +643,24 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
 async def get_graph_from_index_for_visualization(
     tenant_id, kb_id, max_nodes=256, exclude_entity_types=None
 ):
-    """Assemble a visualization graph from indexed chunks by BFS expansion.
+    """Assemble a visualization graph from indexed chunks.
 
     Strategy:
-    1. Pick the single entity with the highest ``rank_flt`` as the center.
-    2. Expand hop-by-hop (1-hop, 2-hop, 3-hop, ...) through indexed relations,
-       adding newly discovered neighbors until the selected node count reaches
-       ``max_nodes``.
-    3. If BFS cannot reach enough nodes, fill the remaining slots with the
-       globally highest-ranked entities.
-    4. Only edges whose both endpoints are selected are included.
-
-    This produces a connected, center-focused subgraph suitable for the
-    incremental-mode knowledge-graph visualization.
+    1. Select the top 16 entities by global pagerank (``rank_flt``) as centers.
+    2. For each center, query its direct relations and keep the 16 strongest
+       neighbors (by edge ``weight``).
+    3. De-duplicate centers and neighbors; the target is up to 256 nodes.
+    4. If the above still yields fewer than ``max_nodes`` nodes, fill the rest
+       with globally top-ranked entities.
+    5. Return only edges whose both endpoints are selected.
     """
     graph = nx.Graph()
     graph.graph["source_id"] = []
     seen_sources = set()
 
     ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
+    num_centers = 16
+    neighbors_per_center = 16
 
     def _parse_entity_doc(_cid, d):
         try:
@@ -680,10 +679,9 @@ async def get_graph_from_index_for_visualization(
         return ent_name, meta
 
     # ------------------------------------------------------------------
-    # 1. Find the center: top entity by rank_flt
+    # 1. Fetch top centers by rank_flt
     # ------------------------------------------------------------------
-    center_name = None
-    node_meta = {}
+    centers = []
     try:
         top_res = await thread_pool_exec(
             settings.docStoreConn.search,
@@ -693,7 +691,7 @@ async def get_graph_from_index_for_visualization(
             [],
             OrderByExpr().desc("rank_flt"),
             0,
-            1,
+            num_centers,
             search.index_name(tenant_id),
             [kb_id],
         )
@@ -701,26 +699,24 @@ async def get_graph_from_index_for_visualization(
         for _cid, d in top_fields.items():
             parsed = _parse_entity_doc(_cid, d)
             if parsed:
-                center_name, meta = parsed
-                node_meta[center_name] = meta
-                for sid in meta.get("source_id", []):
+                centers.append(parsed)
+                for sid in parsed[1].get("source_id", []):
                     seen_sources.add(sid)
-                break
     except Exception as e:
         logging.warning(
-            "get_graph_from_index_for_visualization: kb=%s failed to find center node: %s",
+            "get_graph_from_index_for_visualization: kb=%s failed to fetch top centers: %s",
             kb_id, e,
         )
-
-    if not center_name:
         return None
 
-    selected_order = [center_name]
-    selected_set = {center_name}
-    frontier = {center_name}
+    if not centers:
+        return None
+
+    node_meta = {name: meta for name, meta in centers}
+    selected_set = {name for name, _ in centers}
     edges = []
     seen_edge_keys = set()
-    max_hops = 5
+    neighbor_names = set()
 
     def _record_edge(from_node, to_node, meta):
         key = tuple(sorted([from_node, to_node]))
@@ -732,16 +728,15 @@ async def get_graph_from_index_for_visualization(
             seen_sources.add(sid)
 
     # ------------------------------------------------------------------
-    # 2. BFS expansion from the center
+    # 2. For each center, keep the top N direct neighbors
     # ------------------------------------------------------------------
-    for _hop in range(max_hops):
-        if not frontier or len(selected_set) >= max_nodes:
+    for center_name, _ in centers:
+        if len(selected_set) >= max_nodes:
             break
 
-        rel_fields_list = await query_node_relations(tenant_id, kb_id, list(frontier))
+        rel_fields_list = await query_node_relations(tenant_id, kb_id, [center_name])
 
-        # Collect neighbor names that are not already selected.
-        neighbors_to_query = set()
+        candidate_neighbors = []
         for fields in rel_fields_list:
             from_node = fields.get("from_entity_kwd")
             to_node = fields.get("to_entity_kwd")
@@ -749,56 +744,47 @@ async def get_graph_from_index_for_visualization(
                 from_node = from_node[0] if from_node else None
             if isinstance(to_node, list):
                 to_node = to_node[0] if to_node else None
-            if not from_node or not to_node:
+            if not from_node or not to_node or from_node == to_node:
                 continue
-            if from_node in frontier and to_node not in selected_set:
-                neighbors_to_query.add(to_node)
-            if to_node in frontier and from_node not in selected_set:
-                neighbors_to_query.add(from_node)
 
-        # Batch-fetch neighbor metadata and add valid neighbors.
-        new_frontier = set()
-        if neighbors_to_query:
-            neighbor_meta = await query_existing_entities(
-                tenant_id, kb_id, list(neighbors_to_query)
-            )
-            for node_name, fields in neighbor_meta.items():
-                if len(selected_set) >= max_nodes:
-                    break
-                parsed = _parse_entity_doc(None, fields)
-                if not parsed:
-                    continue
-                ent_name, meta = parsed
-                if ent_name in selected_set:
-                    continue
-                node_meta[ent_name] = meta
-                selected_set.add(ent_name)
-                selected_order.append(ent_name)
-                new_frontier.add(ent_name)
-                for sid in meta.get("source_id", []):
-                    seen_sources.add(sid)
-
-        # Record edges whose both endpoints are now selected.
-        for fields in rel_fields_list:
-            from_node = fields.get("from_entity_kwd")
-            to_node = fields.get("to_entity_kwd")
-            if isinstance(from_node, list):
-                from_node = from_node[0] if from_node else None
-            if isinstance(to_node, list):
-                to_node = to_node[0] if to_node else None
-            if not from_node or not to_node:
+            neighbor = to_node if from_node == center_name else from_node
+            if neighbor == center_name:
                 continue
-            if from_node in selected_set and to_node in selected_set:
-                try:
-                    meta = json.loads(fields["content_with_weight"])
-                except Exception:
-                    meta = {}
-                _record_edge(from_node, to_node, meta)
 
-        frontier = new_frontier
+            try:
+                meta = json.loads(fields["content_with_weight"])
+            except Exception:
+                meta = {}
+            weight = int(meta.get("weight", 0) or 0)
+            candidate_neighbors.append((neighbor, weight, from_node, to_node, meta))
+
+        # Prefer stronger edges; keep up to neighbors_per_center per center.
+        candidate_neighbors.sort(key=lambda x: x[1], reverse=True)
+        kept = candidate_neighbors[:neighbors_per_center]
+
+        for neighbor, _weight, from_node, to_node, meta in kept:
+            if len(selected_set) >= max_nodes:
+                break
+            neighbor_names.add(neighbor)
+            _record_edge(from_node, to_node, meta)
 
     # ------------------------------------------------------------------
-    # 3. Fallback: fill remaining slots with globally top-ranked entities
+    # 3. Batch-fetch metadata for discovered neighbors
+    # ------------------------------------------------------------------
+    if neighbor_names:
+        neighbor_meta = await query_existing_entities(tenant_id, kb_id, list(neighbor_names))
+        for _node_name, fields in neighbor_meta.items():
+            parsed = _parse_entity_doc(None, fields)
+            if not parsed:
+                continue
+            ent_name, meta = parsed
+            node_meta[ent_name] = meta
+            selected_set.add(ent_name)
+            for sid in meta.get("source_id", []):
+                seen_sources.add(sid)
+
+    # ------------------------------------------------------------------
+    # 4. Fallback: fill remaining slots with globally top-ranked entities
     # ------------------------------------------------------------------
     if len(selected_set) < max_nodes:
         try:
@@ -826,7 +812,6 @@ async def get_graph_from_index_for_visualization(
                     continue
                 node_meta[ent_name] = meta
                 selected_set.add(ent_name)
-                selected_order.append(ent_name)
                 for sid in meta.get("source_id", []):
                     seen_sources.add(sid)
         except Exception as e:
@@ -836,17 +821,19 @@ async def get_graph_from_index_for_visualization(
             )
 
     # ------------------------------------------------------------------
-    # 4. Build the output graph
+    # 5. Build the output graph
     # ------------------------------------------------------------------
-    for name in selected_order:
-        graph.add_node(name, **node_meta[name])
+    for name in selected_set:
+        if name in node_meta:
+            graph.add_node(name, **node_meta[name])
     for from_node, to_node, meta in edges:
-        graph.add_edge(from_node, to_node, **meta)
+        if from_node in selected_set and to_node in selected_set:
+            graph.add_edge(from_node, to_node, **meta)
 
     graph.graph["source_id"] = sorted(seen_sources)
     logging.info(
-        "get_graph_from_index_for_visualization: kb=%s nodes=%d edges=%d",
-        kb_id, len(graph.nodes), len(graph.edges),
+        "get_graph_from_index_for_visualization: kb=%s centers=%d nodes=%d edges=%d",
+        kb_id, len(centers), len(graph.nodes), len(graph.edges),
     )
     return graph
 
