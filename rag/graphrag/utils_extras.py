@@ -641,7 +641,7 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
 
 
 async def get_graph_from_index_for_visualization(
-    tenant_id, kb_id, max_nodes=256, max_edges=128, scan_limit=5000
+    tenant_id, kb_id, max_nodes=256, max_edges=128, scan_limit=5000, exclude_entity_types=None
 ):
     """Assemble a truncated graph for visualization from indexed chunks.
 
@@ -650,6 +650,11 @@ async def get_graph_from_index_for_visualization(
     top ``max_nodes`` by pagerank, and only fetches relations between those
     selected nodes. This keeps the visualization API memory-safe even for
     very large knowledge graphs in incremental mode.
+
+    Args:
+        exclude_entity_types: Optional set/list of entity types to exclude from
+            visualization (e.g. {"书籍", "章节"}). Relations incident to excluded
+            nodes are also dropped.
     """
     graph = nx.Graph()
     graph.graph["source_id"] = []
@@ -684,6 +689,7 @@ async def get_graph_from_index_for_visualization(
     es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
 
     candidate_nodes = []
+    excluded_nodes = set()
     for _cid, d in es_res.items():
         try:
             meta = json.loads(d["content_with_weight"])
@@ -692,6 +698,12 @@ async def get_graph_from_index_for_visualization(
                 ent_name = ent_name[0] if ent_name else None
             if not ent_name:
                 continue
+
+            ent_type = meta.get("entity_type")
+            if exclude_entity_types and ent_type in exclude_entity_types:
+                excluded_nodes.add(ent_name)
+                continue
+
             pagerank = float(meta.get("pagerank", 0) or 0)
             candidate_nodes.append((ent_name, pagerank, meta))
             for sid in meta.get("source_id", []):
@@ -699,6 +711,12 @@ async def get_graph_from_index_for_visualization(
         except Exception:
             logging.exception("Failed to parse entity chunk %s", _cid)
             continue
+
+    if excluded_nodes:
+        logging.info(
+            "get_graph_from_index_for_visualization: kb=%s excluded %d nodes by type %s",
+            kb_id, len(excluded_nodes), exclude_entity_types,
+        )
 
     if not candidate_nodes:
         return None

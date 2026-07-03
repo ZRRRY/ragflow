@@ -95,7 +95,8 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
     if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
         _, kb = KnowledgebaseService.get_by_id(dataset_id)
         graph = await get_graph_from_index_for_visualization(
-            kb.tenant_id, dataset_id, max_nodes=256, max_edges=128
+            kb.tenant_id, dataset_id, max_nodes=256, max_edges=128,
+            exclude_entity_types={"书籍", "章节"},
         )
         obj = {"graph": {}, "mind_map": {}}
         if graph is not None and len(graph.nodes) > 0:
