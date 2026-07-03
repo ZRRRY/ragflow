@@ -54,14 +54,16 @@ def _build_query_body(filters: dict, sort_field: str, page_size: int,
     """
     # search_after requires a globally unique sort tuple. The primary field is
     # a business keyword (entity_kwd / from_entity_kwd) which can have duplicates
-    # across documents; ``_id`` is appended as a tiebreaker so pagination never
-    # stalls or skips rows when the primary sort value repeats.
+    # across documents; ``_doc`` is appended as a tiebreaker so pagination never
+    # stalls or skips rows when the primary sort value repeats. ``_doc`` is
+    # preferred over ``_id`` because sorting on ``_id`` requires fielddata, which
+    # Elasticsearch disables by default.
     body: dict[str, Any] = {
         "query": {"bool": {"filter": _filters_to_clauses(filters)}},
         "size": page_size,
         "sort": [
             {sort_field: {"order": "asc"}},
-            {"_id": {"order": "asc"}},
+            {"_doc": {"order": "asc"}},
         ],
     }
     if search_after:
