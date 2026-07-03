@@ -80,8 +80,72 @@ async def _fetch_raw_knowledge_graph(dataset_id: str, tenant_id: str):
     return obj
 
 
+def _truncate_graph_for_visualization(
+    graph_data: dict,
+    max_nodes: int = 256,
+    max_edges: int = 128,
+    protected_types: set | None = None,
+) -> dict:
+    """Truncate graph data for visualization while avoiding isolated nodes.
+
+    Strategy:
+    1. Select top ``max_nodes`` nodes by pagerank (with optional protected types).
+    2. Keep only edges whose both endpoints are in the selected node set,
+       sorted by weight and capped at ``max_edges``.
+    3. Drop isolated nodes that have no remaining edges.
+    """
+    if "nodes" not in graph_data:
+        return graph_data
+
+    all_nodes = graph_data["nodes"]
+
+    if protected_types:
+        protected_nodes = [n for n in all_nodes if n.get("entity_type") in protected_types]
+        other_nodes = [n for n in all_nodes if n.get("entity_type") not in protected_types]
+        remaining_slots = max(0, max_nodes - len(protected_nodes))
+        sorted_other_nodes = sorted(
+            other_nodes,
+            key=lambda x: x.get("pagerank", 0),
+            reverse=True,
+        )[:remaining_slots]
+        selected_nodes = protected_nodes + sorted_other_nodes
+    else:
+        selected_nodes = sorted(
+            all_nodes,
+            key=lambda x: x.get("pagerank", 0),
+            reverse=True,
+        )[:max_nodes]
+
+    node_id_set = {o["id"] for o in selected_nodes}
+
+    filtered_edges = []
+    if "edges" in graph_data:
+        filtered_edges = [
+            o
+            for o in graph_data["edges"]
+            if o["source"] != o["target"]
+            and o["source"] in node_id_set
+            and o["target"] in node_id_set
+        ]
+        filtered_edges = sorted(
+            filtered_edges,
+            key=lambda x: x.get("weight", 0),
+            reverse=True,
+        )[:max_edges]
+
+    # Drop isolated nodes to avoid rendering orphan dots.
+    connected_node_ids = set()
+    for edge in filtered_edges:
+        connected_node_ids.add(edge["source"])
+        connected_node_ids.add(edge["target"])
+
+    graph_data["nodes"] = [n for n in selected_nodes if n["id"] in connected_node_ids]
+    graph_data["edges"] = filtered_edges
+    return graph_data
+
+
 async def get_knowledge_graph(dataset_id: str, tenant_id: str):
-    """Get knowledge graph for a dataset (truncated to 256 nodes and 128 edges for visualization).
+    """Get knowledge graph for a dataset (truncated for visualization).
 
     :param dataset_id: dataset ID
     :param tenant_id: tenant ID
@@ -105,37 +169,12 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
         obj = await _fetch_raw_knowledge_graph(dataset_id, tenant_id)
 
     if "nodes" in obj["graph"]:
-        all_nodes = obj["graph"]["nodes"]
-        if GraphRAGConfig.USE_CHAPTER_GRAPH:
-            protected_types = {"书籍", "章节"}
-            protected_nodes = [n for n in all_nodes if n.get("entity_type") in protected_types]
-            other_nodes = [n for n in all_nodes if n.get("entity_type") not in protected_types]
-            sorted_other_nodes = sorted(
-                other_nodes,
-                key=lambda x: x.get("pagerank", 0),
-                reverse=True,
-            )[:max(0, 256 - len(protected_nodes))]
-            obj["graph"]["nodes"] = protected_nodes + sorted_other_nodes
-        else:
-            obj["graph"]["nodes"] = sorted(
-                all_nodes,
-                key=lambda x: x.get("pagerank", 0),
-                reverse=True,
-            )[:256]
-
-        if "edges" in obj["graph"]:
-            node_id_set = {o["id"] for o in obj["graph"]["nodes"]}
-            filtered_edges = [
-                o
-                for o in obj["graph"]["edges"]
-                if o["source"] != o["target"]
-                and o["source"] in node_id_set
-                and o["target"] in node_id_set
-            ]
-            obj["graph"]["edges"] = sorted(
-                filtered_edges,
-                key=lambda x: x.get("weight", 0),
-                reverse=True,
-            )[:128]
+        protected_types = {"书籍", "章节"} if GraphRAGConfig.USE_CHAPTER_GRAPH else None
+        obj["graph"] = _truncate_graph_for_visualization(
+            obj["graph"],
+            max_nodes=256,
+            max_edges=128,
+            protected_types=protected_types,
+        )
 
     return True, obj

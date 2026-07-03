@@ -746,13 +746,14 @@ async def get_graph_from_index_for_visualization(
         [],
         OrderByExpr(),
         0,
-        max_edges * 2,
+        max_edges * 10,
         search.index_name(tenant_id),
         [kb_id],
     )
     rel_fields = settings.docStoreConn.get_fields(rel_res, rel_flds)
 
-    kept_edges = 0
+    # Sort candidate edges by weight so the strongest connections are kept.
+    candidate_edges = []
     for _cid, d in rel_fields.items():
         try:
             meta = json.loads(d["content_with_weight"])
@@ -768,15 +769,16 @@ async def get_graph_from_index_for_visualization(
                 and from_node in node_set
                 and to_node in node_set
             ):
-                graph.add_edge(from_node, to_node, **meta)
-                kept_edges += 1
-                if kept_edges >= max_edges:
-                    break
+                candidate_edges.append((from_node, to_node, meta))
             for sid in meta.get("source_id", []):
                 seen_sources.add(sid)
         except Exception:
             logging.exception("Failed to parse relation chunk %s", _cid)
             continue
+
+    candidate_edges.sort(key=lambda x: x[2].get("weight", 0), reverse=True)
+    for from_node, to_node, meta in candidate_edges[:max_edges]:
+        graph.add_edge(from_node, to_node, **meta)
 
     graph.graph["source_id"] = sorted(seen_sources)
     logging.info(
