@@ -646,10 +646,10 @@ async def get_graph_from_index_for_visualization(
     """Assemble a truncated graph for visualization from indexed chunks.
 
     Unlike ``get_graph_from_index``, this function does **not** load the full
-    entity/relation index. It samples up to ``scan_limit`` entities, keeps the
-    top ``max_nodes`` by pagerank, and only fetches relations between those
-    selected nodes. This keeps the visualization API memory-safe even for
-    very large knowledge graphs in incremental mode.
+    entity/relation index. It fetches the top ``max_nodes`` entities by global
+    pagerank (``rank_flt``) and only fetches relations between those selected
+    nodes. This keeps the visualization API memory-safe even for very large
+    knowledge graphs in incremental mode.
 
     Args:
         exclude_entity_types: Optional set/list of entity types to exclude from
@@ -660,57 +660,92 @@ async def get_graph_from_index_for_visualization(
     graph.graph["source_id"] = []
     seen_sources = set()
 
-    # 1. Sample entities without loading the entire index.
     ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
-    ent_query = {
-        "query": {
-            "bool": {
-                "filter": [
-                    {"terms": {"kb_id": [kb_id]}},
-                    {"terms": {"knowledge_graph_kwd": ["entity"]}},
-                ]
-            }
-        }
-    }
 
-    # ES / Infinity doc store has no search_with_scroll; fall back to None so
-    # callers handle "unsupported backend" uniformly.
-    if not hasattr(settings.docStoreConn, "search_with_scroll"):
-        return None
+    async def _parse_entity_fields(fields: dict) -> list[tuple[str, float, dict]]:
+        """Parse entity docs into (name, pagerank, meta) tuples."""
+        parsed = []
+        excluded = set()
+        for _cid, d in fields.items():
+            try:
+                meta = json.loads(d["content_with_weight"])
+                ent_name = d["entity_kwd"]
+                if isinstance(ent_name, list):
+                    ent_name = ent_name[0] if ent_name else None
+                if not ent_name:
+                    continue
 
-    es_res = await thread_pool_exec(
-        settings.docStoreConn.search_with_scroll,
-        search.index_name(tenant_id),
-        ent_query,
-        ent_flds,
-        batch_size=1000,
-        max_pages=max(1, scan_limit // 1000),
-    )
-    es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
+                ent_type = meta.get("entity_type")
+                if exclude_entity_types and ent_type in exclude_entity_types:
+                    excluded.add(ent_name)
+                    continue
+
+                pagerank = float(meta.get("pagerank", 0) or 0)
+                parsed.append((ent_name, pagerank, meta))
+                for sid in meta.get("source_id", []):
+                    seen_sources.add(sid)
+            except Exception:
+                logging.exception("Failed to parse entity chunk %s", _cid)
+                continue
+        return parsed, excluded
 
     candidate_nodes = []
     excluded_nodes = set()
-    for _cid, d in es_res.items():
-        try:
-            meta = json.loads(d["content_with_weight"])
-            ent_name = d["entity_kwd"]
-            if isinstance(ent_name, list):
-                ent_name = ent_name[0] if ent_name else None
-            if not ent_name:
-                continue
 
-            ent_type = meta.get("entity_type")
-            if exclude_entity_types and ent_type in exclude_entity_types:
-                excluded_nodes.add(ent_name)
-                continue
+    # Try direct Top-K by rank_flt first (most accurate for global pagerank).
+    try:
+        top_res = await thread_pool_exec(
+            settings.docStoreConn.search,
+            ent_flds,
+            [],
+            {"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]},
+            [],
+            OrderByExpr().desc("rank_flt"),
+            0,
+            max_nodes * 2,
+            search.index_name(tenant_id),
+            [kb_id],
+        )
+        top_fields = settings.docStoreConn.get_fields(top_res, ent_flds)
+        candidate_nodes, excluded_nodes = await _parse_entity_fields(top_fields)
+        if candidate_nodes:
+            logging.info(
+                "get_graph_from_index_for_visualization: kb=%s fetched %d top entities by rank_flt",
+                kb_id, len(candidate_nodes),
+            )
+    except Exception as e:
+        logging.warning(
+            "get_graph_from_index_for_visualization: kb=%s direct rank_flt query failed: %s; falling back to scan",
+            kb_id, e,
+        )
+        candidate_nodes = []
 
-            pagerank = float(meta.get("pagerank", 0) or 0)
-            candidate_nodes.append((ent_name, pagerank, meta))
-            for sid in meta.get("source_id", []):
-                seen_sources.add(sid)
-        except Exception:
-            logging.exception("Failed to parse entity chunk %s", _cid)
-            continue
+    # Fallback to scan if direct query is unavailable or empty.
+    if not candidate_nodes and hasattr(settings.docStoreConn, "search_with_scroll"):
+        ent_query = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"terms": {"kb_id": [kb_id]}},
+                        {"terms": {"knowledge_graph_kwd": ["entity"]}},
+                    ]
+                }
+            }
+        }
+        es_res = await thread_pool_exec(
+            settings.docStoreConn.search_with_scroll,
+            search.index_name(tenant_id),
+            ent_query,
+            ent_flds,
+            batch_size=1000,
+            max_pages=max(1, scan_limit // 1000),
+        )
+        es_res = settings.docStoreConn.get_fields(es_res, ent_flds)
+        candidate_nodes, excluded_nodes = await _parse_entity_fields(es_res)
+        logging.info(
+            "get_graph_from_index_for_visualization: kb=%s scanned %d entities",
+            kb_id, len(candidate_nodes),
+        )
 
     if excluded_nodes:
         logging.info(
