@@ -641,24 +641,49 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
 
 
 async def get_graph_from_index_for_visualization(
-    tenant_id, kb_id, max_nodes=1024, exclude_entity_types=None
+    tenant_id, kb_id, max_nodes=256, exclude_entity_types=None
 ):
-    """Assemble a truncated graph for visualization from indexed chunks.
+    """Assemble a visualization graph from indexed chunks by BFS expansion.
 
-    Unlike ``get_graph_from_index``, this function does **not** load the full
-    entity/relation index. It fetches the top ``max_nodes`` entities by global
-    pagerank (``rank_flt``) and only fetches relations between those selected
-    nodes. The result is then passed to ``_truncate_graph_for_visualization``
-    for final Top-K node/edge selection.
+    Strategy:
+    1. Pick the single entity with the highest ``rank_flt`` as the center.
+    2. Expand hop-by-hop (1-hop, 2-hop, 3-hop, ...) through indexed relations,
+       adding newly discovered neighbors until the selected node count reaches
+       ``max_nodes``.
+    3. If BFS cannot reach enough nodes, fill the remaining slots with the
+       globally highest-ranked entities.
+    4. Only edges whose both endpoints are selected are included.
+
+    This produces a connected, center-focused subgraph suitable for the
+    incremental-mode knowledge-graph visualization.
     """
     graph = nx.Graph()
     graph.graph["source_id"] = []
     seen_sources = set()
 
     ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
-    candidate_nodes = []
 
-    # Try direct Top-K by rank_flt first.
+    def _parse_entity_doc(_cid, d):
+        try:
+            meta = json.loads(d["content_with_weight"])
+        except Exception:
+            logging.exception("Failed to parse entity chunk %s", _cid)
+            return None
+        ent_name = d.get("entity_kwd")
+        if isinstance(ent_name, list):
+            ent_name = ent_name[0] if ent_name else None
+        if not ent_name:
+            return None
+        ent_type = meta.get("entity_type")
+        if exclude_entity_types and ent_type in exclude_entity_types:
+            return None
+        return ent_name, meta
+
+    # ------------------------------------------------------------------
+    # 1. Find the center: top entity by rank_flt
+    # ------------------------------------------------------------------
+    center_name = None
+    node_meta = {}
     try:
         top_res = await thread_pool_exec(
             settings.docStoreConn.search,
@@ -668,93 +693,161 @@ async def get_graph_from_index_for_visualization(
             [],
             OrderByExpr().desc("rank_flt"),
             0,
-            max_nodes,
+            1,
             search.index_name(tenant_id),
             [kb_id],
         )
         top_fields = settings.docStoreConn.get_fields(top_res, ent_flds)
         for _cid, d in top_fields.items():
-            try:
-                meta = json.loads(d["content_with_weight"])
-                ent_name = d["entity_kwd"]
-                if isinstance(ent_name, list):
-                    ent_name = ent_name[0] if ent_name else None
-                if not ent_name:
-                    continue
-
-                ent_type = meta.get("entity_type")
-                if exclude_entity_types and ent_type in exclude_entity_types:
-                    continue
-
-                pagerank = float(meta.get("pagerank", 0) or 0)
-                candidate_nodes.append((ent_name, pagerank, meta))
+            parsed = _parse_entity_doc(_cid, d)
+            if parsed:
+                center_name, meta = parsed
+                node_meta[center_name] = meta
                 for sid in meta.get("source_id", []):
                     seen_sources.add(sid)
-            except Exception:
-                logging.exception("Failed to parse entity chunk %s", _cid)
-                continue
+                break
     except Exception as e:
         logging.warning(
-            "get_graph_from_index_for_visualization: kb=%s direct rank_flt query failed: %s",
+            "get_graph_from_index_for_visualization: kb=%s failed to find center node: %s",
             kb_id, e,
         )
 
-    if not candidate_nodes:
+    if not center_name:
         return None
 
-    candidate_nodes.sort(key=lambda x: x[1], reverse=True)
-    top_nodes = candidate_nodes[:max_nodes]
-    node_set = {name for name, _, _ in top_nodes}
+    selected_order = [center_name]
+    selected_set = {center_name}
+    frontier = {center_name}
+    edges = []
+    seen_edge_keys = set()
+    max_hops = 5
 
-    for ent_name, _, meta in top_nodes:
-        graph.add_node(ent_name, **meta)
+    def _record_edge(from_node, to_node, meta):
+        key = tuple(sorted([from_node, to_node]))
+        if key in seen_edge_keys:
+            return
+        seen_edge_keys.add(key)
+        edges.append((from_node, to_node, meta))
+        for sid in meta.get("source_id", []):
+            seen_sources.add(sid)
 
-    # Fetch relations whose endpoints are both in the selected node set.
-    rel_flds = ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"]
-    rel_condition = {
-        "kb_id": [kb_id],
-        "knowledge_graph_kwd": ["relation"],
-        "from_entity_kwd": list(node_set),
-        "to_entity_kwd": list(node_set),
-    }
+    # ------------------------------------------------------------------
+    # 2. BFS expansion from the center
+    # ------------------------------------------------------------------
+    for _hop in range(max_hops):
+        if not frontier or len(selected_set) >= max_nodes:
+            break
 
-    rel_res = await thread_pool_exec(
-        settings.docStoreConn.search,
-        rel_flds,
-        [],
-        rel_condition,
-        [],
-        OrderByExpr(),
-        0,
-        10000,
-        search.index_name(tenant_id),
-        [kb_id],
-    )
-    rel_fields = settings.docStoreConn.get_fields(rel_res, rel_flds)
+        rel_fields_list = await query_node_relations(tenant_id, kb_id, list(frontier))
 
-    for _cid, d in rel_fields.items():
-        try:
-            meta = json.loads(d["content_with_weight"])
-            from_node = d["from_entity_kwd"]
-            to_node = d["to_entity_kwd"]
+        # Collect neighbor names that are not already selected.
+        neighbors_to_query = set()
+        for fields in rel_fields_list:
+            from_node = fields.get("from_entity_kwd")
+            to_node = fields.get("to_entity_kwd")
             if isinstance(from_node, list):
                 from_node = from_node[0] if from_node else None
             if isinstance(to_node, list):
                 to_node = to_node[0] if to_node else None
-            if (
-                from_node
-                and to_node
-                and from_node in node_set
-                and to_node in node_set
-            ):
-                graph.add_edge(from_node, to_node, **meta)
-            for sid in meta.get("source_id", []):
-                seen_sources.add(sid)
-        except Exception:
-            logging.exception("Failed to parse relation chunk %s", _cid)
-            continue
+            if not from_node or not to_node:
+                continue
+            if from_node in frontier and to_node not in selected_set:
+                neighbors_to_query.add(to_node)
+            if to_node in frontier and from_node not in selected_set:
+                neighbors_to_query.add(from_node)
+
+        # Batch-fetch neighbor metadata and add valid neighbors.
+        new_frontier = set()
+        if neighbors_to_query:
+            neighbor_meta = await query_existing_entities(
+                tenant_id, kb_id, list(neighbors_to_query)
+            )
+            for node_name, fields in neighbor_meta.items():
+                if len(selected_set) >= max_nodes:
+                    break
+                parsed = _parse_entity_doc(None, fields)
+                if not parsed:
+                    continue
+                ent_name, meta = parsed
+                if ent_name in selected_set:
+                    continue
+                node_meta[ent_name] = meta
+                selected_set.add(ent_name)
+                selected_order.append(ent_name)
+                new_frontier.add(ent_name)
+                for sid in meta.get("source_id", []):
+                    seen_sources.add(sid)
+
+        # Record edges whose both endpoints are now selected.
+        for fields in rel_fields_list:
+            from_node = fields.get("from_entity_kwd")
+            to_node = fields.get("to_entity_kwd")
+            if isinstance(from_node, list):
+                from_node = from_node[0] if from_node else None
+            if isinstance(to_node, list):
+                to_node = to_node[0] if to_node else None
+            if not from_node or not to_node:
+                continue
+            if from_node in selected_set and to_node in selected_set:
+                try:
+                    meta = json.loads(fields["content_with_weight"])
+                except Exception:
+                    meta = {}
+                _record_edge(from_node, to_node, meta)
+
+        frontier = new_frontier
+
+    # ------------------------------------------------------------------
+    # 3. Fallback: fill remaining slots with globally top-ranked entities
+    # ------------------------------------------------------------------
+    if len(selected_set) < max_nodes:
+        try:
+            top_res = await thread_pool_exec(
+                settings.docStoreConn.search,
+                ent_flds,
+                [],
+                {"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]},
+                [],
+                OrderByExpr().desc("rank_flt"),
+                0,
+                max_nodes,
+                search.index_name(tenant_id),
+                [kb_id],
+            )
+            top_fields = settings.docStoreConn.get_fields(top_res, ent_flds)
+            for _cid, d in top_fields.items():
+                if len(selected_set) >= max_nodes:
+                    break
+                parsed = _parse_entity_doc(_cid, d)
+                if not parsed:
+                    continue
+                ent_name, meta = parsed
+                if ent_name in selected_set:
+                    continue
+                node_meta[ent_name] = meta
+                selected_set.add(ent_name)
+                selected_order.append(ent_name)
+                for sid in meta.get("source_id", []):
+                    seen_sources.add(sid)
+        except Exception as e:
+            logging.warning(
+                "get_graph_from_index_for_visualization: kb=%s fallback top-entities query failed: %s",
+                kb_id, e,
+            )
+
+    # ------------------------------------------------------------------
+    # 4. Build the output graph
+    # ------------------------------------------------------------------
+    for name in selected_order:
+        graph.add_node(name, **node_meta[name])
+    for from_node, to_node, meta in edges:
+        graph.add_edge(from_node, to_node, **meta)
 
     graph.graph["source_id"] = sorted(seen_sources)
+    logging.info(
+        "get_graph_from_index_for_visualization: kb=%s nodes=%d edges=%d",
+        kb_id, len(graph.nodes), len(graph.edges),
+    )
     return graph
 
 

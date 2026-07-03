@@ -85,22 +85,29 @@ def _truncate_graph_for_visualization(
     max_nodes: int = 256,
     max_edges: int = 512,
     protected_types: set | None = None,
+    keep_isolated_nodes: bool = False,
 ) -> dict:
-    """Truncate graph data for visualization while avoiding isolated nodes.
+    """Truncate graph data for visualization.
 
     Strategy:
     1. Select top ``max_nodes`` nodes by pagerank (with optional protected types).
     2. Keep only edges whose both endpoints are in the selected node set.
     3. Greedily pick edges: first guarantee every node has at least one edge,
        then fill remaining slots with the highest-weight edges.
-    4. Drop nodes that still have no edge after the above.
+    4. By default, drop nodes that still have no edge after the above. When
+       ``keep_isolated_nodes`` is True, keep the selected nodes even if they
+       have no incident edge.
     """
     if "nodes" not in graph_data:
         return graph_data
 
     all_nodes = graph_data["nodes"]
 
-    if protected_types:
+    if keep_isolated_nodes:
+        # Preserve the input node ordering (e.g. BFS order from incremental mode)
+        # instead of re-ranking by pagerank.
+        selected_nodes = all_nodes[:max_nodes]
+    elif protected_types:
         protected_nodes = [n for n in all_nodes if n.get("entity_type") in protected_types]
         other_nodes = [n for n in all_nodes if n.get("entity_type") not in protected_types]
         remaining_slots = max(0, max_nodes - len(protected_nodes))
@@ -160,9 +167,12 @@ def _truncate_graph_for_visualization(
             node_degree[src] += 1
             node_degree[tgt] += 1
 
-    # Drop isolated nodes that still have no edge.
-    connected_node_ids = {nid for nid, deg in node_degree.items() if deg > 0}
-    graph_data["nodes"] = [n for n in selected_nodes if n["id"] in connected_node_ids]
+    # When keep_isolated_nodes is enabled, keep every selected node regardless of degree.
+    if keep_isolated_nodes:
+        graph_data["nodes"] = selected_nodes
+    else:
+        connected_node_ids = {nid for nid, deg in node_degree.items() if deg > 0}
+        graph_data["nodes"] = [n for n in selected_nodes if n["id"] in connected_node_ids]
     graph_data["edges"] = filtered_edges
     return graph_data
 
@@ -182,7 +192,7 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
     if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
         _, kb = KnowledgebaseService.get_by_id(dataset_id)
         graph = await get_graph_from_index_for_visualization(
-            kb.tenant_id, dataset_id, max_nodes=1024,
+            kb.tenant_id, dataset_id, max_nodes=256,
             exclude_entity_types={"书籍", "章节"},
         )
         obj = {"graph": {}, "mind_map": {}}
@@ -193,11 +203,13 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
 
     if "nodes" in obj["graph"]:
         protected_types = {"书籍", "章节"} if GraphRAGConfig.USE_CHAPTER_GRAPH else None
+        keep_isolated_nodes = bool(GraphRAGConfig.USE_INCREMENTAL_GRAPH)
         obj["graph"] = _truncate_graph_for_visualization(
             obj["graph"],
             max_nodes=256,
             max_edges=512,
             protected_types=protected_types,
+            keep_isolated_nodes=keep_isolated_nodes,
         )
 
     return True, obj
