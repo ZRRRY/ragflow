@@ -814,13 +814,15 @@ async def get_graph_from_index_for_visualization(
     candidate_edges.sort(key=lambda x: x[2].get("weight", 0), reverse=True)
     # Return more candidates than max_edges so the upstream truncator can
     # prefer edges that connect more distinct nodes.
+    kept = 0
     for from_node, to_node, meta in candidate_edges[:max_edges * 5]:
         graph.add_edge(from_node, to_node, **meta)
+        kept += 1
 
     graph.graph["source_id"] = sorted(seen_sources)
     logging.info(
-        "get_graph_from_index_for_visualization: kb=%s nodes=%d edges=%d sources=%d",
-        kb_id, len(graph.nodes), len(graph.edges), len(seen_sources),
+        "get_graph_from_index_for_visualization: kb=%s nodes=%d candidate_relations=%d kept_relations=%d sources=%d",
+        kb_id, len(graph.nodes), len(candidate_edges), kept, len(seen_sources),
     )
     return graph
 

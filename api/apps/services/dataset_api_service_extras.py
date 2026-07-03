@@ -60,6 +60,7 @@ async def _fetch_raw_knowledge_graph(dataset_id: str, tenant_id: str):
     # 防御性深度权限校验:避免被其他入口绕过 (P2-9 安全回归修复)
     from api.db.services.knowledgebase_service import KnowledgebaseService
     from rag.nlp import search
+    import logging
 
     if not KnowledgebaseService.accessible(dataset_id, tenant_id):
         return {"graph": {}, "mind_map": {}}
@@ -76,6 +77,12 @@ async def _fetch_raw_knowledge_graph(dataset_id: str, tenant_id: str):
     graph = await get_graph_from_json(kb.tenant_id, dataset_id)
     if graph is not None and len(graph.nodes) > 0:
         obj["graph"] = json_graph.node_link_data(graph, edges="edges")
+        logging.info(
+            "_fetch_raw_knowledge_graph: kb=%s raw_nodes=%d raw_edges=%d",
+            dataset_id, len(obj["graph"].get("nodes", [])), len(obj["graph"].get("edges", [])),
+        )
+    else:
+        logging.warning("_fetch_raw_knowledge_graph: kb=%s no monolithic graph blob found", dataset_id)
 
     return obj
 
@@ -95,10 +102,13 @@ def _truncate_graph_for_visualization(
        then fill remaining slots with the highest-weight edges.
     4. Drop nodes that still have no edge after the above.
     """
+    import logging
+
     if "nodes" not in graph_data:
         return graph_data
 
     all_nodes = graph_data["nodes"]
+    all_edges = graph_data.get("edges", [])
 
     if protected_types:
         protected_nodes = [n for n in all_nodes if n.get("entity_type") in protected_types]
@@ -164,6 +174,13 @@ def _truncate_graph_for_visualization(
     connected_node_ids = {nid for nid, deg in node_degree.items() if deg > 0}
     graph_data["nodes"] = [n for n in selected_nodes if n["id"] in connected_node_ids]
     graph_data["edges"] = filtered_edges
+
+    logging.info(
+        "_truncate_graph_for_visualization: input_nodes=%d input_edges=%d "
+        "selected_nodes=%d candidate_edges=%d round1+2_edges=%d final_nodes=%d final_edges=%d",
+        len(all_nodes), len(all_edges), len(selected_nodes), len(candidate_edges),
+        len(filtered_edges), len(graph_data["nodes"]), len(graph_data["edges"]),
+    )
     return graph_data
 
 
