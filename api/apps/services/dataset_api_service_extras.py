@@ -83,16 +83,17 @@ async def _fetch_raw_knowledge_graph(dataset_id: str, tenant_id: str):
 def _truncate_graph_for_visualization(
     graph_data: dict,
     max_nodes: int = 256,
-    max_edges: int = 128,
+    max_edges: int = 512,
     protected_types: set | None = None,
 ) -> dict:
     """Truncate graph data for visualization while avoiding isolated nodes.
 
     Strategy:
     1. Select top ``max_nodes`` nodes by pagerank (with optional protected types).
-    2. Keep only edges whose both endpoints are in the selected node set,
-       sorted by weight and capped at ``max_edges``.
-    3. Drop isolated nodes that have no remaining edges.
+    2. Keep only edges whose both endpoints are in the selected node set.
+    3. Greedily pick edges: first guarantee every node has at least one edge,
+       then fill remaining slots with the highest-weight edges.
+    4. Drop nodes that still have no edge after the above.
     """
     if "nodes" not in graph_data:
         return graph_data
@@ -117,28 +118,50 @@ def _truncate_graph_for_visualization(
         )[:max_nodes]
 
     node_id_set = {o["id"] for o in selected_nodes}
+    node_degree = {nid: 0 for nid in node_id_set}
 
     filtered_edges = []
     if "edges" in graph_data:
-        filtered_edges = [
+        candidate_edges = [
             o
             for o in graph_data["edges"]
             if o["source"] != o["target"]
             and o["source"] in node_id_set
             and o["target"] in node_id_set
         ]
-        filtered_edges = sorted(
-            filtered_edges,
-            key=lambda x: x.get("weight", 0),
-            reverse=True,
-        )[:max_edges]
+        candidate_edges.sort(key=lambda x: x.get("weight", 0), reverse=True)
 
-    # Drop isolated nodes to avoid rendering orphan dots.
-    connected_node_ids = set()
-    for edge in filtered_edges:
-        connected_node_ids.add(edge["source"])
-        connected_node_ids.add(edge["target"])
+        selected_keys = set()
 
+        # Round 1: ensure every selected node has at least one edge.
+        for edge in candidate_edges:
+            if len(filtered_edges) >= max_edges:
+                break
+            src, tgt = edge["source"], edge["target"]
+            key = tuple(sorted([src, tgt]))
+            if key in selected_keys:
+                continue
+            if node_degree[src] == 0 or node_degree[tgt] == 0:
+                filtered_edges.append(edge)
+                selected_keys.add(key)
+                node_degree[src] += 1
+                node_degree[tgt] += 1
+
+        # Round 2: fill remaining slots with highest-weight edges.
+        for edge in candidate_edges:
+            if len(filtered_edges) >= max_edges:
+                break
+            src, tgt = edge["source"], edge["target"]
+            key = tuple(sorted([src, tgt]))
+            if key in selected_keys:
+                continue
+            filtered_edges.append(edge)
+            selected_keys.add(key)
+            node_degree[src] += 1
+            node_degree[tgt] += 1
+
+    # Drop isolated nodes that still have no edge.
+    connected_node_ids = {nid for nid, deg in node_degree.items() if deg > 0}
     graph_data["nodes"] = [n for n in selected_nodes if n["id"] in connected_node_ids]
     graph_data["edges"] = filtered_edges
     return graph_data
@@ -159,7 +182,7 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
     if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
         _, kb = KnowledgebaseService.get_by_id(dataset_id)
         graph = await get_graph_from_index_for_visualization(
-            kb.tenant_id, dataset_id, max_nodes=256, max_edges=128,
+            kb.tenant_id, dataset_id, max_nodes=256, max_edges=512,
             exclude_entity_types={"书籍", "章节"},
         )
         obj = {"graph": {}, "mind_map": {}}
@@ -173,7 +196,7 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
         obj["graph"] = _truncate_graph_for_visualization(
             obj["graph"],
             max_nodes=256,
-            max_edges=128,
+            max_edges=512,
             protected_types=protected_types,
         )
 

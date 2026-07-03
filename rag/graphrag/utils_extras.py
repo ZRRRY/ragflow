@@ -746,7 +746,7 @@ async def get_graph_from_index_for_visualization(
         [],
         OrderByExpr(),
         0,
-        max_edges * 10,
+        max_edges * 5,
         search.index_name(tenant_id),
         [kb_id],
     )
@@ -777,7 +777,9 @@ async def get_graph_from_index_for_visualization(
             continue
 
     candidate_edges.sort(key=lambda x: x[2].get("weight", 0), reverse=True)
-    for from_node, to_node, meta in candidate_edges[:max_edges]:
+    # Return more candidates than max_edges so the upstream truncator can
+    # prefer edges that connect more distinct nodes.
+    for from_node, to_node, meta in candidate_edges[:max_edges * 5]:
         graph.add_edge(from_node, to_node, **meta)
 
     graph.graph["source_id"] = sorted(seen_sources)
