@@ -27,7 +27,7 @@ from networkx.readwrite import json_graph
 from common import settings
 from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.utils import get_graph_from_json
-from rag.graphrag.utils_extras import get_graph_from_index
+from rag.graphrag.utils_extras import get_graph_from_index_for_visualization
 
 # Knowledge-graph keyword types that must be wiped when deleting a graph.
 # "merge_state" is an incremental-build artefact and is harmless when no such
@@ -181,8 +181,9 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
 
     if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
         _, kb = KnowledgebaseService.get_by_id(dataset_id)
-        graph = await get_graph_from_index(
-            kb.tenant_id, dataset_id, exclude_entity_types={"书籍", "章节"}
+        graph = await get_graph_from_index_for_visualization(
+            kb.tenant_id, dataset_id, max_nodes=1024,
+            exclude_entity_types={"书籍", "章节"},
         )
         obj = {"graph": {}, "mind_map": {}}
         if graph is not None and len(graph.nodes) > 0:

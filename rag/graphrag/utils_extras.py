@@ -640,6 +640,124 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
     return graph
 
 
+async def get_graph_from_index_for_visualization(
+    tenant_id, kb_id, max_nodes=1024, exclude_entity_types=None
+):
+    """Assemble a truncated graph for visualization from indexed chunks.
+
+    Unlike ``get_graph_from_index``, this function does **not** load the full
+    entity/relation index. It fetches the top ``max_nodes`` entities by global
+    pagerank (``rank_flt``) and only fetches relations between those selected
+    nodes. The result is then passed to ``_truncate_graph_for_visualization``
+    for final Top-K node/edge selection.
+    """
+    graph = nx.Graph()
+    graph.graph["source_id"] = []
+    seen_sources = set()
+
+    ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
+    candidate_nodes = []
+
+    # Try direct Top-K by rank_flt first.
+    try:
+        top_res = await thread_pool_exec(
+            settings.docStoreConn.search,
+            ent_flds,
+            [],
+            {"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]},
+            [],
+            OrderByExpr().desc("rank_flt"),
+            0,
+            max_nodes,
+            search.index_name(tenant_id),
+            [kb_id],
+        )
+        top_fields = settings.docStoreConn.get_fields(top_res, ent_flds)
+        for _cid, d in top_fields.items():
+            try:
+                meta = json.loads(d["content_with_weight"])
+                ent_name = d["entity_kwd"]
+                if isinstance(ent_name, list):
+                    ent_name = ent_name[0] if ent_name else None
+                if not ent_name:
+                    continue
+
+                ent_type = meta.get("entity_type")
+                if exclude_entity_types and ent_type in exclude_entity_types:
+                    continue
+
+                pagerank = float(meta.get("pagerank", 0) or 0)
+                candidate_nodes.append((ent_name, pagerank, meta))
+                for sid in meta.get("source_id", []):
+                    seen_sources.add(sid)
+            except Exception:
+                logging.exception("Failed to parse entity chunk %s", _cid)
+                continue
+    except Exception as e:
+        logging.warning(
+            "get_graph_from_index_for_visualization: kb=%s direct rank_flt query failed: %s",
+            kb_id, e,
+        )
+
+    if not candidate_nodes:
+        return None
+
+    candidate_nodes.sort(key=lambda x: x[1], reverse=True)
+    top_nodes = candidate_nodes[:max_nodes]
+    node_set = {name for name, _, _ in top_nodes}
+
+    for ent_name, _, meta in top_nodes:
+        graph.add_node(ent_name, **meta)
+
+    # Fetch relations whose endpoints are both in the selected node set.
+    rel_flds = ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"]
+    rel_condition = {
+        "kb_id": [kb_id],
+        "knowledge_graph_kwd": ["relation"],
+        "from_entity_kwd": list(node_set),
+        "to_entity_kwd": list(node_set),
+    }
+
+    rel_res = await thread_pool_exec(
+        settings.docStoreConn.search,
+        rel_flds,
+        [],
+        rel_condition,
+        [],
+        OrderByExpr(),
+        0,
+        10000,
+        search.index_name(tenant_id),
+        [kb_id],
+    )
+    rel_fields = settings.docStoreConn.get_fields(rel_res, rel_flds)
+
+    for _cid, d in rel_fields.items():
+        try:
+            meta = json.loads(d["content_with_weight"])
+            from_node = d["from_entity_kwd"]
+            to_node = d["to_entity_kwd"]
+            if isinstance(from_node, list):
+                from_node = from_node[0] if from_node else None
+            if isinstance(to_node, list):
+                to_node = to_node[0] if to_node else None
+            if (
+                from_node
+                and to_node
+                and from_node in node_set
+                and to_node in node_set
+            ):
+                graph.add_edge(from_node, to_node, **meta)
+            for sid in meta.get("source_id", []):
+                seen_sources.add(sid)
+        except Exception:
+            logging.exception("Failed to parse relation chunk %s", _cid)
+            continue
+
+    graph.graph["source_id"] = sorted(seen_sources)
+    return graph
+
+
 async def _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback=None):
     """Batch-embed nodes and append chunks. Replaces the per-node asyncio.gather pattern."""
     if not change.added_updated_nodes:
