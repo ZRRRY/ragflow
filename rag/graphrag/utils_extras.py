@@ -786,36 +786,43 @@ async def get_graph_from_index_for_visualization(
                 seen_sources.add(sid)
 
     # ------------------------------------------------------------------
-    # 4. Fallback: fill remaining slots with globally top-ranked entities
+    # 4. Fallback: loop and fill the remaining slots with globally
+    #    top-ranked entities by pagerank until we reach max_nodes.
     # ------------------------------------------------------------------
     if len(selected_set) < max_nodes:
         try:
-            top_res = await thread_pool_exec(
-                settings.docStoreConn.search,
-                ent_flds,
-                [],
-                {"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]},
-                [],
-                OrderByExpr().desc("rank_flt"),
-                0,
-                max_nodes,
-                search.index_name(tenant_id),
-                [kb_id],
-            )
-            top_fields = settings.docStoreConn.get_fields(top_res, ent_flds)
-            for _cid, d in top_fields.items():
-                if len(selected_set) >= max_nodes:
+            fallback_batch_size = 256
+            offset = 0
+            while len(selected_set) < max_nodes:
+                top_res = await thread_pool_exec(
+                    settings.docStoreConn.search,
+                    ent_flds,
+                    [],
+                    {"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]},
+                    [],
+                    OrderByExpr().desc("rank_flt"),
+                    offset,
+                    fallback_batch_size,
+                    search.index_name(tenant_id),
+                    [kb_id],
+                )
+                top_fields = settings.docStoreConn.get_fields(top_res, ent_flds)
+                if not top_fields:
                     break
-                parsed = _parse_entity_doc(_cid, d)
-                if not parsed:
-                    continue
-                ent_name, meta = parsed
-                if ent_name in selected_set:
-                    continue
-                node_meta[ent_name] = meta
-                selected_set.add(ent_name)
-                for sid in meta.get("source_id", []):
-                    seen_sources.add(sid)
+                for _cid, d in top_fields.items():
+                    if len(selected_set) >= max_nodes:
+                        break
+                    parsed = _parse_entity_doc(_cid, d)
+                    if not parsed:
+                        continue
+                    ent_name, meta = parsed
+                    if ent_name in selected_set:
+                        continue
+                    node_meta[ent_name] = meta
+                    selected_set.add(ent_name)
+                    for sid in meta.get("source_id", []):
+                        seen_sources.add(sid)
+                offset += fallback_batch_size
         except Exception as e:
             logging.warning(
                 "get_graph_from_index_for_visualization: kb=%s fallback top-entities query failed: %s",
