@@ -786,33 +786,42 @@ async def get_graph_from_index_for_visualization(
                 seen_sources.add(sid)
 
     # ------------------------------------------------------------------
-    # 4. Fallback: loop and fill the remaining slots with globally
-    #    top-ranked entities by pagerank until we reach max_nodes.
+    # 4. Fallback: fill the remaining slots with random entities
     # ------------------------------------------------------------------
     if len(selected_set) < max_nodes:
         try:
-            fallback_batch_size = 256
-            offset = 0
-            while len(selected_set) < max_nodes:
-                top_res = await thread_pool_exec(
-                    settings.docStoreConn.search,
-                    ent_flds,
-                    [],
-                    {"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]},
-                    [],
-                    OrderByExpr().desc("rank_flt"),
-                    offset,
-                    fallback_batch_size,
-                    search.index_name(tenant_id),
-                    [kb_id],
+            raw = getattr(settings.docStoreConn, "es", None) or getattr(settings.docStoreConn, "os", None)
+            if raw is None:
+                raise NotImplementedError(
+                    "Random fallback requires an Elasticsearch or OpenSearch backend."
                 )
-                top_fields = settings.docStoreConn.get_fields(top_res, ent_flds)
-                if not top_fields:
+            index_name = search.index_name(tenant_id)
+            for _ in range(5):
+                if len(selected_set) >= max_nodes:
                     break
-                for _cid, d in top_fields.items():
+                needed = max_nodes - len(selected_set)
+                body = {
+                    "query": {
+                        "function_score": {
+                            "query": {"bool": {"filter": [
+                                {"term": {"kb_id": kb_id}},
+                                {"terms": {"knowledge_graph_kwd": ["entity"]}},
+                            ]}},
+                            "random_score": {"seed": int(time.time() * 1000) % (2 ** 31)},
+                        }
+                    },
+                    "_source": ent_flds,
+                    "size": needed * 5,
+                }
+                res = await thread_pool_exec(raw.search, index=index_name, body=body)
+                hits = res.get("hits", {}).get("hits", [])
+                if not hits:
+                    break
+                for h in hits:
                     if len(selected_set) >= max_nodes:
                         break
-                    parsed = _parse_entity_doc(_cid, d)
+                    d = h.get("_source", {})
+                    parsed = _parse_entity_doc(None, d)
                     if not parsed:
                         continue
                     ent_name, meta = parsed
@@ -822,10 +831,9 @@ async def get_graph_from_index_for_visualization(
                     selected_set.add(ent_name)
                     for sid in meta.get("source_id", []):
                         seen_sources.add(sid)
-                offset += fallback_batch_size
         except Exception as e:
             logging.warning(
-                "get_graph_from_index_for_visualization: kb=%s fallback top-entities query failed: %s",
+                "get_graph_from_index_for_visualization: kb=%s random fallback query failed: %s",
                 kb_id, e,
             )
 
