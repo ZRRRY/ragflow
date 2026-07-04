@@ -646,12 +646,12 @@ async def get_graph_from_index_for_visualization(
     """Assemble a visualization graph from indexed chunks.
 
     Strategy:
-    1. Select the top 16 entities by global pagerank (``rank_flt``) as centers.
+    1. Select the top 8 entities by global pagerank (``rank_flt``) as centers.
     2. For each center, query its direct relations and keep the 16 strongest
        neighbors (by edge ``weight``).
-    3. De-duplicate centers and neighbors; the target is up to 256 nodes.
-    4. If the above still yields fewer than ``max_nodes`` nodes, fill the rest
-       with globally top-ranked entities.
+    3. Fill the remaining 120 slots with globally top-ranked entities by
+       pagerank.
+    4. De-duplicate across all three groups; the target is 256 nodes.
     5. Return only edges whose both endpoints are selected.
     """
     graph = nx.Graph()
@@ -659,8 +659,10 @@ async def get_graph_from_index_for_visualization(
     seen_sources = set()
 
     ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
-    num_centers = 16
+    num_centers = 8
     neighbors_per_center = 16
+    fallback_topk = 120
+    max_nodes = num_centers + num_centers * neighbors_per_center + fallback_topk
 
     def _parse_entity_doc(_cid, d):
         try:
