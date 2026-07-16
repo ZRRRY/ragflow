@@ -37,7 +37,6 @@ from typing import Optional
 
 from common import settings
 from common.constants import LLMType, SVR_CONSUMER_GROUP_NAME
-from common.exceptions import TaskCanceledException
 from common.misc_utils import thread_pool_exec
 from api.db.joint_services.tenant_model_service import (
     get_model_config_from_provider_instance,
@@ -237,7 +236,10 @@ async def reconcile_stuck_graphrag_tasks():
 
 async def _run_reconcile_as_leader():
     """Leader-elected wrapper around reconcile_stuck_graphrag_tasks."""
-    te = sys.modules["rag.svr.task_executor"]
+    te = _get_task_executor_module()
+    if te is None:
+        logging.error("[reconcile] task_executor module not found, aborting leader reconcile")
+        return
     _reconcile_leader_key = "graphrag:reconcile:leader"
     _reconcile_leader_ttl = 600
     _leader_token = f"{socket.gethostname()}:{os.getpid()}:{time.time()}"
@@ -314,7 +316,10 @@ async def kg_postprocess_consumer():
     if not GraphRAGConfig.USE_ASYNC_KG_PHASES:
         return
 
-    te = sys.modules["rag.svr.task_executor"]
+    te = _get_task_executor_module()
+    if te is None:
+        logging.error("[KG-PP] task_executor module not found, consumer aborting")
+        return
     queue_name = GraphRAGConfig.KG_POSTPROCESS_QUEUE
     group_name = SVR_CONSUMER_GROUP_NAME + "_kg_pp"
     consumer_name = te.CONSUMER_NAME + "_kg_pp"
@@ -378,7 +383,11 @@ async def kg_postprocess_consumer():
                 if msg:
                     logging.info("[KG-PP] kb=%s: %s", kb_id, msg)
 
-            kb_lock = RedisDistributedLock(f"graphrag_task_{kb_id}", lock_value="kg_postprocess", timeout=3600)
+            # 唯一 lock_value：官方 acquire/spin_acquire 的第一步是
+            # delete_if_equal(lock_key, lock_value)——固定 value 会让后到者
+            # 先删掉先到者持有的锁再抢走，互斥完全失效。与主流程
+            # batch_merge:{task_id} 的模式保持一致。
+            kb_lock = RedisDistributedLock(f"graphrag_task_{kb_id}", lock_value=f"kg_pp:{task_id}", timeout=3600)
             try:
                 await kb_lock.spin_acquire(stop_event=te.stop_event)
             except asyncio.CancelledError:
@@ -500,7 +509,11 @@ def _make_set_progress_wrapper(original_set_progress):
 def _make_main_wrapper(original_main):
     """Wrap main() with boot-time reconcile and background KG phase tasks."""
     async def main():
-        te = sys.modules["rag.svr.task_executor"]
+        te = _get_task_executor_module()
+        if te is None:
+            # Should never happen: this wrapper is only installed by
+            # patch_task_executor(), which caches the module reference.
+            return await original_main()
 
         # Ensure signal handlers are installed before any potentially long
         # boot-time work (matches the order in the original embedded version).
@@ -535,10 +548,43 @@ def _make_main_wrapper(original_main):
     return main
 
 
+# -----------------------------------------------------------------------------
+# task_executor module lookup.
+#
+# Production launches run ``python rag/svr/task_executor.py`` (see
+# docker/entrypoint.sh / docker/launch_backend_service.sh), so the module is
+# registered as ``__main__`` — ``sys.modules["rag.svr.task_executor"]`` does
+# NOT exist and a plain lookup silently finds nothing. Unit tests import it
+# as a regular module instead. All lookups must go through this helper.
+# -----------------------------------------------------------------------------
+_te_module = None
+
+
+def _get_task_executor_module():
+    """Return the live task_executor module, or None when it cannot be found."""
+    global _te_module
+    if _te_module is not None:
+        return _te_module
+    te = sys.modules.get("rag.svr.task_executor")
+    if te is None:
+        main_mod = sys.modules.get("__main__")
+        if main_mod is not None and hasattr(main_mod, "set_progress") and hasattr(main_mod, "main"):
+            te = main_mod
+    if te is not None:
+        _te_module = te
+    return te
+
+
 def patch_task_executor():
     """Install custom extensions into the already-imported task_executor module."""
-    te = sys.modules.get("rag.svr.task_executor")
-    if te is None or getattr(te, "_task_executor_patched", False):
+    te = _get_task_executor_module()
+    if te is None:
+        logging.warning(
+            "[task_executor_extras] task_executor module not found in sys.modules; "
+            "custom patches (reconcile/heartbeat/KG-PP) NOT installed"
+        )
+        return
+    if getattr(te, "_task_executor_patched", False):
         return
 
     # Preserve originals so they can be restored in tests if needed.
@@ -547,6 +593,13 @@ def patch_task_executor():
 
     te.set_progress = _make_set_progress_wrapper(te._original_set_progress)
     te.main = _make_main_wrapper(te._original_main)
+
+    # CONSUMER_NAME is normally assigned in the ``if __name__ == "__main__"``
+    # block AFTER this patch installs (script mode overwrites this default),
+    # so provide a fallback for module-imported usage (e.g. tests) to keep
+    # the KG-PP consumer from hitting AttributeError.
+    if not hasattr(te, "CONSUMER_NAME"):
+        te.CONSUMER_NAME = f"task_executor_{getattr(te, 'TASK_TYPE', 'common')}_0"
 
     # Backward-compat shim: only installed when reconcile-on-boot is enabled,
     # so default deployments don't pay the global __getattr__ dispatch cost.
@@ -558,3 +611,9 @@ def patch_task_executor():
         te.__getattr__ = __getattr__
 
     te._task_executor_patched = True
+    logging.info(
+        "[task_executor_extras] patches installed on %s (reconcile_on_boot=%s, async_kg_phases=%s)",
+        getattr(te, "__name__", "<unknown>"),
+        GraphRAGConfig.RECONCILE_STUCK_ON_BOOT,
+        GraphRAGConfig.USE_ASYNC_KG_PHASES,
+    )

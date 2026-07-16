@@ -25,9 +25,9 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | # | 定制位置 | 复制/依赖的官方逻辑 | 需 diff 的官方文件 | 风险等级 | 最近核对 |
 |---|----------|--------------------|-------------------|---------|---------|
 | 1 | `rag/graphrag/general/index_extras.py` `run_graphrag_for_kb` | 官方同名编排函数（`index.py:257`）近全文复制加增量分支，上游编排层 bugfix 不传播 | `rag/graphrag/general/index.py` | **高** | 2026-07-16 |
-| 2 | `index_extras.py` `resolve_entities_incremental` + `index_patch.py` wrapper | 官方 `resolve_entities`（`index.py:758`）调用约定（8 位置参数 + `task_id=`/`entity_types=`）| 同上 | **高**（签名漂移已致 TypeError，见第六节已知问题） | 2026-07-16 |
+| 2 | `index_extras.py` `resolve_entities_incremental` + `index_patch.py` wrapper | 官方 `resolve_entities`（`index.py:758`）调用约定（8 位置参数 + `task_id=`/`entity_types=`）| 同上 | **高**（曾因签名漂移致 TypeError，2026-07-16 已修复并加回归测试） | 2026-07-16 |
 | 3 | `index_patch.py` `_wrap_extract_community` | 按位置取 `args[6]`/`args[7]` 作为 callback/task_id | 同上 `extract_community`（`index.py:804`） | 中（上游改签名静默失效） | 2026-07-16 |
-| 4 | `rag/svr/task_executor_extras.py` | `sys.modules["rag.svr.task_executor"]` 模块查找；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值 | `rag/svr/task_executor.py` | **高**（脚本启动下 patch 不生效，见第六节） | 2026-07-16 |
+| 4 | `rag/svr/task_executor_extras.py` | `sys.modules` 模块查找（生产为 `__main__`，2026-07-16 已修复回退逻辑并加安装日志）；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值（已加兜底默认值） | `rag/svr/task_executor.py` | **高** | 2026-07-16 |
 | 5 | `api/apps/services/dataset_api_service_extras.py` `get_knowledge_graph` | 整函数替换官方实现；截断策略已偏离（边 128→512、丢孤立节点、无向去重） | `api/apps/services/dataset_api_service.py` | 中（上游改进被屏蔽） | 2026-07-16 |
 | 6 | `rag/graphrag/document_delete_extras.py` | 官方文档删除 GraphRAG 清理流程副本（增量路径条件化） | `api/db/services/document_service.py` | 中 | 2026-07-16 |
 | 7 | `common/doc_store/opensearch_conn_extras.py` `insert` 全局替换 | 官方 insert 重试/序列化逻辑副本（含官方缺陷：重试耗尽返回空错误列表，bulk 失败被静默吞掉） | `rag/utils/opensearch_conn.py` | 中 | 2026-07-16 |
@@ -174,20 +174,20 @@ git diff <旧tag>..<新tag> -- <官方文件>
 
 ## 六、待验证事项与已知问题
 
-### 已知问题（2026-07-16 全分支审查发现，按严重程度排序，待修）
+### 已知问题（2026-07-16 全分支审查发现；4 个严重项已于同日修复）
 
-1. **`resolve_entities_incremental` 签名与全部调用点不兼容**：flag 开时必现 `TypeError: got multiple values for argument 'task_id'`；flag 关时官方 `resolve_entities` 不收 `entity_types=` kwarg 同样 TypeError。增量消解路径当前开关怎么打都会崩。
-2. **`patch_task_executor()` 在生产启动方式下静默不生效**：`entrypoint.sh`/`launch_backend_service.sh` 以脚本方式运行（模块名为 `__main__`），`sys.modules.get("rag.svr.task_executor")` 必为 None 直接 return。reconcile、心跳、KG-PP consumer 全部未运行，且无日志。
-3. **flag 组合 `USE_INCREMENTAL_MERGE=1` + `USE_INCREMENTAL_GRAPH=0` 导致全图数据丢失**：merge 末尾 `set_graph` 路由到官方实现，KB 级删除后把单文档 delta 写成全局图。config 层缺少开关组合校验。
-4. **KG-PP 分布式锁互斥失效**：`lock_value="kg_postprocess"` 为固定字符串，官方 `spin_acquire` 的 `delete_if_equal` 会先删锁再抢，后到者可夺走先到者的锁。应改用唯一 lock_value。
+1. ~~**`resolve_entities_incremental` 签名与全部调用点不兼容**~~ **已修复**：增量实现签名与官方 `resolve_entities` 完全对齐（8 位置参数 + `task_id=`/`entity_types=`），wrapper 回退官方实现时剔除 `entity_types`（`index_patch.py`）。回归测试：`test_incremental_bugfixes.py::TestResolveEntitiesCallConvention`。
+2. ~~**`patch_task_executor()` 在生产启动方式下静默不生效**~~ **已修复**：新增 `_get_task_executor_module()`，`rag.svr.task_executor` 查不到时回退 `__main__`（生产脚本启动方式）；仍找不到时打 WARNING 而非静默 return；安装成功打 INFO；`CONSUMER_NAME` 提供模块级兜底默认值。回归测试：`TestTaskExecutorModuleLookup`。
+3. ~~**flag 组合 `USE_INCREMENTAL_MERGE=1` + `USE_INCREMENTAL_GRAPH=0` 导致全图数据丢失**~~ **已修复**：`GraphRAGConfig.normalize_flag_combinations()`（import 时与 `reload()` 时执行）在 MERGE/RESOLUTION 开启而 GRAPH 关闭时自动升级 GRAPH 并打 ERROR 日志提醒修正环境变量。回归测试：`TestFlagCombinationNormalization`。
+4. ~~**KG-PP 分布式锁互斥失效**~~ **已修复**：`lock_value` 改为唯一值 `kg_pp:{task_id}`，与主流程 `batch_merge:{task_id}` 的模式一致，官方 `delete_if_equal` 不再误删他人持锁。
 
-其余中/轻度问题（resume 空指针、`does_graph_contains` size=1 假阴性、search_after 无 PIT、局部 PageRank 污染全局 rank、OS insert 沿用官方静默失败缺陷、KG-PP 失败即 ack 无死信等）见 2026-07-16 审查记录，修复优先级低于上述四项。
+其余中/轻度问题（resume 空指针、`does_graph_contains` size=1 假阴性、search_after 无 PIT、局部 PageRank 污染全局 rank、OS insert 沿用官方静默失败缺陷、KG-PP 失败即 ack 无死信等）仍未处理，见 2026-07-16 审查记录。
 
 ### 待验证事项
 
-- [ ] 端到端集成测试：`USE_INCREMENTAL_GRAPH=1 USE_INCREMENTAL_MERGE=1 USE_INCREMENTAL_RESOLUTION=1`（注意：受已知问题 1 阻塞，修复前无法通过）
+- [ ] 端到端集成测试：`USE_INCREMENTAL_GRAPH=1 USE_INCREMENTAL_MERGE=1 USE_INCREMENTAL_RESOLUTION=1`
 - [ ] 验证 `_record_lock_metric` Redis hash 写入
-- [ ] 验证启动时 `RECONCILE_STUCK_ON_BOOT=1` 的 reconcile 日志（注意：受已知问题 2 阻塞）
+- [ ] 验证启动时 `RECONCILE_STUCK_ON_BOOT=1` 的 reconcile 日志
 - [ ] 测试 OpenSearch KNN 路径在 Infinity/ES 后端下的降级行为
 - [x] 检查 `api/apps/restful_apis/dataset_api.py` 路由冲突：`DELETE /datasets/<id>/graph` 已新增用于前端删除按钮；`unbindPipelineTask` 保持 `/datasets/<id>/index?type=` 风格以避免冲突
 

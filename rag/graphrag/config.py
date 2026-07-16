@@ -236,6 +236,25 @@ class GraphRAGConfig:
             return True
 
     @classmethod
+    def normalize_flag_combinations(cls):
+        """危险开关组合兜底。
+
+        增量 merge / 增量 resolution 的产物依赖增量图存储（entity/relation
+        chunk）。若 ``USE_INCREMENTAL_GRAPH=0``，``set_graph`` 会路由到官方
+        全量实现（``_set_graph_impl``），把单文档 delta / 局部消解结果覆盖
+        为全局图——静默数据丢失。此处自动升级为 ``USE_INCREMENTAL_GRAPH=1``
+        并以 ERROR 日志提醒修正环境变量。
+        """
+        if (cls.USE_INCREMENTAL_MERGE or cls.USE_INCREMENTAL_RESOLUTION) and not cls.USE_INCREMENTAL_GRAPH:
+            logger.error(
+                "USE_INCREMENTAL_MERGE/USE_INCREMENTAL_RESOLUTION 依赖 USE_INCREMENTAL_GRAPH=1；"
+                "当前 USE_INCREMENTAL_GRAPH=0 会导致 set_graph 走官方全量覆盖路径（数据丢失风险），"
+                "已自动按 USE_INCREMENTAL_GRAPH=1 处理。请修正环境变量配置。"
+            )
+            cls.USE_INCREMENTAL_GRAPH = True
+            cls.DELETE_SUBGRAPH_ON_DOC_DELETE = True
+
+    @classmethod
     def reload(cls):
         """重新从环境变量读取所有开关。仅在测试场景使用,生产部署需重启。"""
         cls.USE_INCREMENTAL_GRAPH = os.environ.get("USE_INCREMENTAL_GRAPH", "0") == "1"
@@ -270,12 +289,16 @@ class GraphRAGConfig:
         cls.KEEP_SUBGRAPH = os.environ.get("GRAPHRAG_KEEP_SUBGRAPH", "1") == "1"
         cls.KEEP_MERGE = os.environ.get("GRAPHRAG_KEEP_MERGE", "1") == "1"
         cls.KEEP_RESOLUTION = os.environ.get("GRAPHRAG_KEEP_RESOLUTION", "1") == "1"
+        cls.normalize_flag_combinations()
         logger.info("GraphRAGConfig.reload() applied; current flags logged via log_flags().")
         cls.log_flags(force=True)
 
 
 # 不在 import 时自动打印,避免 worker 启动时重复污染日志。
 # 需要诊断时显式调用 GraphRAGConfig.log_flags(force=True)。
+
+# 危险开关组合兜底（MERGE/RESOLUTION 依赖增量图存储，详见方法 docstring）
+GraphRAGConfig.normalize_flag_combinations()
 
 # === CUSTOM BEGIN [redis-conn-monkey-patch] ===
 # 原因：为 RedisDB 与 RedisDistributedLock 注入 GraphRAG 自定义方法，避免修改官方 redis_conn.py

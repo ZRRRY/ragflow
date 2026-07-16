@@ -132,6 +132,10 @@ def _wrap_resolve_entities(*args, **kwargs):
         )
 
         return _custom(*args, **kwargs)
+    # 官方 resolve_entities 不收 entity_types；自定义调用点
+    # （index_extras / task_executor_extras）会带此关键字参数，
+    # 回退官方实现前必须剔除，否则 TypeError。
+    kwargs.pop("entity_types", None)
     return _ORIGINALS["resolve_entities"](*args, **kwargs)
 
 

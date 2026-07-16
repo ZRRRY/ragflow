@@ -1465,16 +1465,25 @@ async def merge_subgraph_incremental(
 
 
 async def resolve_entities_incremental(
+    graph,
+    subgraph_nodes: set[str],
     tenant_id: str,
     kb_id: str,
-    union_nodes: set[str],
+    doc_id: str | None,
     llm_bdl,
     embed_bdl,
     callback,
     task_id: str = "",
     entity_types: list[str] | None = None,
 ):
-    """Incremental entity resolution via OpenSearch KNN or char-level filtering."""
+    """Incremental entity resolution via OpenSearch KNN or char-level filtering.
+
+    签名与官方 ``resolve_entities``（rag/graphrag/general/index.py）完全对齐，
+    因为 wrapper 按官方调用约定原样透传全部参数。增量路径不使用
+    ``graph``/``doc_id``（实体直接从索引读取）；官方语义上的
+    ``subgraph_nodes`` 在此视为待消解的新增/变更节点集合。
+    """
+    union_nodes = set(subgraph_nodes or ())
     start = asyncio.get_running_loop().time()
     excluded_types = build_excluded_types(entity_types)
 
