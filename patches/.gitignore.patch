@@ -1,14 +1,25 @@
 diff --git a/.gitignore b/.gitignore
-index d289bd94e..70b1613ac 100644
+index d289bd94e..7eb6665c1 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -237,7 +237,10 @@ bin/*
+@@ -52,6 +52,7 @@ uv-x86_64*.tar.gz
+ .lh/
+ .venv
+ docker/data
++docker/docker-compose.override.yml
+ 
+ # OceanBase data and conf
+ docker/oceanbase/conf
+@@ -237,7 +238,13 @@ bin/*
  !bin/.gitkeep
  .claude/settings.local.json
  
 -.run/
 +# GraphRAG review documents
 +docs/graphrag_review/
++
++# Diff generated text files
++*diff*.txt
 +
  # Local agent tooling state (per-developer; not for commit)
 +.run/
