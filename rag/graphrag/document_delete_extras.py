@@ -25,6 +25,10 @@ def cleanup_knowledge_graph_references(doc, chunk_index_name):
     When incremental GraphRAG is disabled, the official logic is executed
     verbatim to keep the default behavior unchanged.
     """
+    # Documents that were never parsed have no chunks and no graph data;
+    # skip the ES round-trips entirely.
+    if not getattr(doc, "chunk_num", 0):
+        return
     if GraphRAGConfig.DELETE_SUBGRAPH_ON_DOC_DELETE:
         _cleanup_knowledge_graph_references_incremental(doc, chunk_index_name)
     else:
@@ -83,7 +87,7 @@ def _cleanup_knowledge_graph_references_incremental(doc, chunk_index_name):
         chunk_index_name,
         [doc.kb_id],
     )
-    subgraph_ids = list(subgraph_res.ids or [])
+    subgraph_ids = settings.docStoreConn.get_doc_ids(subgraph_res)
     if subgraph_ids:
         settings.docStoreConn.delete(
             {"id": subgraph_ids},
