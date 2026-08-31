@@ -21,6 +21,7 @@ When every feature switch is off the original implementations are preserved.
 """
 
 import logging
+import os
 
 from rag.graphrag.config import GraphRAGConfig
 
@@ -55,6 +56,13 @@ def apply_patch(module):
     module.merge_subgraph = _wrap_merge_subgraph
     module.resolve_entities = _wrap_resolve_entities
     module.extract_community = _wrap_extract_community
+
+    # Raise the default per-doc merge timeout: the official 180s default is
+    # too small once the KB-level global graph grows large.  Both the original
+    # and the custom ``run_graphrag_for_kb`` read this module global at call
+    # time (index_extras has its own env-driven default), so overriding it here
+    # keeps the official file untouched.
+    module.DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = int(os.environ.get("GRAPHRAG_MERGE_TIMEOUT_SECONDS", "1800"))
     logger.debug("GraphRAG index patch applied; flags=%s", _feature_flags())
 
 

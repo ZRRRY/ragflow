@@ -108,7 +108,9 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | 环境变量 | 默认值 | 控制功能 |
 |----------|--------|----------|
 | `USE_INCREMENTAL_MERGE` | `0` | Merge 阶段：1=仅合并新增 subgraph，0=官方默认全图 merge |
-| `GRAPHRAG_MERGE_TIMEOUT_SECONDS` | `1800` | Merge 阶段单步超时（秒） |
+| `GRAPHRAG_MERGE_TIMEOUT_SECONDS` | `1800` | Merge 阶段单步超时（秒）；官方 `index.py` 的默认值由 `index_patch.apply_patch()` 在运行时覆写，`index_extras.py` 自带同默认值 |
+| `GRAPHRAG_SET_GRAPH_STREAM_WINDOW` | `256` | `set_graph_delta` 流式 embed→insert 的窗口大小，避免大变更集的全部向量一次性驻留内存导致 executor OOM；删除（removed + 预删旧版本）已前移到嵌入/插入之前，中途崩溃由 merge 重试自愈 |
+| `GRAPHRAG_SET_GRAPH_PIPELINE_DEPTH` | `1` | 流式窗口的流水线深度：最多 d 个窗口同时在入库、下一窗口同时嵌入；内存峰值约 (d+1) 个窗口，ES 在途 bulk 请求数约 4×d（每窗口带 `GRAPHRAG_INSERT_CONCURRENCY` 路并发） |
 
 ### Phase 2.5：增量合并后全局 PageRank 重算
 | 环境变量 | 默认值 | 控制功能 |

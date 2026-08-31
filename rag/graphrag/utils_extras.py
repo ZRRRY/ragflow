@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import networkx as nx
 
@@ -60,6 +60,21 @@ _INSERT_CONCURRENCY = max(1, int(os.environ.get("GRAPHRAG_INSERT_CONCURRENCY", 4
 # query/filter.  Splitting large to_node lists avoids "max_terms_count" errors
 # during bulk edge deletion.
 _MAX_TERMS_COUNT = max(1, int(os.environ.get("GRAPHRAG_DELETE_MAX_TERMS_COUNT", 65536)))
+
+# Streaming embed→insert window for ``set_graph_delta``.  At most this many
+# chunks' embedding vectors are held in memory at once; each full window is
+# embedded and inserted before the next one is built.  A large KB merge can
+# produce tens of thousands of vectors (~32KB each in Python list form), so
+# materializing them all before inserting can OOM the task executor.
+# Override with GRAPHRAG_SET_GRAPH_STREAM_WINDOW.
+_SET_GRAPH_STREAM_WINDOW = max(1, int(os.environ.get("GRAPHRAG_SET_GRAPH_STREAM_WINDOW", 256)))
+
+# Pipeline depth for the streaming embed→insert: how many windows may have an
+# insert in flight while later windows are being built/embedded.  Depth d keeps
+# at most d+1 windows in memory and up to d * GRAPHRAG_INSERT_CONCURRENCY bulk
+# requests in flight against the doc store.  Override with
+# GRAPHRAG_SET_GRAPH_PIPELINE_DEPTH.
+_SET_GRAPH_PIPELINE_DEPTH = max(1, int(os.environ.get("GRAPHRAG_SET_GRAPH_PIPELINE_DEPTH", 1)))
 
 
 async def _post_insert_refresh(tenant_id: str, callback=None, label: str = "set_graph"):
@@ -847,12 +862,20 @@ async def get_graph_from_index_for_visualization(
     return graph
 
 
-async def _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback=None):
-    """Batch-embed nodes and append chunks. Replaces the per-node asyncio.gather pattern."""
+async def _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback=None, flush=None, window_size=0):
+    """Batch-embed nodes and append chunks. Replaces the per-node asyncio.gather pattern.
+
+    When ``flush`` is provided, chunks are embedded and handed to ``flush`` in
+    windows of ``window_size`` items, so embedding vectors for the whole change
+    set never reside in memory at once (streaming embed→insert).
+    """
     if not change.added_updated_nodes:
         return
 
     items = []
+    sink = [] if flush else chunks
+    load = 0
+
     for node in change.added_updated_nodes:
         node_attrs = graph.nodes[node]
         chunk = {
@@ -875,19 +898,36 @@ async def _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback=No
         chunk["n_hop_with_weight"] = json.dumps(_utils.n_neighbor(graph, node) or [], ensure_ascii=False)
         # 书籍/章节类结构节点不需要语义向量，直接入库；不进入批量 embedding。
         if GraphRAGConfig.should_skip_embedding(node_attrs.get("entity_type")):
-            chunks.append(chunk)
-            continue
-        items.append((chunk, node, node))
+            sink.append(chunk)
+        else:
+            items.append((chunk, node, node))
+        load += 1
+        if flush and load >= window_size:
+            await _batch_embed_items(kb_id, embd_mdl, items, sink, callback, label="nodes")
+            await flush(sink)
+            items, sink, load = [], [], 0
 
-    await _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label="nodes")
+    if flush:
+        await _batch_embed_items(kb_id, embd_mdl, items, sink, callback, label="nodes")
+        if sink:
+            await flush(sink)
+    else:
+        await _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label="nodes")
 
 
-async def _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback=None):
-    """Batch-embed edges and append chunks. Replaces the per-edge asyncio.gather pattern."""
+async def _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback=None, flush=None, window_size=0):
+    """Batch-embed edges and append chunks. Replaces the per-edge asyncio.gather pattern.
+
+    ``flush`` / ``window_size`` have the same streaming semantics as in
+    ``_batch_embed_nodes``.
+    """
     if not change.added_updated_edges:
         return
 
     items = []
+    sink = [] if flush else chunks
+    load = 0
+
     for from_node, to_node in change.added_updated_edges:
         edge_attrs = graph.get_edge_data(from_node, to_node)
         if not edge_attrs:
@@ -911,13 +951,23 @@ async def _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback=No
         from_type = graph.nodes[from_node].get("entity_type")
         to_type = graph.nodes[to_node].get("entity_type")
         if GraphRAGConfig.should_skip_embedding(from_type) or GraphRAGConfig.should_skip_embedding(to_type):
-            chunks.append(chunk)
-            continue
-        cache_key = f"{from_node}->{to_node}"
-        embed_text = f"{cache_key}: {edge_attrs.get('description', '')}"
-        items.append((chunk, cache_key, embed_text))
+            sink.append(chunk)
+        else:
+            cache_key = f"{from_node}->{to_node}"
+            embed_text = f"{cache_key}: {edge_attrs.get('description', '')}"
+            items.append((chunk, cache_key, embed_text))
+        load += 1
+        if flush and load >= window_size:
+            await _batch_embed_items(kb_id, embd_mdl, items, sink, callback, label="edges")
+            await flush(sink)
+            items, sink, load = [], [], 0
 
-    await _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label="edges")
+    if flush:
+        await _batch_embed_items(kb_id, embd_mdl, items, sink, callback, label="edges")
+        if sink:
+            await flush(sink)
+    else:
+        await _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label="edges")
 
 
 async def _batch_embed_items(kb_id, embd_mdl, items, chunks, callback, label):
@@ -1051,22 +1101,26 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
        ``get_graph_from_index`` from the indexed entity/relation documents.
     3. **Entity / relation chunks are produced for the delta** so the
        ``get_graph_from_index`` path can assemble a consistent graph.
+    4. **Streaming embed→insert** – chunks are embedded and inserted in
+       windows (``_SET_GRAPH_STREAM_WINDOW``) instead of materializing the
+       whole change set in memory.  A large merge can produce tens of
+       thousands of embedding vectors; holding them all at once can OOM the
+       task executor.  Windows form a bounded pipeline (window N inserts
+       while window N+1 embeds; depth via ``_SET_GRAPH_PIPELINE_DEPTH``), so
+       throughput stays close to the slower of the two stages while memory
+       stays bounded at depth+1 windows.
+
+    Ordering note: deletions (removed entities/edges + pre-delete of old
+    versions) run BEFORE the streaming embed→insert.  If the run crashes
+    mid-way, the index temporarily misses some entities/relations, but the
+    next merge attempt for the same document re-embeds (the embed cache makes
+    this cheap) and re-inserts the same delta, so the index converges back to
+    a consistent state.
     """
     start = asyncio.get_running_loop().time()
 
     # ------------------------------------------------------------------
-    # 1. Embeddings for the delta only
-    chunks = []
-    await _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback)
-    await _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback)
-
-    now = asyncio.get_running_loop().time()
-    if callback:
-        callback(msg=f"set_graph converted graph change to {len(chunks)} chunks in {now - start:.2f}s.")
-    start = now
-
-    # ------------------------------------------------------------------
-    # 2. Delete removed entities/edges (graph JSON shadow storage is left alone)
+    # 1. Delete removed entities/edges (graph JSON shadow storage is left alone)
     # ------------------------------------------------------------------
     if change.removed_nodes:
         BATCH_SIZE = 100
@@ -1102,7 +1156,7 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-    # 3. Pre-delete old versions of entities/edges that will be re-inserted
+    # 2. Pre-delete old versions of entities/edges that will be re-inserted
     await _pre_delete_added_updated(tenant_id, kb_id, change, callback)
 
     del_now = asyncio.get_running_loop().time()
@@ -1110,7 +1164,53 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
         callback(msg=f"set_graph removed {len(change.removed_nodes)} nodes and {len(change.removed_edges)} edges from index in {del_now - start:.2f}s.")
     start = del_now
 
-    await _utils.insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert chunks")
+    # ------------------------------------------------------------------
+    # 3. Streaming embed→insert with a bounded pipeline: while up to
+    #    ``_SET_GRAPH_PIPELINE_DEPTH`` windows are being inserted into the
+    #    doc store, the next window is already being built/embedded.
+    #    Backpressure comes from awaiting the oldest in-flight insert before
+    #    scheduling a new one, so at most depth+1 windows' chunks (and their
+    #    vectors) are in memory at once.
+    #    ``insert_total`` counts every chunk the two builders will produce
+    #    (edges without edge_attrs are skipped, mirroring _batch_embed_edges).
+    # ------------------------------------------------------------------
+    insert_total = len(change.added_updated_nodes) + sum(
+        1 for from_node, to_node in change.added_updated_edges if graph.get_edge_data(from_node, to_node)
+    )
+    inserted = {"n": 0}
+    pending_inserts: deque = deque()
+
+    async def _insert_window(window_chunks):
+        await _utils.insert_chunks_bounded(window_chunks, tenant_id, kb_id, label="Insert chunks")
+        inserted["n"] += len(window_chunks)
+        if callback:
+            callback(msg=f"Insert chunks: {inserted['n']}/{insert_total}")
+
+    async def _flush_window(window_chunks):
+        # Backpressure: at most _SET_GRAPH_PIPELINE_DEPTH inserts in flight;
+        # awaiting the oldest one also propagates insert failures early.
+        while len(pending_inserts) >= _SET_GRAPH_PIPELINE_DEPTH:
+            await pending_inserts.popleft()
+        pending_inserts.append(asyncio.create_task(_insert_window(window_chunks)))
+
+    try:
+        await _batch_embed_nodes(
+            kb_id, embd_mdl, graph, change, [], callback,
+            flush=_flush_window, window_size=_SET_GRAPH_STREAM_WINDOW,
+        )
+        await _batch_embed_edges(
+            kb_id, embd_mdl, graph, change, [], callback,
+            flush=_flush_window, window_size=_SET_GRAPH_STREAM_WINDOW,
+        )
+        while pending_inserts:
+            await pending_inserts.popleft()
+    except Exception:
+        for task in pending_inserts:
+            task.cancel()
+        if pending_inserts:
+            await asyncio.gather(*pending_inserts, return_exceptions=True)
+        raise
+
     await _post_insert_refresh(tenant_id, callback=callback, label="set_graph_delta")
     now = asyncio.get_running_loop().time()
     if callback:
