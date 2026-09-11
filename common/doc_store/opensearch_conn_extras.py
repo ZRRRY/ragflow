@@ -29,6 +29,8 @@ Methods installed
   Bulk insert with ``refresh="false"`` and increased timeout for high-volume GraphRAG writes.
 * ``OSConnection.count(condition, index_name, knowledgebase_ids) -> int``
   Count documents matching ``condition`` within the given knowledge bases.
+* ``OSConnection.update_docs(index_name, updates) -> list[str]``
+  Bulk partial update by ``_id`` (only the supplied fields are replaced).
 """
 
 from __future__ import annotations
@@ -167,13 +169,18 @@ def _os_search_with_scroll(
 
     scroll_id = None
     try:
-        res = self.os.search(
-            index=index_names,
-            body=query_body,
-            scroll=scroll_timeout,
-            size=batch_size,
-            _source=True,
-        )
+        search_kwargs = {
+            "index": index_names,
+            "body": query_body,
+            "scroll": scroll_timeout,
+            "size": batch_size,
+        }
+        # Respect a caller-provided ``_source`` projection in the query body
+        # (e.g. pagerank recalc fetches only metadata fields); the explicit
+        # ``_source=True`` kwarg would override the body's projection.
+        if "_source" not in query_body:
+            search_kwargs["_source"] = True
+        res = self.os.search(**search_kwargs)
         scroll_id = res.get("_scroll_id")
         hits = res["hits"]["hits"]
 
@@ -301,6 +308,51 @@ def _os_insert(self, documents: list[dict], indexName: str, knowledgebaseId: str
     return res
 
 
+def _os_update_docs(self, index_name: str, updates: list[tuple[str, dict]]) -> list[str]:
+    """Bulk partial update of documents by ``_id``.
+
+    ``updates`` is a list of ``(doc_id, fields)`` pairs; each entry issues a
+    bulk ``update`` action with ``{"doc": fields}`` so untouched fields (e.g.
+    embedding vectors) are preserved in place and never leave the doc store.
+
+    Shares the ``_os_insert`` write contract: ``refresh="false"`` for
+    throughput, so the caller MUST issue an explicit refresh once the logical
+    operation completes. Returns a list of per-item error strings (empty on
+    full success).
+    """
+    from rag.utils.opensearch_conn import ATTEMPT_TIME
+
+    if not updates:
+        return []
+
+    operations = []
+    for doc_id, fields in updates:
+        operations.append({"update": {"_index": index_name, "_id": doc_id}})
+        operations.append({"doc": fields})
+
+    res = []
+    for _ in range(ATTEMPT_TIME):
+        try:
+            res = []
+            r = self.os.bulk(index=index_name, body=operations, refresh="false", timeout=300)
+            if not r["errors"]:
+                return res
+            for item in r["items"]:
+                for action in ["create", "delete", "index", "update"]:
+                    if action in item and "error" in item[action]:
+                        res.append(str(item[action]["_id"]) + ":" + str(item[action]["error"]))
+            return res
+        except Exception as e:
+            res.append(str(e))
+            _logger.warning("OSConnection.update_docs got exception: " + str(e))
+            res = []
+            if re.search(r"(Timeout|time out)", str(e), re.IGNORECASE):
+                res.append(str(e))
+                time.sleep(3)
+                continue
+    return res
+
+
 def _os_count(self, condition: dict, indexName: str, knowledgebaseIds: list[str]) -> int:
     assert "_id" not in condition
     cond = condition.copy()
@@ -367,6 +419,10 @@ def install() -> None:
     if not hasattr(OSConnection, "count"):
         OSConnection.count = _os_count
         _logger.info("OSConnection.count custom extra installed")
+
+    if not hasattr(OSConnection, "update_docs"):
+        OSConnection.update_docs = _os_update_docs
+        _logger.info("OSConnection.update_docs custom extra installed")
 
     # Always override insert to use the GraphRAG-optimized bulk settings.
     OSConnection.insert = _os_insert

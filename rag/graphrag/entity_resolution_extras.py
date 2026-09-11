@@ -123,6 +123,8 @@ class IncrementalEntityResolution(EntityResolution):
       - ``candidate_resolution`` can be injected by the caller instead of being
         computed from the full graph.
       - Batch / concurrency sizes are read from ``GraphRAGConfig``.
+      - PageRank is not recomputed on the local recall graph; global pagerank
+        is owned by ``recalc_global_pagerank`` (runs after merge / resolution).
     """
 
     def __init__(self, llm_invoker, excluded_types: set[str] | None = None):
@@ -254,11 +256,11 @@ class IncrementalEntityResolution(EntityResolution):
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-        # Update pagerank
-        pr = nx.pagerank(graph)
-        for node_name, pagerank in pr.items():
-            graph.nodes[node_name]["pagerank"] = pagerank
-
+        # PageRank is deliberately NOT recomputed here: ``graph`` is a local
+        # recall subgraph, so ranks computed on it would be orders of
+        # magnitude larger than the global ones and would overwrite them in
+        # the index. Global PageRank is owned by ``recalc_global_pagerank``,
+        # which runs after merge and again after incremental resolution.
         return EntityResolutionResult(
             graph=graph,
             change=change,

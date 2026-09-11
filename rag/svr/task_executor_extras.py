@@ -430,6 +430,21 @@ async def kg_postprocess_consumer():
                         set_phase_marker(kb_id, PHASE_RESOLUTION)
                         logging.info("[KG-PP] kb=%s resolution done", kb_id)
 
+                        # Incremental resolution merged/removed nodes, so the
+                        # global topology changed; recompute pagerank once more.
+                        # Non-fatal on failure: ranks stay stale until the next
+                        # merge-triggered recalc, and community must still run.
+                        if (
+                            GraphRAGConfig.RECALC_GLOBAL_PAGERANK_AFTER_MERGE
+                            and GraphRAGConfig.USE_INCREMENTAL_RESOLUTION
+                        ):
+                            try:
+                                from rag.graphrag.general.index_extras import recalc_global_pagerank
+                                await recalc_global_pagerank(tenant_id, kb_id, pp_callback, task_id=task_id)
+                                logging.info("[KG-PP] kb=%s pagerank recalc done", kb_id)
+                            except Exception:
+                                logging.exception("[KG-PP] kb=%s pagerank recalc failed (non-fatal)", kb_id)
+
                     if community_pending:
                         from rag.graphrag.general.index import extract_community
                         await extract_community(

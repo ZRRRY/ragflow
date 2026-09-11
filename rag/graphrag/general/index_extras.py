@@ -133,6 +133,16 @@ def _min_timeout_config(value: int, default: int, minimum: int = 60) -> int:
     return max(value, minimum)
 
 
+def _final_graph_is_delta(final_graph) -> bool:
+    """Whether the post-merge in-memory graph is a per-doc delta.
+
+    ``merge_subgraph_incremental`` returns per-doc delta graphs, so in
+    incremental-merge mode a non-None ``final_graph`` must never feed the
+    official resolution/community phases.
+    """
+    return bool(GraphRAGConfig.USE_INCREMENTAL_MERGE and final_graph is not None)
+
+
 # Phase 4.3: record lock wait/held durations in a Redis hash so external
 # dashboards / exporters can scrape them.
 _LOCK_METRICS_KEY_TMPL = "graphrag:lock_metrics:{}"
@@ -490,8 +500,10 @@ async def run_graphrag_for_kb(
             "seconds": now - start,
         }
 
+    # Lock TTL covers merge + pagerank recalc inside the critical section;
+    # 3600s matches the KG postprocess consumer's lock.
     kb_lock = RedisDistributedLock(
-        f"graphrag_task_{kb_id}", lock_value=f"batch_merge:{task_id}", timeout=1200
+        f"graphrag_task_{kb_id}", lock_value=f"batch_merge:{task_id}", timeout=3600
     )
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before acquiring merge lock.", callback)
     lock_acquire_t0 = asyncio.get_running_loop().time()
@@ -610,8 +622,15 @@ async def run_graphrag_for_kb(
             and GraphRAGConfig.USE_INCREMENTAL_MERGE
             and ok_docs
         ):
-            await recalc_global_pagerank(
-                tenant_id, kb_id, embedding_model, callback, task_id=task_id
+            await _run_with_retry(
+                "global pagerank recalc",
+                lambda: recalc_global_pagerank(tenant_id, kb_id, callback, task_id=task_id),
+                attempts=merge_retry_attempts,
+                timeout_seconds=merge_timeout_seconds,
+                backoff_seconds=retry_backoff_seconds,
+                backoff_max_seconds=retry_backoff_max_seconds,
+                callback=callback,
+                task_id=task_id,
             )
     finally:
         try:
@@ -691,8 +710,12 @@ async def run_graphrag_for_kb(
     try:
         _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before resolution/community extraction.", callback)
 
+        # In incremental-merge mode ``final_graph`` is the last document's delta
+        # graph (merge_subgraph_incremental returns per-doc deltas), never the
+        # global graph. The official resolution / community implementations must
+        # not consume it: reload the full graph from the doc store instead.
         need_preload_full_graph = (
-            final_graph is None
+            (final_graph is None or _final_graph_is_delta(final_graph))
             and (
                 (resolution_pending and not GraphRAGConfig.USE_INCREMENTAL_RESOLUTION)
                 or (community_pending and not GraphRAGConfig.USE_ASYNC_COMMUNITY)
@@ -768,6 +791,25 @@ async def run_graphrag_for_kb(
                 task_id=task_id,
             )
             set_phase_marker(kb_id, PHASE_RESOLUTION)
+
+            # Phase 2.5b: incremental resolution merged/removed nodes, so the
+            # global topology changed again; recompute PageRank once more to
+            # keep ranks consistent. Official resolution already recomputes
+            # pagerank on the full graph and does not need this.
+            if (
+                GraphRAGConfig.RECALC_GLOBAL_PAGERANK_AFTER_MERGE
+                and GraphRAGConfig.USE_INCREMENTAL_RESOLUTION
+            ):
+                await _run_with_retry(
+                    "global pagerank recalc (post-resolution)",
+                    lambda: recalc_global_pagerank(tenant_id, kb_id, callback, task_id=task_id),
+                    attempts=merge_retry_attempts,
+                    timeout_seconds=merge_timeout_seconds,
+                    backoff_seconds=retry_backoff_seconds,
+                    backoff_max_seconds=retry_backoff_max_seconds,
+                    callback=callback,
+                    task_id=task_id,
+                )
         elif with_resolution:
             callback(msg=f"[GraphRAG] dataset:{kb_id} resolution already completed previously, skipping.")
 
@@ -1146,7 +1188,6 @@ async def generate_subgraph(
 async def recalc_global_pagerank(
     tenant_id: str,
     kb_id: str,
-    embedding_model,
     callback,
     task_id: str = "",
 ):
@@ -1156,6 +1197,13 @@ async def recalc_global_pagerank(
 
     This compensates for ``merge_subgraph_incremental`` which intentionally
     skips global PageRank to avoid loading the full graph for every document.
+    It is also invoked after incremental entity resolution, whose node merges
+    change the topology; ``IncrementalEntityResolution`` deliberately does not
+    update pagerank itself because values computed on its local recall graph
+    would be on a different scale than the global ones written here.
+
+    The write-back uses partial updates (only ``rank_flt`` and
+    ``content_with_weight``) so embedding vectors never leave the doc store.
     """
     _has_cancel_and_exit(
         task_id, f"Task {task_id} cancelled before global pagerank recalc.", callback
@@ -1163,44 +1211,45 @@ async def recalc_global_pagerank(
     start = asyncio.get_running_loop().time()
     callback(msg=f"[GraphRAG] dataset:{kb_id} start global pagerank recalc.")
 
-    # 1. Load the global graph with structural nodes (book / chapter) filtered
-    # out at load time. Both the persisted snapshot and PageRank use this
-    # filtered graph so that structural nodes never participate in the global
-    # graph or its ranking.
+    # 1. Capability check: the entity scan needs scroll-based retrieval and the
+    # write-back uses partial updates. Both are provided by the OpenSearch /
+    # Elasticsearch conn extras; other backends skip the recalc entirely.
     has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
-    callback(
-        msg=f"[GraphRAG] dataset:{kb_id} pagerank recalc: docStoreConn has search_with_scroll={has_scroll}."
-    )
-
     if not has_scroll and type(settings.docStoreConn).__name__ == "ESConnection":
         try:
             from common.doc_store.es_conn_extras import install as install_es_conn_extras
             install_es_conn_extras()
             has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
             callback(
-                msg=f"[GraphRAG] dataset:{kb_id} pagerank recalc: re-installed es extras, "
+                msg=f"[GraphRAG] dataset:{kb_id} pagerank recalc: installed es extras, "
                     f"search_with_scroll={has_scroll}."
             )
         except Exception as e:
             logging.exception("Failed to install es_conn_extras: %s", e)
             callback(msg=f"[GraphRAG] dataset:{kb_id} failed to install es extras: {e!r}")
 
-    if has_scroll:
-        try:
-            graph = await get_graph_from_index(
-                tenant_id,
-                kb_id,
-                exclude_entity_types=GraphRAGConfig.NO_EMBED_ENTITY_TYPES,
-            )
-            callback(
-                msg=f"[GraphRAG] dataset:{kb_id} get_graph_from_index returned "
-                    f"{'None' if graph is None else f'graph(nodes={len(graph.nodes)}, edges={len(graph.edges)})'}"
-            )
-        except Exception as e:
-            logging.exception("get_graph_from_index failed for pagerank recalc: %s", e)
-            callback(msg=f"[GraphRAG] dataset:{kb_id} get_graph_from_index failed: {e!r}")
-            graph = None
-    else:
+    update_docs = getattr(settings.docStoreConn, "update_docs", None)
+    if not has_scroll or update_docs is None:
+        callback(
+            msg=f"[GraphRAG] dataset:{kb_id} backend lacks search_with_scroll/update_docs; "
+                f"skip pagerank recalc."
+        )
+        return
+
+    # 2. Load the global graph (scroll-based assembly from entity/relation
+    # chunks; monolithic JSON fallback). Structural (book/chapter) nodes are
+    # filtered after loading with the same ``should_skip_embedding`` predicate
+    # used at write-back time, so the two can never disagree (alias names like
+    # "Book"/"Chapter" are covered as well as the exact 书籍/章节 types).
+    try:
+        graph = await get_graph_from_index(tenant_id, kb_id)
+        callback(
+            msg=f"[GraphRAG] dataset:{kb_id} get_graph_from_index returned "
+                f"{'None' if graph is None else f'graph(nodes={len(graph.nodes)}, edges={len(graph.edges)})'}"
+        )
+    except Exception as e:
+        logging.exception("get_graph_from_index failed for pagerank recalc: %s", e)
+        callback(msg=f"[GraphRAG] dataset:{kb_id} get_graph_from_index failed: {e!r}")
         graph = None
 
     if graph is None:
@@ -1215,21 +1264,36 @@ async def recalc_global_pagerank(
             callback(msg=f"[GraphRAG] dataset:{kb_id} get_graph fallback failed: {e!r}")
             graph = None
 
-        if graph is not None:
-            excluded_nodes = {
-                node
-                for node, attrs in graph.nodes(data=True)
-                if GraphRAGConfig.should_skip_embedding(attrs.get("entity_type"))
-            }
-            if excluded_nodes:
-                graph.remove_nodes_from(excluded_nodes)
-                callback(
-                    msg=f"[GraphRAG] dataset:{kb_id} excluded {len(excluded_nodes)} "
-                        f"structural nodes after loading."
-                )
+    if graph is not None:
+        excluded_nodes = {
+            node
+            for node, attrs in graph.nodes(data=True)
+            if GraphRAGConfig.should_skip_embedding(attrs.get("entity_type"))
+        }
+        if excluded_nodes:
+            graph.remove_nodes_from(excluded_nodes)
+            callback(
+                msg=f"[GraphRAG] dataset:{kb_id} excluded {len(excluded_nodes)} "
+                    f"structural nodes after loading."
+            )
 
     if graph is None or len(graph.nodes) == 0:
         callback(msg=f"[GraphRAG] dataset:{kb_id} no global graph; skip pagerank recalc.")
+        return
+
+    # Truncation guard: get_graph_from_index silently caps at
+    # SEARCH_WITH_SCROLL_HITS_CAP; ranks computed on a truncated graph must
+    # never be written back over the full index.
+    hits_cap = GraphRAGConfig.SEARCH_WITH_SCROLL_HITS_CAP
+    if len(graph.nodes) >= hits_cap:
+        callback(
+            msg=f"[GraphRAG] dataset:{kb_id} graph load reached the {hits_cap} node cap; "
+                f"abort pagerank recalc (raise GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP to proceed)."
+        )
+        logging.warning(
+            "pagerank recalc aborted for kb=%s: %d nodes reached hits_cap=%d",
+            kb_id, len(graph.nodes), hits_cap,
+        )
         return
 
     callback(
@@ -1237,24 +1301,17 @@ async def recalc_global_pagerank(
             f"nodes={len(graph.nodes)} edges={len(graph.edges)}."
     )
 
-    # 2. Compute global PageRank on the filtered graph.
+    # 3. Compute global PageRank on the filtered graph.
     pr = nx.pagerank(graph)
     callback(
         msg=f"[GraphRAG] dataset:{kb_id} pagerank computed for {len(pr)} nodes."
     )
 
-    # 3. Apply the recomputed pagerank to graph nodes.
-    for node_name, pagerank in pr.items():
-        graph.nodes[node_name]["pagerank"] = pagerank
-
-    # 4. Fetch all entity chunks while preserving full _source (including vectors).
-    if not hasattr(settings.docStoreConn, "search_with_scroll"):
-        callback(
-            msg=f"[GraphRAG] dataset:{kb_id} backend lacks search_with_scroll; skip pagerank recalc."
-        )
-        return
-
+    # 4. Scan entity chunks with a narrow _source projection so embedding
+    # vectors never leave the doc store; only the fields needed for the
+    # rewrite are transferred.
     query_body = {
+        "_source": ["entity_kwd", "content_with_weight"],
         "query": {
             "bool": {
                 "filter": [
@@ -1262,7 +1319,7 @@ async def recalc_global_pagerank(
                     {"terms": {"knowledge_graph_kwd": ["entity"]}},
                 ]
             }
-        }
+        },
     }
     try:
         res = await thread_pool_exec(
@@ -1270,6 +1327,7 @@ async def recalc_global_pagerank(
             search.index_name(tenant_id),
             query_body,
             [],
+            hits_cap=hits_cap,
         )
     except Exception as e:
         logging.exception("Failed to load entity chunks for pagerank recalc: %s", e)
@@ -1281,10 +1339,40 @@ async def recalc_global_pagerank(
         callback(msg=f"[GraphRAG] dataset:{kb_id} no entity chunks found; skip pagerank recalc.")
         return
 
-    # 5. Build updated chunks preserving every field from _source.
-    # Structural nodes (book/chapter) keep their original pagerank untouched.
-    updated_chunks = []
+    if len(hits) >= hits_cap:
+        callback(
+            msg=f"[GraphRAG] dataset:{kb_id} entity scan reached the {hits_cap} hits cap; "
+                f"abort pagerank recalc instead of writing partial ranks."
+        )
+        logging.warning(
+            "pagerank recalc aborted for kb=%s: entity scan collected %d hits (cap=%d)",
+            kb_id, len(hits), hits_cap,
+        )
+        return
+
+    # 5. Partial-update write-back in bounded windows. Structural nodes are
+    # pinned to 0.0 (they never participate in ranking; without this the
+    # merge-time 0.001 placeholder would outrank real entities on large
+    # graphs). Entities missing from the pagerank map (e.g. parse failures at
+    # load time) are skipped, never zeroed.
+    _UPDATE_WINDOW = 1000
+    updates: list[tuple[str, dict]] = []
+    updated = 0
     skipped = 0
+
+    async def _flush_updates():
+        nonlocal updated
+        if not updates:
+            return
+        errors = await thread_pool_exec(update_docs, search.index_name(tenant_id), list(updates))
+        if errors:
+            raise Exception(
+                f"update_docs failed for {len(errors)}/{len(updates)} entity chunks, "
+                f"first errors: {errors[:3]}"
+            )
+        updated += len(updates)
+        updates.clear()
+
     for hit in hits:
         _has_cancel_and_exit(
             task_id, f"Task {task_id} cancelled during pagerank recalc.", callback
@@ -1309,31 +1397,29 @@ async def recalc_global_pagerank(
             continue
 
         if GraphRAGConfig.should_skip_embedding(meta.get("entity_type")):
-            # Structural nodes (book/chapter) are excluded from the PageRank
-            # graph; leave their stored pagerank as-is.
+            new_pr = 0.0
+        elif entity_name in pr:
+            new_pr = float(pr[entity_name])
+        else:
             skipped += 1
             continue
 
-        new_pr = float(pr.get(entity_name, 0.0) or 0.0)
         meta["pagerank"] = new_pr
+        updates.append((cid, {
+            "rank_flt": new_pr,
+            "content_with_weight": json.dumps(meta, ensure_ascii=False),
+        }))
+        if len(updates) >= _UPDATE_WINDOW:
+            await _flush_updates()
 
-        new_chunk = dict(source)
-        new_chunk["id"] = cid
-        new_chunk["content_with_weight"] = json.dumps(meta, ensure_ascii=False)
-        new_chunk["rank_flt"] = new_pr
-        updated_chunks.append(new_chunk)
+    await _flush_updates()
 
-    if not updated_chunks:
+    if not updated:
         callback(msg=f"[GraphRAG] dataset:{kb_id} no valid entity chunks to update.")
         return
 
-    # 6. Bulk overwrite entity chunks.
-    await insert_chunks_bounded(
-        updated_chunks, tenant_id, kb_id,
-        callback=callback, label="Update entity pagerank"
-    )
-
-    # 7. Best-effort refresh so downstream queries see new ranks immediately.
+    # 6. Best-effort refresh so downstream queries see new ranks immediately
+    # (update_docs writes with refresh="false").
     refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
     if refresh_fn is not None:
         try:
@@ -1344,7 +1430,7 @@ async def recalc_global_pagerank(
     now = asyncio.get_running_loop().time()
     callback(
         msg=f"[GraphRAG] dataset:{kb_id} global pagerank recalc done: "
-            f"updated {len(updated_chunks)} entities, skipped {skipped}, "
+            f"updated {updated} entities, skipped {skipped}, "
             f"in {now - start:.2f}s."
     )
 

@@ -25,6 +25,8 @@ Methods installed
   Count documents matching ``condition`` within the given knowledge bases.
 * ``ESConnection.search_with_scroll(index_names, query_body, fields, ...) -> dict``
   Scroll-based retrieval for large result sets, mirroring the OpenSearch extra.
+* ``ESConnection.update_docs(index_name, updates) -> list[str]``
+  Bulk partial update by ``_id`` (only the supplied fields are replaced).
 """
 
 from __future__ import annotations
@@ -200,6 +202,51 @@ def _es_count(self, condition: dict, index_name: str, knowledgebase_ids: list[st
     raise Exception("ESConnection.count timeout.")
 
 
+def _es_update_docs(self, index_name: str, updates: list[tuple[str, dict]]) -> list[str]:
+    """Bulk partial update of documents by ``_id``.
+
+    ``updates`` is a list of ``(doc_id, fields)`` pairs; each entry issues a
+    bulk ``update`` action with ``{"doc": fields}`` so untouched fields (e.g.
+    embedding vectors) are preserved in place and never leave the doc store.
+
+    Shares the ``_os_update_docs`` contract: ``refresh="false"`` for
+    throughput, so the caller MUST issue an explicit refresh once the logical
+    operation completes. Returns a list of per-item error strings (empty on
+    full success).
+    """
+    from rag.utils.es_conn import ATTEMPT_TIME
+
+    if not updates:
+        return []
+
+    operations = []
+    for doc_id, fields in updates:
+        operations.append({"update": {"_index": index_name, "_id": doc_id}})
+        operations.append({"doc": fields})
+
+    res = []
+    for _ in range(ATTEMPT_TIME):
+        try:
+            res = []
+            r = self.es.bulk(index=index_name, operations=operations, refresh="false", timeout="60s")
+            if not r["errors"]:
+                return res
+            for item in r["items"]:
+                for action in ["create", "delete", "index", "update"]:
+                    if action in item and "error" in item[action]:
+                        res.append(str(item[action]["_id"]) + ":" + str(item[action]["error"]))
+            return res
+        except ConnectionTimeout:
+            self.logger.exception("ESConnection.update_docs request timeout")
+            self._connect()
+            continue
+        except Exception as e:
+            self.logger.exception(f"ESConnection.update_docs got exception: {e}")
+            raise e
+    self.logger.error(f"ESConnection.update_docs timeout for {ATTEMPT_TIME} times!")
+    raise Exception("ESConnection.update_docs timeout.")
+
+
 def _should_auto_refresh_after_insert(documents: list[dict], index_name: str) -> bool:
     """Best-effort heuristic for add_chunk-like single-chunk inserts.
 
@@ -263,6 +310,10 @@ def install() -> None:
     if not hasattr(cls, "count"):
         cls.count = _es_count
         _logger.info("ESConnection.count custom extra installed")
+
+    if not hasattr(cls, "update_docs"):
+        cls.update_docs = _es_update_docs
+        _logger.info("ESConnection.update_docs custom extra installed")
 
     if not hasattr(cls, "_original_insert"):
         cls._original_insert = cls.insert
