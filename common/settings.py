@@ -399,20 +399,6 @@ def init_settings():
         logging.exception(f"es_conn_extras install failed, continuing without extras: {e}")
     # === CUSTOM END [es-conn-extras] ===
 
-    # === CUSTOM BEGIN [os-conn-extras] ===
-    # 原因：注入自定义 OSConnection 方法（knn_search_entities、search_with_scroll、count
-    # 及 GraphRAG 优化的 insert），供 GraphRAG 增量/优化逻辑使用。
-    # 日期：2026-06-20
-    # 关联：common/doc_store/opensearch_conn_extras.py
-    try:
-        from common.doc_store.opensearch_conn_extras import install as install_opensearch_conn_extras
-        install_opensearch_conn_extras()
-    except ImportError as e:
-        logging.warning(f"opensearch_conn_extras hook unavailable, skipping install: {e}")
-    except Exception as e:
-        logging.exception(f"opensearch_conn_extras install failed, continuing without extras: {e}")
-    # === CUSTOM END [os-conn-extras] ===
-
     retriever = search.Dealer(docStoreConn)
     from rag.graphrag import search as kg_search
 

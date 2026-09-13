@@ -20,6 +20,7 @@ that the custom implementations can replace the official functions in-place.
 When every feature switch is off the original implementations are preserved.
 """
 
+import inspect
 import logging
 import os
 
@@ -39,8 +40,14 @@ def apply_patch(module):
 
     Must be called once after the module is fully imported. The original
     callables are kept so that wrappers can fall back to official behaviour
-    when the corresponding feature flags are disabled.
+    when the corresponding feature flags are disabled. Idempotent: a second
+    call would otherwise re-store the already-wrapped functions as
+    "originals", causing infinite wrapper recursion.
     """
+    if getattr(module, "_graphrag_index_patch_applied", False):
+        logger.debug("GraphRAG index patch already applied; skipping.")
+        return
+
     names = [
         "run_graphrag_for_kb",
         "generate_subgraph",
@@ -63,6 +70,7 @@ def apply_patch(module):
     # time (index_extras has its own env-driven default), so overriding it here
     # keeps the official file untouched.
     module.DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = int(os.environ.get("GRAPHRAG_MERGE_TIMEOUT_SECONDS", "1800"))
+    module._graphrag_index_patch_applied = True
     logger.debug("GraphRAG index patch applied; flags=%s", _feature_flags())
 
 
@@ -151,17 +159,29 @@ def _wrap_extract_community(*args, **kwargs):
     # The official entry does not perform an early task-cancellation check.
     # Preserve the custom addition so that long community runs can be aborted
     # promptly without waiting for the extractor's first checkpoint.
+    #
+    # Resolve task_id/callback by parameter name via the official signature
+    # instead of hard-coded positional indices — silent argument
+    # misidentification on upstream signature drift is worse than a loud
+    # failure. Falls back to kwargs-only when binding fails.
     task_id = kwargs.get("task_id", "")
-    if args and len(args) > 7:
-        task_id = args[7]
+    callback = kwargs.get("callback")
+    original = _ORIGINALS.get("extract_community")
+    if original is not None:
+        try:
+            bound = inspect.signature(original).bind(*args, **kwargs)
+            task_id = bound.arguments.get("task_id", task_id) or ""
+            callback = bound.arguments.get("callback", callback)
+        except TypeError:
+            logger.warning(
+                "extract_community call does not match the official signature; "
+                "cancellation check may be skipped"
+            )
     if task_id:
         from api.db.services.task_service import has_canceled
         from common.exceptions import TaskCanceledException
 
         if has_canceled(task_id):
-            callback = kwargs.get("callback")
-            if args and len(args) > 6:
-                callback = args[6]
             if callback:
                 callback(msg=f"Task {task_id} cancelled before community extraction.")
             raise TaskCanceledException(f"Task {task_id} was cancelled")

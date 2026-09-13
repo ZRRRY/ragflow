@@ -135,7 +135,9 @@ def _es_search_with_scroll(
                 max_pages, len(hits),
             )
 
-        return {"hits": {"hits": hits}}
+        # ``_truncated`` lets callers distinguish "complete result" from
+        # "cut off by a cap" — critical when the data feeds ranking.
+        return {"hits": {"hits": hits}, "_truncated": hit_cap_reached or pages_consumed >= max_pages}
     except Exception as e:
         _logger.exception("ESConnection.search_with_scroll query: %s", json.dumps(query_body))
         raise e
@@ -286,10 +288,19 @@ def _get_real_es_connection_class():
         return ESConnection
 
     if inspect.isfunction(ESConnection) and ESConnection.__closure__:
+        # Prefer the class defined by rag.utils.es_conn itself (robust against
+        # upstream renames); fall back to the historical name match.
+        named_match = None
         for cell in ESConnection.__closure__:
             val = cell.cell_contents
-            if inspect.isclass(val) and val.__name__ == "ESConnection":
+            if not inspect.isclass(val):
+                continue
+            if getattr(val, "__module__", None) == "rag.utils.es_conn":
                 return val
+            if val.__name__ == "ESConnection":
+                named_match = val
+        if named_match is not None:
+            return named_match
 
     raise RuntimeError(
         "Could not locate the real ESConnection class inside the singleton wrapper."

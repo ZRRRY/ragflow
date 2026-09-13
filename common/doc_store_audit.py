@@ -62,7 +62,6 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-import os
 from typing import Any
 
 _logger = logging.getLogger(__name__)
@@ -107,12 +106,11 @@ def _is_audited(condition: Any) -> tuple[bool, list[str], list[str]]:
     return (len(matched) > 0), key_fields, matched
 
 
-def _caller_location(skip_frames: int = 3) -> str:
+def _caller_location(skip_frames: int = 2) -> str:
     """Return a short ``file:line`` for the immediate caller of delete().
 
     ``skip_frames`` accounts for: 0=this fn, 1=wrapper, 2=caller of
-    wrapper. We add 1 more to land on the *direct* caller's line, not on
-    a deep internal frame.
+    wrapper — i.e. the direct call site of ``docStoreConn.delete``.
     """
     try:
         frame = inspect.currentframe()
@@ -152,7 +150,7 @@ def make_audited_delete(original_delete):
                     key_fields,
                     indexName,
                     knowledgebaseId,
-                    _caller_location(skip_frames=3),
+                    _caller_location(skip_frames=2),
                 )
         except Exception:
             # Audit must never block a real delete.

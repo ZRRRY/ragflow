@@ -124,7 +124,7 @@ def _truncate_graph_for_visualization(
             reverse=True,
         )[:max_nodes]
 
-    node_id_set = {o["id"] for o in selected_nodes}
+    node_id_set = {o["id"] for o in selected_nodes if o.get("id") is not None}
     node_degree = {nid: 0 for nid in node_id_set}
 
     filtered_edges = []
@@ -132,7 +132,9 @@ def _truncate_graph_for_visualization(
         candidate_edges = [
             o
             for o in graph_data["edges"]
-            if o["source"] != o["target"]
+            if o.get("source") is not None
+            and o.get("target") is not None
+            and o["source"] != o["target"]
             and o["source"] in node_id_set
             and o["target"] in node_id_set
         ]
@@ -172,7 +174,15 @@ def _truncate_graph_for_visualization(
         graph_data["nodes"] = selected_nodes
     else:
         connected_node_ids = {nid for nid, deg in node_degree.items() if deg > 0}
-        graph_data["nodes"] = [n for n in selected_nodes if n["id"] in connected_node_ids]
+        # Protected types (books / chapters) must survive the isolated-node
+        # filter — dropping them would silently remove chapter structure from
+        # the visualization even though they were explicitly selected above.
+        graph_data["nodes"] = [
+            n
+            for n in selected_nodes
+            if n.get("id") in connected_node_ids
+            or (protected_types and n.get("entity_type") in protected_types)
+        ]
     graph_data["edges"] = filtered_edges
     return graph_data
 

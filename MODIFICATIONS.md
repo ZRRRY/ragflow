@@ -7,6 +7,8 @@
 > 2. 第二~四节：修改清单、环境变量开关等参考资料。
 >
 > 最近全面修订：2026-07-16（按 extras/patches 架构现状重写，替代 2026-06-18 的旧版移植记录）。
+>
+> 2026-09-12：第二轮全面审查并完成修复（详见第六节）；OpenSearch 后端弃用，`common/doc_store/opensearch_conn_extras.py`、KNN 消解路径及 4 个 KNN 环境变量整体删除。
 
 ---
 
@@ -24,18 +26,19 @@ git diff <旧tag>..<新tag> -- <官方文件>
 
 | # | 定制位置 | 复制/依赖的官方逻辑 | 需 diff 的官方文件 | 风险等级 | 最近核对 |
 |---|----------|--------------------|-------------------|---------|---------|
-| 1 | `rag/graphrag/general/index_extras.py` `run_graphrag_for_kb` | 官方同名编排函数（`index.py:257`）近全文复制加增量分支，上游编排层 bugfix 不传播 | `rag/graphrag/general/index.py` | **高** | 2026-07-16 |
-| 2 | `index_extras.py` `resolve_entities_incremental` + `index_patch.py` wrapper | 官方 `resolve_entities`（`index.py:758`）调用约定（8 位置参数 + `task_id=`/`entity_types=`）| 同上 | **高**（曾因签名漂移致 TypeError，2026-07-16 已修复并加回归测试） | 2026-07-16 |
-| 3 | `index_patch.py` `_wrap_extract_community` | 按位置取 `args[6]`/`args[7]` 作为 callback/task_id | 同上 `extract_community`（`index.py:804`） | 中（上游改签名静默失效） | 2026-07-16 |
-| 4 | `rag/svr/task_executor_extras.py` | `sys.modules` 模块查找（生产为 `__main__`，2026-07-16 已修复回退逻辑并加安装日志）；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值（已加兜底默认值） | `rag/svr/task_executor.py` | **高** | 2026-07-16 |
-| 5 | `api/apps/services/dataset_api_service_extras.py` `get_knowledge_graph` | 整函数替换官方实现；截断策略已偏离（边 128→512、丢孤立节点、无向去重） | `api/apps/services/dataset_api_service.py` | 中（上游改进被屏蔽） | 2026-07-16 |
-| 6 | `rag/graphrag/document_delete_extras.py` | 官方文档删除 GraphRAG 清理流程副本（增量路径条件化） | `api/db/services/document_service.py` | 中 | 2026-07-16 |
-| 7 | `common/doc_store/opensearch_conn_extras.py` `insert` 全局替换 | 官方 insert 重试/序列化逻辑副本（含官方缺陷：重试耗尽返回空错误列表，bulk 失败被静默吞掉） | `rag/utils/opensearch_conn.py` | 中 | 2026-07-16 |
-| 8 | `common/doc_store/es_conn_extras.py` | 遍历 `@singleton` 闭包 cell 定位 ESConnection 类；注入 `count`/`search_with_scroll`/insert 包装 | `rag/utils/es_conn.py`、`common/decorator.py`（`singleton`） | 低（有 RuntimeError 兜底） | 2026-07-16 |
-| 9 | `rag/llm/siliconflow_timeout_patch.py` | 替换 `SILICONFLOWEmbed._call`，假定其内部超时处理结构不变 | `rag/llm/embedding_model.py`（`SILICONFLOWEmbed`） | 低（有子类守卫） | 2026-07-16 |
-| 10 | `rag/utils/redis_conn_patch.py` | 替换 `RedisDistributedLock.spin_acquire`（依赖官方 `delete_if_equal` 锁协议）；新增 `RedisDB.ttl` | `rag/utils/redis_conn.py` | 中（无 hasattr 守卫，上游同名改动被静默覆盖） | 2026-07-16 |
-| 11 | `rag/graphrag/entity_resolution.py` 尾部 CUSTOM 块 | import 时类重绑定 `EntityResolution`→`IncrementalEntityResolution`；依赖「CUSTOM 块位于文件末尾」的执行顺序，且与 `entity_resolution_extras.py` 存在循环 import | `rag/graphrag/entity_resolution.py` | 中（上游在文件尾部新增代码即打破） | 2026-07-16 |
-| 12 | `rag/graphrag/utils.py` `set_graph` 无条件委托 | 官方原实现改名 `_set_graph_impl`，extras 包装后按 flag 路由 | `rag/graphrag/utils.py` | 低 | 2026-07-16 |
+| 1 | `rag/graphrag/general/index_extras.py` `run_graphrag_for_kb` | 官方同名编排函数（`index.py:257`）近全文复制加增量分支，上游编排层 bugfix 不传播 | `rag/graphrag/general/index.py` | **高** | 2026-09-12 |
+| 2 | `index_extras.py` `resolve_entities_incremental` + `index_patch.py` wrapper | 官方 `resolve_entities`（`index.py:758`）调用约定（8 位置参数 + `task_id=`/`entity_types=`）| 同上 | **高**（曾因签名漂移致 TypeError，2026-07-16 已修复并加回归测试） | 2026-09-12 |
+| 3 | `index_patch.py` `_wrap_extract_community` | 官方 `extract_community`（`index.py:804`）形参表 | 同上 | 低（2026-09-12 已改为 `inspect.signature` 按名绑定，漂移时打 WARNING 而非静默错位） | 2026-09-12 |
+| 4 | `rag/svr/task_executor_extras.py` | `sys.modules` 模块查找（生产为 `__main__`）；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值（有兜底默认值） | `rag/svr/task_executor.py` | **高** | 2026-09-12 |
+| 5 | `api/apps/services/dataset_api_service_extras.py` `get_knowledge_graph` | 整函数替换官方实现；截断策略已偏离（边 128→512、丢孤立节点、无向去重） | `api/apps/services/dataset_api_service.py` | 中（上游改进被屏蔽） | 2026-09-12 |
+| 6 | `rag/graphrag/document_delete_extras.py` | 官方文档删除 GraphRAG 清理流程副本（增量路径条件化；2026-09-12 起 subgraph 的 `must_not` 兜底与官方对齐，显式 ID 列举改用 scroll 分页） | `api/db/services/document_service.py` | 中 | 2026-09-12 |
+| 7 | `common/doc_store/es_conn_extras.py` | 遍历 `@singleton` 闭包 cell 定位 ESConnection 类（2026-09-12 起按 `__module__` 匹配，不再硬编码类名）；注入 `count`/`search_with_scroll`/insert 包装 | `rag/utils/es_conn.py`、`common/decorator.py`（`singleton`） | 低（有 RuntimeError 兜底） | 2026-09-12 |
+| 8 | `rag/llm/siliconflow_timeout_patch.py` | 替换 `SILICONFLOWEmbed._call`，假定其内部超时处理结构不变 | `rag/llm/embedding_model.py`（`SILICONFLOWEmbed`） | 低（有子类守卫） | 2026-09-12 |
+| 9 | `rag/utils/redis_conn_patch.py` | 替换 `RedisDistributedLock.spin_acquire`（依赖官方 `delete_if_equal` 锁协议）；新增 `RedisDB.ttl` | `rag/utils/redis_conn.py` | 中（无 hasattr 守卫，上游同名改动被静默覆盖） | 2026-09-12 |
+| 10 | `rag/graphrag/entity_resolution.py` 尾部 CUSTOM 块 | import 时类重绑定 `EntityResolution`→`IncrementalEntityResolution`；依赖「CUSTOM 块位于文件末尾」的执行顺序，且与 `entity_resolution_extras.py` 存在循环 import | `rag/graphrag/entity_resolution.py` | 中（上游在文件尾部新增代码即打破） | 2026-09-12 |
+| 11 | `rag/graphrag/utils.py` `set_graph` 无条件委托 | 官方原实现改名 `_set_graph_impl`，extras 包装后按 flag 路由 | `rag/graphrag/utils.py` | 低 | 2026-09-12 |
+
+> 2026-09-12：OpenSearch 后端弃用，原第 7 项 `common/doc_store/opensearch_conn_extras.py` 已整体删除（该文件 monkey-patch 从未真正生效——patch 装在了 `@singleton` 工厂闭包而非真类上）；上游官方文件 `rag/utils/opensearch_conn.py` 保持原样不动。
 
 ---
 
@@ -49,7 +52,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | `api/apps/restful_apis/dataset_api.py` | 新增 `delete_knowledge_graph` 转发函数（修复 main 上 `backward_compat.py` 废弃端点的坏引用） | `api_apps_restful_apis_dataset_api.py.patch` |
 | `api/apps/services/dataset_api_service.py` | `get_knowledge_graph` 委托 extras；删图关键词增加 `merge_state` | `api_apps_services_dataset_api_service.py.patch` |
 | `api/db/services/document_service.py` | 删文档的 GraphRAG 清理逻辑抽至 `document_delete_extras.py`（官方路径逐字保留） | `api_db_services_document_service.py.patch` |
-| `common/settings.py` | `init_settings()` 中安装 ES/OS extras 与删除审计三个 hook（带异常兜底） | `common_settings.py.patch` |
+| `common/settings.py` | `init_settings()` 中安装 ES extras 与删除审计两个 hook（带异常兜底；OS extras hook 已于 2026-09-12 随 OS 后端弃用移除） | `common_settings.py.patch` |
 | `rag/graphrag/entity_resolution.py` | 尾部 CUSTOM 块：flag 开启时类重绑定 + 额外导出 | `rag_graphrag_entity_resolution.py.patch` |
 | `rag/graphrag/general/index.py` | 尾部调用 `index_patch.apply_patch()` | `rag_graphrag_general_index.py.patch` |
 | `rag/graphrag/utils.py` | `does_graph_contains`/`get_graph` flag 路由；`set_graph` 无条件委托 extras；书籍/章节跳过 embedding | `rag_graphrag_utils.py.patch` |
@@ -75,12 +78,12 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | GraphRAG 核心 | `rag/graphrag/config.py` | 全部环境变量开关集中配置（import 时顺带安装 redis/siliconflow 两个 patch） |
 | | `rag/graphrag/general/index_extras.py` | 增量编排、ChapterGraph、增量 merge/消解、异步 community、全局 PageRank 重算 |
 | | `rag/graphrag/general/index_patch.py` | monkey-patch 调度器：保存原函数、按 flag 路由 |
-| | `rag/graphrag/utils_extras.py` | 增量存储层：set_graph_delta、merge_state、在线组图、可视化 256 节点策略 |
+| | `rag/graphrag/utils_extras.py` | 增量存储层：set_graph_delta、merge_state、在线组图、可视化 256 节点策略、拓扑专用加载（PageRank 用） |
 | | `rag/graphrag/utils_pagination.py` | search_after + `_doc` tiebreaker 分页（仅 ES/OS 后端） |
 | | `rag/graphrag/entity_resolution_extras.py` | 增量实体消解（excluded_types、候选注入、数字 2-gram 规则） |
 | | `rag/graphrag/document_delete_extras.py` | 文档删除时的 KG 清理（显式 ID 防误删） |
 | 任务执行 | `rag/svr/task_executor_extras.py` | 卡死任务 reconcile、心跳、KG 后处理 Stream 消费者 |
-| 存储/连接 | `common/doc_store/es_conn_extras.py`、`common/doc_store/opensearch_conn_extras.py` | count/scroll/KNN 注入与 insert 包装 |
+| 存储/连接 | `common/doc_store/es_conn_extras.py` | ES count/scroll 注入与 insert 包装（`opensearch_conn_extras.py` 已于 2026-09-12 删除） |
 | | `common/doc_store_audit.py` | `docStoreConn.delete` 审计钩子（KG 产物删除留痕） |
 | | `rag/utils/redis_conn_patch.py` | `RedisDB.ttl`、可取消的 `spin_acquire` |
 | | `rag/llm/siliconflow_timeout_patch.py` | SiliconFlow Embedding 超时可配置 |
@@ -115,16 +118,12 @@ git diff <旧tag>..<新tag> -- <官方文件>
 ### Phase 2.5：增量合并后全局 PageRank 重算
 | 环境变量 | 默认值 | 控制功能 |
 |----------|--------|----------|
-| `RECALC_GLOBAL_PAGERANK_AFTER_MERGE` | `0` | 增量 merge 全部完成后加载一次全图重算 PageRank 并写回 entity chunks。需同时开启 `USE_INCREMENTAL_MERGE=1`；仅 OpenSearch/ES 后端（`search_with_scroll` 可用）实际生效 |
+| `RECALC_GLOBAL_PAGERANK_AFTER_MERGE` | `0` | 增量 merge 全部完成后重算全局 PageRank 并写回 entity chunks。需同时开启 `USE_INCREMENTAL_MERGE=1`；仅 ES 后端（`search_with_scroll`/`update_docs`/`search_after` 可用）实际生效。2026-09-12 起为拓扑加载（不取 description，内存约降一个量级）+ 实体/关系 scroll 截断显式检测（截断即放弃）；`GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP` 必须大于 max(节点数, 关系数) |
 
 ### Phase 3：增量实体消解
 | 环境变量 | 默认值 | 控制功能 |
 |----------|--------|----------|
-| `USE_INCREMENTAL_RESOLUTION` | `0` | 实体消解：1=按 entity_type 分批消解，0=官方默认全图消解 |
-| `USE_KNN_FOR_RESOLUTION` | `0` | 增量消解内：1=OpenSearch KNN 召回，0=字符级过滤（仅增量消解开启时生效） |
-| `ENTITY_RESOLUTION_TOP_K` | `20` | KNN 召回 Top-K |
-| `ENTITY_RESOLUTION_SIM_THRESHOLD` | `0.7` | KNN 相似度阈值 |
-| `ENTITY_RESOLUTION_KNN_CONCURRENCY` | `8` | KNN 查询并发数 |
+| `USE_INCREMENTAL_RESOLUTION` | `0` | 实体消解：1=按 entity_type 分批消解，0=官方默认全图消解（候选召回为字符级过滤；OpenSearch KNN 路径及 `USE_KNN_FOR_RESOLUTION`/`ENTITY_RESOLUTION_TOP_K`/`ENTITY_RESOLUTION_SIM_THRESHOLD`/`ENTITY_RESOLUTION_KNN_CONCURRENCY` 已于 2026-09-12 随 OS 弃用移除） |
 | `RESOLUTION_BATCH_SIZE` | `100` | 实体消解批大小 |
 | `RESOLUTION_MAX_CONCURRENT_TASKS` | `5` | 实体消解最大并发任务数 |
 
@@ -183,14 +182,36 @@ git diff <旧tag>..<新tag> -- <官方文件>
 3. ~~**flag 组合 `USE_INCREMENTAL_MERGE=1` + `USE_INCREMENTAL_GRAPH=0` 导致全图数据丢失**~~ **已修复**：`GraphRAGConfig.normalize_flag_combinations()`（import 时与 `reload()` 时执行）在 MERGE/RESOLUTION 开启而 GRAPH 关闭时自动升级 GRAPH 并打 ERROR 日志提醒修正环境变量。回归测试：`TestFlagCombinationNormalization`。
 4. ~~**KG-PP 分布式锁互斥失效**~~ **已修复**：`lock_value` 改为唯一值 `kg_pp:{task_id}`，与主流程 `batch_merge:{task_id}` 的模式一致，官方 `delete_if_equal` 不再误删他人持锁。
 
-其余中/轻度问题（resume 空指针、`does_graph_contains` size=1 假阴性、search_after 无 PIT、局部 PageRank 污染全局 rank、OS insert 沿用官方静默失败缺陷、KG-PP 失败即 ack 无死信等）仍未处理，见 2026-07-16 审查记录。
+### 2026-09-12 第二轮审查（全部 extras 文件）已修复项
+
+5. ~~**OpenSearch extras 静默失效**~~：`opensearch_conn_extras.py` 的 monkey-patch 装在 `@singleton` 工厂闭包上而非真类，5 个注入方法从未生效但日志报 installed。**随 OS 后端弃用整体删除**（文件、settings 钩子、KNN 消解路径、`USE_KNN_FOR_RESOLUTION`/`ENTITY_RESOLUTION_TOP_K`/`ENTITY_RESOLUTION_SIM_THRESHOLD`/`ENTITY_RESOLUTION_KNN_CONCURRENCY` 四个环境变量）；OS 官方 insert 静默失败缺陷随之消失。
+6. ~~**心跳键与任务状态弱一致**~~：心跳初始写失败后 `xx=True` 续约永远无法自愈，且 cancel 路径（官方 `set_progress` 抛 `TaskCanceledException`）心跳键残留成幽灵心跳。已修复：写失败回滚 `_current_task_id`、cancel 路径清理心跳、心跳循环加 Redis None 守卫。
+7. ~~**删文档增量路径 subgraph 清理缺兜底**~~：增量路径 `kg_types` 补回 `"subgraph"`（恢复官方 `must_not exists source_id` 安全网）；显式 ID 列举的 10000 硬上限改为 scroll 分页，无 scroll 后端保留 cap 并打 ERROR。
+8. ~~**增量消解吞 `TaskCanceledException`**~~：取消后所有批次空转到结束。已改为重抛，gather 立即中止。
+9. ~~**增量消解 checkpoint 是死代码**~~（调用方从不传 `checkpoints`/`save_checkpoint`）：已接上 `load_checkpoints`/`save_checkpoint`（与官方 `RESOLUTION_CHECKPOINT` 一致），中断后可续跑。
+10. ~~**`_wrap_extract_community` 按 `args[6]`/`args[7]` 位置取参**~~：已改为 `inspect.signature` 按名绑定，绑定失败打 WARNING 而非静默错位。
+11. ~~**`index_patch.apply_patch` 无幂等守卫**~~：重复调用会把 `_ORIGINALS` 覆盖成已包装版本。已加 `_graphrag_index_patch_applied` 标记。
+12. ~~**`recalc_global_pagerank` 每次重试都重新加载全图（大 KB OOM 风险）**~~：改为单次尝试、失败非致命（rank 保持陈旧至下次 merge）。
+13. ~~**`write_merge_state` 写后无 refresh**~~（并发 retry 读到陈旧状态）：末尾加 `_post_insert_refresh`；`state="failed"` 写入失败不再掩盖原始 merge 异常。
+14. ~~**`get_graph_from_index_for_visualization` 静默覆写 `max_nodes` 为 256**~~：按入参分配 centers/neighbors 预算，`max_nodes` 作为硬上限生效。
+15. ~~**`does_graph_contains` 单 round-trip 只覆盖 OpenSearch**~~：已切到 ES 后端（`.es`），ES 同样享受 bool.should 单 round-trip。
+16. ~~**ChapterGraph DEBUG 日志刷用户可见进度**~~：改为 `logging.debug`；~~实体-章节子串匹配假阳性~~（"AI" 匹配 "fail"）：加 ASCII 词边界守卫，CJK 子串语义不变。
+17. ~~**可视化 `protected_types` 与孤立节点丢弃矛盾**~~（章节节点静默消失）：保护类型免于孤立过滤；边/节点字段缺失改 `.get` 兜底防 KeyError。
+18. ~~**`es_conn_extras` 闭包定位硬编码类名 `ESConnection`**~~：改为优先按 `__module__` 匹配。
+19. ~~**`doc_store_audit` `_caller_location(skip_frames=3)` 多跳一帧**~~：改为 2，审计日志定位到真实调用点。
+20. **全局 PageRank 重算大 KB 改造**：图加载改为拓扑专用加载器 `get_graph_topology_from_index`（只取 `entity_kwd`/`entity_type_kwd`/`from_entity_kwd`/`to_entity_kwd`，不取 description，内存约降一个量级）；`_es_search_with_scroll` 返回新增 `_truncated` 标记，实体或关系 scroll 被 `hits_cap` 截断时重算显式放弃（修掉原"边截断无守卫"缺口）；实体写回扫描改为 `search_after` 流式分页 + 窗口化 flush，不再受 `hits_cap` 限制。回归测试：`test_graphrag_topology.py`。
+
+### 仍未处理（第二轮审查复核确认）
+
+- **resume 空指针**、`does_graph_contains` 官方 legacy 路径 size=1 假阴性、search_after 无 PIT、局部 PageRank 污染全局 rank：与第一轮记录一致。
+- **KG-PP 失败/cancel 即 ack 无死信**：第二轮确认 cancel 路径（`task_executor_extras.py` 消费循环内 `has_canceled` 分支）与失败路径同样受影响——任何用户取消都会走此路径；官方 Redis Stream 本身无 DLQ 机制，属于框架级限制。
+- 增量消解的 `IncrementalEntityResolution.__init__` 已加 `*args/**kwargs` 前向兼容，但上游若在 `resolve_entities` 中新增调用参数仍需对照第一节第 2 项核对。
 
 ### 待验证事项
 
 - [ ] 端到端集成测试：`USE_INCREMENTAL_GRAPH=1 USE_INCREMENTAL_MERGE=1 USE_INCREMENTAL_RESOLUTION=1`
 - [ ] 验证 `_record_lock_metric` Redis hash 写入
 - [ ] 验证启动时 `RECONCILE_STUCK_ON_BOOT=1` 的 reconcile 日志
-- [ ] 测试 OpenSearch KNN 路径在 Infinity/ES 后端下的降级行为
 - [x] 检查 `api/apps/restful_apis/dataset_api.py` 路由冲突：`DELETE /datasets/<id>/graph` 已新增用于前端删除按钮；`unbindPipelineTask` 保持 `/datasets/<id>/index?type=` 风格以避免冲突
 
 ---

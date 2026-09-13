@@ -76,18 +76,46 @@ def _cleanup_knowledge_graph_references_incremental(doc, chunk_index_name):
     # missing/typed values is backend-dependent. Resolve matching subgraph
     # chunk IDs explicitly so we never accidentally delete every subgraph in
     # the KB (or none of them).
-    subgraph_res = settings.docStoreConn.search(
-        ["_id"],
-        [],
-        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["subgraph"], "source_id": doc.id},
-        [],
-        OrderByExpr(),
-        0,
-        10000,
-        chunk_index_name,
-        [doc.kb_id],
-    )
-    subgraph_ids = settings.docStoreConn.get_doc_ids(subgraph_res)
+    subgraph_ids = None
+    if hasattr(settings.docStoreConn, "search_with_scroll"):
+        # Single-shot search is capped by index.max_result_window (10000);
+        # scroll pages through everything so very large documents (e.g.
+        # ChapterGraph books) do not leave subgraph chunks behind.
+        query_body = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"terms": {"kb_id": [doc.kb_id]}},
+                        {"terms": {"knowledge_graph_kwd": ["subgraph"]}},
+                        {"term": {"source_id": doc.id}},
+                    ]
+                }
+            }
+        }
+        try:
+            scroll_res = settings.docStoreConn.search_with_scroll(chunk_index_name, query_body, ["_id"])
+            subgraph_ids = settings.docStoreConn.get_doc_ids(scroll_res)
+        except Exception:
+            logger.exception("subgraph scroll listing failed for doc %s; falling back to paged search", doc.id)
+            subgraph_ids = None
+    if subgraph_ids is None:
+        subgraph_res = settings.docStoreConn.search(
+            ["_id"],
+            [],
+            {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["subgraph"], "source_id": doc.id},
+            [],
+            OrderByExpr(),
+            0,
+            10000,
+            chunk_index_name,
+            [doc.kb_id],
+        )
+        subgraph_ids = settings.docStoreConn.get_doc_ids(subgraph_res)
+        if len(subgraph_ids) >= 10000:
+            logger.error(
+                "subgraph cleanup for doc %s hit the 10000 listing cap; some subgraph chunks may remain",
+                doc.id,
+            )
     if subgraph_ids:
         settings.docStoreConn.delete(
             {"id": subgraph_ids},
@@ -114,7 +142,7 @@ def _cleanup_knowledge_graph_references_incremental(doc, chunk_index_name):
         for row in graph_source.values()
     )
     if doc_in_graph_source:
-        kg_types = ["entity", "relation", "graph", "community_report"]
+        kg_types = ["entity", "relation", "graph", "subgraph", "community_report"]
         settings.docStoreConn.update(
             {"kb_id": doc.kb_id, "knowledge_graph_kwd": kg_types, "source_id": doc.id},
             {"remove": {"source_id": doc.id}},

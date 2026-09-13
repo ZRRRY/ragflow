@@ -19,9 +19,14 @@
 Covers ``recalc_global_pagerank`` (rag/graphrag/general/index_extras.py):
   - partial-update write-back (rank_flt + content_with_weight.pagerank)
   - structural (book/chapter) nodes pinned to 0.0
-  - hits-cap truncation aborts before any write
+  - topology truncation (entity OR relation scroll over hits_cap) aborts
+    before any write
   - entities missing from the pagerank map are skipped, never zeroed
   - _final_graph_is_delta guards official phases from per-doc delta graphs
+
+The entity write-back scan itself streams via ``search_after`` and is no
+longer bounded by ``hits_cap``; the topology load enforces the cap (covered
+by test_graphrag_topology.py).
 """
 
 import json
@@ -54,6 +59,7 @@ except Exception:
 from common import settings  # mocked by the shared conftest
 from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.general import index_extras
+from rag.graphrag.utils_extras import GraphTopologyTruncatedError
 
 
 async def _run_sync(func, *args, **kwargs):
@@ -62,17 +68,16 @@ async def _run_sync(func, *args, **kwargs):
 
 
 class _FakeDocStore:
-    """Minimal doc-store double: scroll scan + partial update + refresh."""
+    """Minimal doc-store double: capability attrs + partial update + refresh."""
 
-    def __init__(self, hits):
-        self._hits = hits
-        self.scan_queries = []
+    def __init__(self):
+        self.es = MagicMock()  # capability marker for search_after support
         self.update_calls = []
         self.refreshed = False
 
     def search_with_scroll(self, index_name, query_body, fields, hits_cap=None):
-        self.scan_queries.append(query_body)
-        return {"hits": {"hits": list(self._hits)}}
+        # Capability marker only; the recalc path no longer scans with scroll.
+        raise AssertionError("search_with_scroll should not be called by recalc")
 
     def update_docs(self, index_name, updates):
         self.update_calls.append(list(updates))
@@ -96,15 +101,13 @@ def _entity_hit(cid, name, entity_type, pagerank=0.001, description="d"):
 
 
 def _graph():
-    """Alpha-Beta-Gamma chain plus one structural (book) node linked to Alpha."""
+    """Alpha-Beta-Gamma chain; the structural node is filtered at load time."""
     g = nx.Graph()
-    g.add_node("Alpha", entity_type="organization", pagerank=0.001, source_id=["d1"])
-    g.add_node("Beta", entity_type="organization", pagerank=0.001, source_id=["d1"])
-    g.add_node("Gamma", entity_type="person", pagerank=0.001, source_id=["d1"])
-    g.add_node("Book X", entity_type="书籍", pagerank=0.001, source_id=["d1"])
-    g.add_edge("Alpha", "Beta", weight=1.0)
-    g.add_edge("Beta", "Gamma", weight=1.0)
-    g.add_edge("Book X", "Alpha", weight=1.0)
+    g.add_node("Alpha")
+    g.add_node("Beta")
+    g.add_node("Gamma")
+    g.add_edge("Alpha", "Beta")
+    g.add_edge("Beta", "Gamma")
     return g
 
 
@@ -117,23 +120,38 @@ def _hits():
     ]
 
 
-def _setup(monkeypatch, hits, graph):
-    """Wire the fake doc store and graph loader into index_extras."""
+def _setup(monkeypatch, hits, graph, topology_error=None):
+    """Wire the fake doc store, topology loader and search_after into index_extras."""
     msgs = []
-    store = _FakeDocStore(hits)
+    store = _FakeDocStore()
     monkeypatch.setattr(settings, "docStoreConn", store)
     monkeypatch.setattr(index_extras, "thread_pool_exec", _run_sync)
 
-    async def _fake_loader(tenant_id, kb_id):
+    async def _fake_topology(tenant_id, kb_id, skip_entity_type=None, hits_cap=None):
+        if topology_error is not None:
+            raise topology_error
         return graph
 
-    monkeypatch.setattr(index_extras, "get_graph_from_index", _fake_loader)
+    monkeypatch.setattr(index_extras, "get_graph_topology_from_index", _fake_topology)
+
+    sa_calls = []
+
+    def _fake_search_after(filters, index_name, kb_id, fields, sort_field, page_size=1000, max_pages=1000):
+        sa_calls.append({"filters": filters, "fields": fields, "sort_field": sort_field})
+        page = [dict(h["_source"], id=h["_id"]) for h in hits]
+
+        async def _gen():
+            yield page
+
+        return _gen()
+
+    monkeypatch.setattr(index_extras, "search_all_by_search_after", _fake_search_after)
 
     def _callback(msg=None, **kwargs):
         if msg:
             msgs.append(msg)
 
-    return store, msgs, _callback
+    return store, sa_calls, msgs, _callback
 
 
 def _collected_updates(store):
@@ -143,17 +161,14 @@ def _collected_updates(store):
 class TestRecalcGlobalPagerank:
     @pytest.mark.asyncio
     async def test_writes_partial_updates_with_global_pagerank(self, monkeypatch):
-        store, msgs, callback = _setup(monkeypatch, _hits(), _graph())
+        store, sa_calls, msgs, callback = _setup(monkeypatch, _hits(), _graph())
 
         await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
 
         updates = _collected_updates(store)
         assert set(updates) == {"c1", "c2", "c3", "c4"}
 
-        # Structural node is removed from the graph before PageRank runs.
-        expected_graph = _graph()
-        expected_graph.remove_node("Book X")
-        expected = nx.pagerank(expected_graph)
+        expected = nx.pagerank(_graph())
 
         for cid, name in [("c1", "Alpha"), ("c2", "Beta"), ("c3", "Gamma")]:
             assert updates[cid]["rank_flt"] == pytest.approx(expected[name])
@@ -167,39 +182,31 @@ class TestRecalcGlobalPagerank:
         assert updates["c4"]["rank_flt"] == 0.0
         assert json.loads(updates["c4"]["content_with_weight"])["pagerank"] == 0.0
 
-        # The scan must use the narrow _source projection (no vector fields).
-        assert store.scan_queries[0]["_source"] == ["entity_kwd", "content_with_weight"]
+        # The scan must use the narrow field projection (no vector fields).
+        assert sa_calls[0]["fields"] == ["entity_kwd", "content_with_weight"]
         assert store.refreshed is True
         assert any("updated 4 entities, skipped 0" in m for m in msgs)
 
     @pytest.mark.asyncio
-    async def test_aborts_when_entity_scan_reaches_hits_cap(self, monkeypatch):
-        # Graph has 3 nodes after structural filtering (< cap=4), but the
-        # entity scan returns 4 hits == cap → write-back must not happen.
-        monkeypatch.setattr(GraphRAGConfig, "SEARCH_WITH_SCROLL_HITS_CAP", 4)
-        store, msgs, callback = _setup(monkeypatch, _hits(), _graph())
+    async def test_aborts_when_topology_is_truncated(self, monkeypatch):
+        # Entity or relation scroll cut off by hits_cap → no scan, no writes.
+        store, sa_calls, msgs, callback = _setup(
+            monkeypatch,
+            _hits(),
+            None,
+            topology_error=GraphTopologyTruncatedError("relation scroll hit the hits_cap=50000"),
+        )
 
         await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
 
+        assert sa_calls == []
         assert store.update_calls == []
-        assert any("hits cap" in m for m in msgs)
-
-    @pytest.mark.asyncio
-    async def test_aborts_when_graph_load_reaches_hits_cap(self, monkeypatch):
-        # cap=3 → filtered graph (3 nodes) reaches the cap → abort before scan.
-        monkeypatch.setattr(GraphRAGConfig, "SEARCH_WITH_SCROLL_HITS_CAP", 3)
-        store, msgs, callback = _setup(monkeypatch, _hits(), _graph())
-
-        await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
-
-        assert store.scan_queries == []
-        assert store.update_calls == []
-        assert any("node cap" in m for m in msgs)
+        assert any("abort pagerank recalc" in m for m in msgs)
 
     @pytest.mark.asyncio
     async def test_entity_missing_from_pagerank_is_skipped_not_zeroed(self, monkeypatch):
         hits = _hits() + [_entity_hit("c5", "Ghost", "organization")]
-        store, msgs, callback = _setup(monkeypatch, hits, _graph())
+        store, sa_calls, msgs, callback = _setup(monkeypatch, hits, _graph())
 
         await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
 
@@ -210,12 +217,12 @@ class TestRecalcGlobalPagerank:
 
     @pytest.mark.asyncio
     async def test_skips_when_backend_lacks_update_docs(self, monkeypatch):
-        store, msgs, callback = _setup(monkeypatch, _hits(), _graph())
+        store, sa_calls, msgs, callback = _setup(monkeypatch, _hits(), _graph())
         monkeypatch.delattr(_FakeDocStore, "update_docs")
 
         await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
 
-        assert store.scan_queries == []
+        assert sa_calls == []
         assert any("update_docs" in m for m in msgs)
 
 

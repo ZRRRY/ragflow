@@ -37,6 +37,7 @@ from typing import Optional
 
 from common import settings
 from common.constants import LLMType, SVR_CONSUMER_GROUP_NAME
+from common.exceptions import TaskCanceledException
 from common.misc_utils import thread_pool_exec
 from api.db.joint_services.tenant_model_service import (
     get_model_config_from_provider_instance,
@@ -298,6 +299,9 @@ async def _heartbeat_loop():
         tid = _get_current_task_id()
         if not tid:
             continue
+        if REDIS_CONN.REDIS is None:
+            logging.warning("[heartbeat] redis client unavailable, skip renew task=%s", tid)
+            continue
         try:
             # XX flag: only renew if the key already exists.  This
             # prevents reviving a heartbeat that set_progress already
@@ -496,10 +500,29 @@ def _make_set_progress_wrapper(original_set_progress):
                         exp=GraphRAGConfig.HEARTBEAT_TTL,
                     )
                 except Exception:
+                    # Roll back the task switch: without the heartbeat key the
+                    # renewal loop (xx=True) could never create it, and
+                    # reconcile would treat this live task as stuck. Clear
+                    # prev_tid too, so the finally block does not delete the
+                    # restored task's still-valid heartbeat.
                     logging.exception("[heartbeat] initial lock write failed task=%s", task_id)
+                    _set_current_task_id(prev_tid)
+                    prev_tid = None
 
         try:
             return original_set_progress(task_id, from_page=from_page, to_page=to_page, prog=prog, msg=msg)
+        except TaskCanceledException:
+            # The official set_progress writes prog=-1 and raises on cancel,
+            # so the finally block below never sees the terminal state.
+            # Clean up the heartbeat here or the renewal loop (xx=True) would
+            # keep reviving a ghost heartbeat for a dead task forever.
+            if GraphRAGConfig.RECONCILE_STUCK_ON_BOOT:
+                try:
+                    REDIS_CONN.delete(f"graphrag:hb:{task_id}")
+                except Exception:
+                    logging.exception("[heartbeat] cancel-path lock delete failed task=%s", task_id)
+                _set_current_task_id(None)
+            raise
         finally:
             # Heartbeat cleanup, decoupled from the prog value to avoid stranded
             # keys on `set_progress(task_id, prog=None)` paths (msg-only updates):

@@ -15,35 +15,33 @@
 #
 """Phase 2.2: search_after 分页工具。
 
-OpenSearch / Elasticsearch 的 ``index.max_result_window`` 默认 10000，超过会
+Elasticsearch 的 ``index.max_result_window`` 默认 10000，超过会
 被硬截断。GraphRAG 在大 KB 下需要拉超过 1 万的 relation / entity，scroll API
 会在内存里累积全量结果（10w+ 文档时单次调用峰值 1GB+），所以优先用
 ``search_after`` + PIT (point-in-time) 分页。
 
-只支持 OpenSearch / Elasticsearch 后端；Infinity / OceanBase 走 fallback
+只支持 Elasticsearch 后端；Infinity / OceanBase 走 fallback
 （旧的 size=10000 单次查询）。
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, AsyncIterator
 
 from common.misc_utils import thread_pool_exec
-from rag.nlp import search
 from common import settings
 
 logger = logging.getLogger(__name__)
 
 
 def supports_search_after(conn) -> bool:
-    """检测 doc store 是否支持原生 search_after（OpenSearch / Elasticsearch）。"""
-    return hasattr(conn, "os") or hasattr(conn, "es")
+    """检测 doc store 是否支持原生 search_after（Elasticsearch）。"""
+    return hasattr(conn, "es")
 
 
 def _build_query_body(filters: dict, sort_field: str, page_size: int,
                       search_after: list | None = None) -> dict:
-    """构造 OpenSearch / ES query body。
+    """构造 Elasticsearch query body。
 
     Args:
         filters: 与 Dealer.search req["filters"] 等价的 condition dict
@@ -72,7 +70,7 @@ def _build_query_body(filters: dict, sort_field: str, page_size: int,
 
 
 def _filters_to_clauses(filters: dict) -> list[dict]:
-    """把 RAGFlow 内部 condition dict 转 OpenSearch bool filter clauses。
+    """把 RAGFlow 内部 condition dict 转 Elasticsearch bool filter clauses。
 
     仅支持 Phase 2.3 调用方使用的 terms / term / match 模式，复杂的 script /
     nested 不在范围内。
@@ -102,7 +100,7 @@ async def search_all_by_search_after(
 ) -> AsyncIterator[list[dict]]:
     """Async generator: 一次 yield 一个 page 的 hits（已投影到 fields）。
 
-    Phase 2.2: 用 OpenSearch / ES 原生 search_after 翻页，绕过 max_result_window
+    Phase 2.2: 用 Elasticsearch 原生 search_after 翻页，绕过 max_result_window
     截断。每次 page_size 一次 ES round-trip，max_pages 上限 1000（即最多
     100w hit/查询）。中间任意一页 ES 抛异常由调用方决定 retry / break。
 
@@ -118,10 +116,10 @@ async def search_all_by_search_after(
     conn = settings.docStoreConn
     if not supports_search_after(conn):
         raise NotImplementedError(
-            "search_after pagination only supports OpenSearch / Elasticsearch backends; "
+            "search_after pagination only supports Elasticsearch backends; "
             f"current backend {type(conn).__name__} is not supported."
         )
-    raw = conn.os if hasattr(conn, "os") else conn.es
+    raw = conn.es
 
     body = _build_query_body(filters, sort_field, page_size, search_after=None)
     body["_source"] = fields

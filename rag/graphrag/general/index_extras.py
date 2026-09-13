@@ -37,6 +37,7 @@ from common.exceptions import TaskCanceledException
 from common.misc_utils import thread_pool_exec
 from rag.graphrag.checkpoints import (
     COMMUNITY_CHECKPOINT,
+    RESOLUTION_CHECKPOINT,
     cleanup_checkpoints,
     load_checkpoints,
     save_checkpoint,
@@ -79,10 +80,11 @@ from rag.graphrag.utils import (
     tidy_graph,
 )
 from rag.graphrag.utils_extras import (
+    GraphTopologyTruncatedError,
     does_graph_contains,
-    fetch_node_vectors,
     get_graph,
     get_graph_from_index,
+    get_graph_topology_from_index,
     is_doc_merged,
     query_existing_entities,
     query_existing_relations,
@@ -90,6 +92,7 @@ from rag.graphrag.utils_extras import (
     set_graph,
     write_merge_state,
 )
+from rag.graphrag.utils_pagination import search_all_by_search_after
 from rag.nlp import rag_tokenizer, search
 from rag.utils.redis_conn import REDIS_CONN, RedisDistributedLock
 
@@ -582,15 +585,20 @@ async def run_graphrag_for_kb(
                 raise
             except Exception as e:
                 if GraphRAGConfig.USE_INCREMENTAL_MERGE:
-                    await write_merge_state(
-                        tenant_id,
-                        kb_id,
-                        doc_id,
-                        state="failed",
-                        expected_nodes=len(sg.nodes),
-                        expected_edges=len(sg.edges),
-                        extra={"error": repr(e)},
-                    )
+                    try:
+                        await write_merge_state(
+                            tenant_id,
+                            kb_id,
+                            doc_id,
+                            state="failed",
+                            expected_nodes=len(sg.nodes),
+                            expected_edges=len(sg.edges),
+                            extra={"error": repr(e)},
+                        )
+                    except Exception:
+                        # Never mask the original merge failure with a
+                        # doc-store write error from the status update.
+                        logging.exception("write_merge_state(failed) failed for doc %s (non-fatal)", doc_id)
                 failed_docs.append((doc_id, f"merge failed: {e!r}"))
                 callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} FAILED: {e!r}")
                 raise
@@ -622,16 +630,29 @@ async def run_graphrag_for_kb(
             and GraphRAGConfig.USE_INCREMENTAL_MERGE
             and ok_docs
         ):
-            await _run_with_retry(
-                "global pagerank recalc",
-                lambda: recalc_global_pagerank(tenant_id, kb_id, callback, task_id=task_id),
-                attempts=merge_retry_attempts,
-                timeout_seconds=merge_timeout_seconds,
-                backoff_seconds=retry_backoff_seconds,
-                backoff_max_seconds=retry_backoff_max_seconds,
-                callback=callback,
-                task_id=task_id,
-            )
+            # Single attempt, non-fatal: every retry would reload the full
+            # graph from the doc store (scroll), which risks OOM on large KBs.
+            # A failure leaves ranks stale until the next merge-triggered
+            # recalc — the graph itself is already merged and usable.
+            try:
+                await _run_with_retry(
+                    "global pagerank recalc",
+                    lambda: recalc_global_pagerank(tenant_id, kb_id, callback, task_id=task_id),
+                    attempts=1,
+                    timeout_seconds=merge_timeout_seconds,
+                    backoff_seconds=retry_backoff_seconds,
+                    backoff_max_seconds=retry_backoff_max_seconds,
+                    callback=callback,
+                    task_id=task_id,
+                )
+            except TaskCanceledException:
+                raise
+            except Exception:
+                # _run_with_retry already emitted the FAILED callback.
+                logging.exception(
+                    "[GraphRAG] dataset:%s global pagerank recalc failed (non-fatal); ranks stay stale until next merge",
+                    kb_id,
+                )
     finally:
         try:
             _held = asyncio.get_running_loop().time() - lock_held_t0
@@ -972,6 +993,31 @@ def _extract_book_and_chapters(doc_id: str, chunks: list[str], fallback_title: s
     return book_title, chapter_entities, chapter_relations, chunk_chapters
 
 
+def _name_appears_in_text(name_lower: str, text_lower: str) -> bool:
+    """Substring match with ASCII word-boundary guards.
+
+    Prevents short ASCII entity names ("AI", "main") from matching inside
+    longer words ("fail", "remain"), while keeping plain substring semantics
+    for CJK names, which legitimately appear adjacent to other characters.
+    Both arguments must already be lowercased.
+    """
+    if not name_lower:
+        return False
+    start = 0
+    while True:
+        idx = text_lower.find(name_lower, start)
+        if idx < 0:
+            return False
+        before = text_lower[idx - 1] if idx > 0 else ""
+        after_idx = idx + len(name_lower)
+        after = text_lower[after_idx] if after_idx < len(text_lower) else ""
+        before_is_word_char = before == "_" or (before.isascii() and before.isalnum())
+        after_is_word_char = after == "_" or (after.isascii() and after.isalnum())
+        if not before_is_word_char and not after_is_word_char:
+            return True
+        start = idx + 1
+
+
 def _link_entities_to_chapters(
     doc_id: str, chunks: list[str], entities: list[dict], chunk_chapters: list[list[str]]
 ):
@@ -987,7 +1033,7 @@ def _link_entities_to_chapters(
         ent_name_lower = ent_name.lower()
         matched = False
         for idx, text in enumerate(chunk_texts):
-            if ent_name_lower in text:
+            if _name_appears_in_text(ent_name_lower, text):
                 matched = True
                 for chapter in chunk_chapters[idx]:
                     pair = (chapter, ent_name)
@@ -1056,18 +1102,23 @@ async def generate_subgraph(
     if GraphRAGConfig.USE_CHAPTER_GRAPH:
         for i, ck in enumerate(chunks[:2]):
             preview = ck[:300].replace("\n", " | ")
-            callback(msg=f"[ChapterGraph DEBUG] chunk {i} preview: {preview}")
-        callback(msg=f"[ChapterGraph DEBUG] total chunks={len(chunks)}, fallback_title={fallback_title}")
+            logging.debug("[ChapterGraph] chunk %d preview: %s", i, preview)
+        logging.debug(
+            "[ChapterGraph] total chunks=%d, fallback_title=%s", len(chunks), fallback_title
+        )
 
         _, chapter_ents, chapter_rels, chunk_chapters = _extract_book_and_chapters(
             doc_id, chunks, fallback_title
         )
-        callback(msg=f"[ChapterGraph DEBUG] chapter_ents={len(chapter_ents)}, chapter_rels={len(chapter_rels)}")
+        logging.debug(
+            "[ChapterGraph] chapter_ents=%d, chapter_rels=%d", len(chapter_ents), len(chapter_rels)
+        )
         if chapter_ents:
-            callback(msg=f"[ChapterGraph DEBUG] chapter_entities={[e['entity_name'] for e in chapter_ents]}")
+            logging.debug("[ChapterGraph] chapter_entities=%s", [e["entity_name"] for e in chapter_ents])
         if chapter_rels:
-            callback(
-                msg=f"[ChapterGraph DEBUG] chapter_rels_sample={(chapter_rels[0]['src_id'], chapter_rels[0]['tgt_id'])}"
+            logging.debug(
+                "[ChapterGraph] chapter_rels_sample=%s",
+                (chapter_rels[0]["src_id"], chapter_rels[0]["tgt_id"]),
             )
 
     ents = list(llm_ents)
@@ -1204,6 +1255,11 @@ async def recalc_global_pagerank(
 
     The write-back uses partial updates (only ``rank_flt`` and
     ``content_with_weight``) so embedding vectors never leave the doc store.
+
+    Memory shape at large-KB scale: the graph is loaded topology-only (entity
+    names + edge endpoints, no descriptions), and the entity write-back
+    streams ``search_after`` pages flushed in bounded windows, so resident
+    memory stays flat regardless of entity count.
     """
     _has_cancel_and_exit(
         task_id, f"Task {task_id} cancelled before global pagerank recalc.", callback
@@ -1212,8 +1268,8 @@ async def recalc_global_pagerank(
     callback(msg=f"[GraphRAG] dataset:{kb_id} start global pagerank recalc.")
 
     # 1. Capability check: the entity scan needs scroll-based retrieval and the
-    # write-back uses partial updates. Both are provided by the OpenSearch /
-    # Elasticsearch conn extras; other backends skip the recalc entirely.
+    # write-back uses partial updates. Both are provided by the Elasticsearch
+    # conn extras; other backends skip the recalc entirely.
     has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
     if not has_scroll and type(settings.docStoreConn).__name__ == "ESConnection":
         try:
@@ -1236,68 +1292,37 @@ async def recalc_global_pagerank(
         )
         return
 
-    # 2. Load the global graph (scroll-based assembly from entity/relation
-    # chunks; monolithic JSON fallback). Structural (book/chapter) nodes are
-    # filtered after loading with the same ``should_skip_embedding`` predicate
-    # used at write-back time, so the two can never disagree (alias names like
+    # 2. Load the global graph topology (entity names + edge endpoints only;
+    # descriptions stay in the doc store — at large-KB scale that is roughly
+    # an order of magnitude less resident memory). Structural (book/chapter)
+    # nodes are filtered with the same ``should_skip_embedding`` predicate used
+    # at write-back time, so the two can never disagree (alias names like
     # "Book"/"Chapter" are covered as well as the exact 书籍/章节 types).
+    # Any scroll truncation (entities OR relations) aborts the recalc: ranks
+    # computed on a partial topology must never be written back.
+    hits_cap = GraphRAGConfig.SEARCH_WITH_SCROLL_HITS_CAP
     try:
-        graph = await get_graph_from_index(tenant_id, kb_id)
-        callback(
-            msg=f"[GraphRAG] dataset:{kb_id} get_graph_from_index returned "
-                f"{'None' if graph is None else f'graph(nodes={len(graph.nodes)}, edges={len(graph.edges)})'}"
+        graph = await get_graph_topology_from_index(
+            tenant_id,
+            kb_id,
+            skip_entity_type=GraphRAGConfig.should_skip_embedding,
+            hits_cap=hits_cap,
         )
+    except GraphTopologyTruncatedError as e:
+        callback(msg=f"[GraphRAG] dataset:{kb_id} abort pagerank recalc: {e}")
+        logging.warning("pagerank recalc aborted for kb=%s: %s", kb_id, e)
+        return
     except Exception as e:
-        logging.exception("get_graph_from_index failed for pagerank recalc: %s", e)
-        callback(msg=f"[GraphRAG] dataset:{kb_id} get_graph_from_index failed: {e!r}")
-        graph = None
-
-    if graph is None:
-        try:
-            graph = await get_graph(tenant_id, kb_id)
-            callback(
-                msg=f"[GraphRAG] dataset:{kb_id} get_graph fallback returned "
-                    f"{'None' if graph is None else f'graph(nodes={len(graph.nodes)}, edges={len(graph.edges)})'}"
-            )
-        except Exception as e:
-            logging.exception("get_graph fallback failed for pagerank recalc: %s", e)
-            callback(msg=f"[GraphRAG] dataset:{kb_id} get_graph fallback failed: {e!r}")
-            graph = None
-
-    if graph is not None:
-        excluded_nodes = {
-            node
-            for node, attrs in graph.nodes(data=True)
-            if GraphRAGConfig.should_skip_embedding(attrs.get("entity_type"))
-        }
-        if excluded_nodes:
-            graph.remove_nodes_from(excluded_nodes)
-            callback(
-                msg=f"[GraphRAG] dataset:{kb_id} excluded {len(excluded_nodes)} "
-                    f"structural nodes after loading."
-            )
+        logging.exception("topology load failed for pagerank recalc: %s", e)
+        callback(msg=f"[GraphRAG] dataset:{kb_id} topology load failed: {e!r}")
+        return
 
     if graph is None or len(graph.nodes) == 0:
         callback(msg=f"[GraphRAG] dataset:{kb_id} no global graph; skip pagerank recalc.")
         return
 
-    # Truncation guard: get_graph_from_index silently caps at
-    # SEARCH_WITH_SCROLL_HITS_CAP; ranks computed on a truncated graph must
-    # never be written back over the full index.
-    hits_cap = GraphRAGConfig.SEARCH_WITH_SCROLL_HITS_CAP
-    if len(graph.nodes) >= hits_cap:
-        callback(
-            msg=f"[GraphRAG] dataset:{kb_id} graph load reached the {hits_cap} node cap; "
-                f"abort pagerank recalc (raise GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP to proceed)."
-        )
-        logging.warning(
-            "pagerank recalc aborted for kb=%s: %d nodes reached hits_cap=%d",
-            kb_id, len(graph.nodes), hits_cap,
-        )
-        return
-
     callback(
-        msg=f"[GraphRAG] dataset:{kb_id} loaded global graph for pagerank recalc: "
+        msg=f"[GraphRAG] dataset:{kb_id} loaded global graph topology for pagerank recalc: "
             f"nodes={len(graph.nodes)} edges={len(graph.edges)}."
     )
 
@@ -1307,54 +1332,14 @@ async def recalc_global_pagerank(
         msg=f"[GraphRAG] dataset:{kb_id} pagerank computed for {len(pr)} nodes."
     )
 
-    # 4. Scan entity chunks with a narrow _source projection so embedding
-    # vectors never leave the doc store; only the fields needed for the
-    # rewrite are transferred.
-    query_body = {
-        "_source": ["entity_kwd", "content_with_weight"],
-        "query": {
-            "bool": {
-                "filter": [
-                    {"terms": {"kb_id": [kb_id]}},
-                    {"terms": {"knowledge_graph_kwd": ["entity"]}},
-                ]
-            }
-        },
-    }
-    try:
-        res = await thread_pool_exec(
-            settings.docStoreConn.search_with_scroll,
-            search.index_name(tenant_id),
-            query_body,
-            [],
-            hits_cap=hits_cap,
-        )
-    except Exception as e:
-        logging.exception("Failed to load entity chunks for pagerank recalc: %s", e)
-        callback(msg=f"[GraphRAG] dataset:{kb_id} failed to load entities for pagerank recalc: {e!r}")
-        return
-
-    hits = res.get("hits", {}).get("hits", [])
-    if not hits:
-        callback(msg=f"[GraphRAG] dataset:{kb_id} no entity chunks found; skip pagerank recalc.")
-        return
-
-    if len(hits) >= hits_cap:
-        callback(
-            msg=f"[GraphRAG] dataset:{kb_id} entity scan reached the {hits_cap} hits cap; "
-                f"abort pagerank recalc instead of writing partial ranks."
-        )
-        logging.warning(
-            "pagerank recalc aborted for kb=%s: entity scan collected %d hits (cap=%d)",
-            kb_id, len(hits), hits_cap,
-        )
-        return
-
-    # 5. Partial-update write-back in bounded windows. Structural nodes are
-    # pinned to 0.0 (they never participate in ranking; without this the
-    # merge-time 0.001 placeholder would outrank real entities on large
-    # graphs). Entities missing from the pagerank map (e.g. parse failures at
-    # load time) are skipped, never zeroed.
+    # 4. Stream entity chunks page-by-page (search_after pagination — no
+    # result-window or hits-cap limit) with a narrow _source projection so
+    # embedding vectors never leave the doc store. Write back partial updates
+    # in bounded windows. Structural nodes are pinned to 0.0 (they never
+    # participate in ranking; without this the merge-time 0.001 placeholder
+    # would outrank real entities on large graphs). Entities missing from the
+    # pagerank map (e.g. parse failures at load time) are skipped, never
+    # zeroed.
     _UPDATE_WINDOW = 1000
     updates: list[tuple[str, dict]] = []
     updated = 0
@@ -1373,42 +1358,50 @@ async def recalc_global_pagerank(
         updated += len(updates)
         updates.clear()
 
-    for hit in hits:
-        _has_cancel_and_exit(
-            task_id, f"Task {task_id} cancelled during pagerank recalc.", callback
-        )
-        cid = hit.get("_id")
-        source = hit.get("_source", {})
-        if not cid:
-            skipped += 1
-            continue
+    # Pagination stays stable while we write: the sort keys (entity_kwd +
+    # _doc) are immutable across the updates we perform here.
+    async for page in search_all_by_search_after(
+        {"knowledge_graph_kwd": ["entity"]},
+        search.index_name(tenant_id),
+        kb_id,
+        ["entity_kwd", "content_with_weight"],
+        "entity_kwd",
+    ):
+        for hit in page:
+            _has_cancel_and_exit(
+                task_id, f"Task {task_id} cancelled during pagerank recalc.", callback
+            )
+            cid = hit.get("id")
+            if not cid:
+                skipped += 1
+                continue
 
-        entity_name = source.get("entity_kwd")
-        if isinstance(entity_name, list):
-            entity_name = entity_name[0] if entity_name else None
-        if not entity_name:
-            skipped += 1
-            continue
+            entity_name = hit.get("entity_kwd")
+            if isinstance(entity_name, list):
+                entity_name = entity_name[0] if entity_name else None
+            if not entity_name:
+                skipped += 1
+                continue
 
-        try:
-            meta = json.loads(source.get("content_with_weight", "{}"))
-        except Exception:
-            skipped += 1
-            continue
+            try:
+                meta = json.loads(hit.get("content_with_weight", "{}"))
+            except Exception:
+                skipped += 1
+                continue
 
-        if GraphRAGConfig.should_skip_embedding(meta.get("entity_type")):
-            new_pr = 0.0
-        elif entity_name in pr:
-            new_pr = float(pr[entity_name])
-        else:
-            skipped += 1
-            continue
+            if GraphRAGConfig.should_skip_embedding(meta.get("entity_type")):
+                new_pr = 0.0
+            elif entity_name in pr:
+                new_pr = float(pr[entity_name])
+            else:
+                skipped += 1
+                continue
 
-        meta["pagerank"] = new_pr
-        updates.append((cid, {
-            "rank_flt": new_pr,
-            "content_with_weight": json.dumps(meta, ensure_ascii=False),
-        }))
+            meta["pagerank"] = new_pr
+            updates.append((cid, {
+                "rank_flt": new_pr,
+                "content_with_weight": json.dumps(meta, ensure_ascii=False),
+            }))
         if len(updates) >= _UPDATE_WINDOW:
             await _flush_updates()
 
@@ -1562,7 +1555,7 @@ async def resolve_entities_incremental(
     task_id: str = "",
     entity_types: list[str] | None = None,
 ):
-    """Incremental entity resolution via OpenSearch KNN or char-level filtering.
+    """Incremental entity resolution via char-level filtering.
 
     签名与官方 ``resolve_entities``（rag/graphrag/general/index.py）完全对齐，
     因为 wrapper 按官方调用约定原样透传全部参数。增量路径不使用
@@ -1615,9 +1608,9 @@ async def resolve_entities_incremental(
             }
         }
         try:
-            # ES / Infinity doc store does not implement search_with_scroll;
-            # in that case fall back to an empty set so resolution can still
-            # proceed via char-level filtering.
+            # Backends without search_with_scroll (Infinity / OceanBase)
+            # return an empty set so resolution can still proceed via
+            # char-level filtering over whatever candidates are known.
             if not hasattr(settings.docStoreConn, "search_with_scroll"):
                 return set()
             res = await thread_pool_exec(
@@ -1639,137 +1632,48 @@ async def resolve_entities_incremental(
             logging.warning("[P3] Failed to fetch existing names for type %s: %s", ent_type, e)
             return set()
 
-    if GraphRAGConfig.USE_KNN_FOR_RESOLUTION:
-        if not hasattr(settings.docStoreConn, "knn_search_entities"):
-            logging.warning(
-                "[P3] KNN resolution requested but %s does not support knn_search_entities; "
-                "falling back to char-level filtering.",
-                type(settings.docStoreConn).__name__,
+    # Char-level candidate recall. Phase 2.4 safety: cap the per-type
+    # candidate set and batch the new-node side so a 10k existing x 100 new
+    # KB does not produce a 1M Cartesian product in memory. Each batch
+    # reuses the existing_names set, so the cost is O(batches x |existing|)
+    # string compares per type, bounded by
+    # RESOLUTION_CHAR_BATCH_SIZE * RESOLUTION_CHAR_MAX_CANDIDATES.
+    char_batch = max(1, int(GraphRAGConfig.RESOLUTION_CHAR_BATCH_SIZE))
+    max_candidates = max(1, int(GraphRAGConfig.RESOLUTION_CHAR_MAX_CANDIDATES))
+
+    for ent_type, new_nodes in new_nodes_by_type.items():
+        if not new_nodes or ent_type in excluded_types:
+            continue
+        if len(candidate_pairs) >= max_candidates:
+            logging.info(
+                "[P3] Char-level candidate set reached cap (%d) before type=%s, skipping remaining",
+                max_candidates,
+                ent_type,
             )
-        else:
-            vector_dim = getattr(embed_bdl, "dimension", None)
-            if vector_dim is None:
-                try:
-                    test_emb, _ = await asyncio.get_running_loop().run_in_executor(
-                        None, embed_bdl.encode, ["DIM_CHECK"]
-                    )
-                    vector_dim = len(test_emb[0])
-                except Exception as e:
-                    logging.warning("[P3] Failed to detect embedding dimension: %s", e)
-                    return
+            break
 
-            new_node_vectors = await fetch_node_vectors(
-                tenant_id, kb_id, list(union_nodes), vector_dim
-            )
-            if not new_node_vectors:
-                logging.info("[P3] No vectors found for new nodes, skipping resolution.")
-                return
+        existing_names = await _fetch_existing_names_by_type(tenant_id, kb_id, ent_type)
+        existing_names = existing_names - set(new_nodes)
 
-            vector_field = f"q_{vector_dim}_vec"
-            knn_semaphore = asyncio.Semaphore(GraphRAGConfig.ENTITY_RESOLUTION_KNN_CONCURRENCY)
-
-            async def _knn_one(node_name, vector, ent_type):
-                async with knn_semaphore:
-                    try:
-                        res = await thread_pool_exec(
-                            settings.docStoreConn.knn_search_entities,
-                            [search.index_name(tenant_id)],
-                            [kb_id],
-                            vector,
-                            vector_field,
-                            GraphRAGConfig.ENTITY_RESOLUTION_TOP_K,
-                            GraphRAGConfig.ENTITY_RESOLUTION_SIM_THRESHOLD,
-                            entity_type=ent_type,
-                            exclude_name=node_name,
-                        )
-                        fields_map = settings.docStoreConn.get_fields(res, ["entity_kwd"])
-                        neighbors = []
-                        for cid, row in fields_map.items():
-                            neighbor_name = row.get("entity_kwd")
-                            if isinstance(neighbor_name, list):
-                                neighbor_name = neighbor_name[0]
-                            if not neighbor_name or neighbor_name == node_name:
-                                continue
-                            if not is_similarity_str(node_name, neighbor_name):
-                                continue
-                            neighbors.append(neighbor_name)
-                        return node_name, neighbors
-                    except Exception as e:
-                        logging.warning("KNN search failed for node %s: %s", node_name, e)
-                        return node_name, []
-
-            for ent_type, new_nodes in new_nodes_by_type.items():
-                if not new_nodes or ent_type in excluded_types:
-                    continue
-
-                tasks = []
-                for node_name in new_nodes:
-                    vector = new_node_vectors.get(node_name)
-                    if not vector:
-                        continue
-                    tasks.append(asyncio.create_task(_knn_one(node_name, vector, ent_type)))
-
-                if not tasks:
-                    continue
-
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, Exception):
-                        logging.warning("KNN task exception: %s", res)
-                        continue
-                    node_name, neighbors = res
-                    for neighbor_name in neighbors:
-                        a, b = (
-                            (node_name, neighbor_name)
-                            if node_name < neighbor_name
-                            else (neighbor_name, node_name)
-                        )
-                        candidate_pairs.add((a, b))
-                        candidate_neighbors.add(neighbor_name)
-
-    if not candidate_pairs:
-        logging.info("[P3] Falling back to char-level filtering for entity resolution.")
-        # Phase 2.4 safety: cap the per-type candidate set and batch the new-node
-        # side so a 10k existing x 100 new KB does not produce a 1M Cartesian
-        # product in memory. Each batch reuses the existing_names set, so the
-        # cost is O(batches x |existing|) string compares per type, bounded by
-        # RESOLUTION_CHAR_BATCH_SIZE * RESOLUTION_CHAR_MAX_CANDIDATES.
-        char_batch = max(1, int(GraphRAGConfig.RESOLUTION_CHAR_BATCH_SIZE))
-        max_candidates = max(1, int(GraphRAGConfig.RESOLUTION_CHAR_MAX_CANDIDATES))
-
-        for ent_type, new_nodes in new_nodes_by_type.items():
-            if not new_nodes or ent_type in excluded_types:
-                continue
+        for batch_start in range(0, len(new_nodes), char_batch):
             if len(candidate_pairs) >= max_candidates:
-                logging.info(
-                    "[P3] Char-level candidate set reached cap (%d) before type=%s, skipping remaining",
-                    max_candidates,
-                    ent_type,
-                )
                 break
-
-            existing_names = await _fetch_existing_names_by_type(tenant_id, kb_id, ent_type)
-            existing_names = existing_names - set(new_nodes)
-
-            for batch_start in range(0, len(new_nodes), char_batch):
-                if len(candidate_pairs) >= max_candidates:
-                    break
-                batch_new = new_nodes[batch_start : batch_start + char_batch]
-                for node_name in batch_new:
-                    for existing_name in existing_names:
-                        if not is_similarity_str(node_name, existing_name):
-                            continue
-                        a, b = (
-                            (node_name, existing_name)
-                            if node_name < existing_name
-                            else (existing_name, node_name)
-                        )
-                        candidate_pairs.add((a, b))
-                        candidate_neighbors.add(existing_name)
-                        if len(candidate_pairs) >= max_candidates:
-                            break
+            batch_new = new_nodes[batch_start : batch_start + char_batch]
+            for node_name in batch_new:
+                for existing_name in existing_names:
+                    if not is_similarity_str(node_name, existing_name):
+                        continue
+                    a, b = (
+                        (node_name, existing_name)
+                        if node_name < existing_name
+                        else (existing_name, node_name)
+                    )
+                    candidate_pairs.add((a, b))
+                    candidate_neighbors.add(existing_name)
                     if len(candidate_pairs) >= max_candidates:
                         break
+                if len(candidate_pairs) >= max_candidates:
+                    break
 
     if not candidate_pairs:
         logging.info("[P3] No candidates found, skipping resolution.")
@@ -1834,6 +1738,11 @@ async def resolve_entities_incremental(
         local_graph.number_of_edges(),
     )
 
+    checkpoints = await load_checkpoints(tenant_id, kb_id, RESOLUTION_CHECKPOINT)
+
+    async def save_resolution_checkpoint(checkpoint_key: str, payload):
+        return await save_checkpoint(tenant_id, kb_id, RESOLUTION_CHECKPOINT, checkpoint_key, payload)
+
     er = EntityResolution(
         llm_bdl,
         excluded_types=excluded_types,
@@ -1845,7 +1754,11 @@ async def resolve_entities_incremental(
             callback=callback,
             task_id=task_id,
             candidate_resolution=dict(candidate_resolution),
+            checkpoints=checkpoints,
+            save_checkpoint=save_resolution_checkpoint,
         )
+    except TaskCanceledException:
+        raise
     except Exception as e:
         logging.warning("P3: EntityResolution failed: %s", e)
         raise
@@ -1858,6 +1771,7 @@ async def resolve_entities_incremental(
     )
 
     await set_graph(tenant_id, kb_id, embed_bdl, reso.graph, change, callback)
+    await cleanup_checkpoints(tenant_id, kb_id, RESOLUTION_CHECKPOINT)
     now = asyncio.get_running_loop().time()
     logging.info("[P3] incremental resolution done in %.2fs.", now - start)
 

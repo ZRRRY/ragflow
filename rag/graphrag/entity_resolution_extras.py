@@ -33,6 +33,7 @@ import editdistance
 import networkx as nx
 
 from rag.nlp import is_english
+from common.exceptions import TaskCanceledException
 from rag.graphrag.checkpoints import resolution_checkpoint_key
 from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.entity_resolution import (
@@ -127,8 +128,13 @@ class IncrementalEntityResolution(EntityResolution):
         is owned by ``recalc_global_pagerank`` (runs after merge / resolution).
     """
 
-    def __init__(self, llm_invoker, excluded_types: set[str] | None = None):
-        super().__init__(llm_invoker)
+    def __init__(self, llm_invoker, *args, excluded_types: set[str] | None = None, **kwargs):
+        # *args/**kwargs are forwarded for forward compatibility: if upstream
+        # EntityResolution gains new constructor parameters (e.g. language /
+        # entity_types), they reach the parent; if the parent does not accept
+        # them it raises TypeError — a loud signal is preferable to silently
+        # dropping arguments.
+        super().__init__(llm_invoker, *args, **kwargs)
         self._excluded_types = excluded_types if excluded_types is not None else set()
 
     async def __call__(
@@ -212,6 +218,10 @@ class IncrementalEntityResolution(EntityResolution):
                         remain_candidates_to_resolve -= len(candidate_batch[1])
                         callback(msg=f"Failed to resolve {len(candidate_batch[1])} pairs due to timeout, skipped. {remain_candidates_to_resolve} remain.")
 
+                except TaskCanceledException:
+                    # Do not swallow task cancellation: re-raise so the
+                    # gather below aborts the remaining batches promptly.
+                    raise
                 except Exception as exception:
                     logging.error(f"Error resolving candidate batch: {exception}")
 

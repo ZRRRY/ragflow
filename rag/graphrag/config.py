@@ -49,15 +49,6 @@ class GraphRAGConfig:
     # 实体消解是否使用增量 resolution：1=按 entity_type 分批消解，0=官方默认全图消解
     USE_INCREMENTAL_RESOLUTION = os.environ.get("USE_INCREMENTAL_RESOLUTION", "0") == "1"
 
-    # 增量消解内候选对召回方式：1=OpenSearch KNN，0=字符级过滤（无 embedding/ANN）
-    # 仅在 USE_INCREMENTAL_RESOLUTION=1 时生效
-    USE_KNN_FOR_RESOLUTION = os.environ.get("USE_KNN_FOR_RESOLUTION", "0") == "1"
-    # KNN 召回 Top-K
-    ENTITY_RESOLUTION_TOP_K = int(os.environ.get("ENTITY_RESOLUTION_TOP_K", "20"))
-    # KNN 相似度阈值
-    ENTITY_RESOLUTION_SIM_THRESHOLD = float(os.environ.get("ENTITY_RESOLUTION_SIM_THRESHOLD", "0.7"))
-    # KNN 查询并发数
-    ENTITY_RESOLUTION_KNN_CONCURRENCY = int(os.environ.get("ENTITY_RESOLUTION_KNN_CONCURRENCY", "8"))
     # 实体消解批大小
     RESOLUTION_BATCH_SIZE = int(os.environ.get("RESOLUTION_BATCH_SIZE", "100"))
     # 实体消解最大并发任务数
@@ -70,7 +61,7 @@ class GraphRAGConfig:
     RESOLUTION_CHAR_MAX_CANDIDATES = int(os.environ.get("RESOLUTION_CHAR_MAX_CANDIDATES", "5000"))
     # set_graph_delta 末尾是否主动 refresh（与 bulk refresh="false" 配套）。
     # 1=insert 后立即 refresh（下游 query 立即可见，~1s 阻塞开销）
-    # 0=依赖 OS 默认 refresh_interval（1s 自然 flush，下游 query 短暂 stale）
+    # 0=依赖 ES 默认 refresh_interval（1s 自然 flush，下游 query 短暂 stale）
     SET_GRAPH_DELTA_REFRESH_AFTER_INSERT = os.environ.get("SET_GRAPH_DELTA_REFRESH_AFTER_INSERT", "1") == "1"
     # search_with_scroll 单次查询返回 hits 上限，防止大 KB 全图加载时 worker OOM。
     # 默认值 50000 保持与原硬编码一致；超大 KB 可通过环境变量提高。
@@ -192,8 +183,7 @@ class GraphRAGConfig:
             "async_kg_phases=%s "
             "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d "
             "heartbeat_interval=%ds heartbeat_ttl=%ds "
-            "knn_resolution=%s resolution_top_k=%d resolution_sim_thr=%.2f "
-            "knn_concurrency=%d resolution_batch_size=%d resolution_max_concurrent=%d "
+            "resolution_batch_size=%d resolution_max_concurrent=%d "
             "max_safe_resume_nodes=%d max_parallel_docs=%d "
             "search_with_scroll_hits_cap=%d "
             "use_chapter_graph=%s "
@@ -211,10 +201,6 @@ class GraphRAGConfig:
             cls.STUCK_TASK_MIN_EDGES,
             cls.HEARTBEAT_INTERVAL,
             cls.HEARTBEAT_TTL,
-            cls.USE_KNN_FOR_RESOLUTION,
-            cls.ENTITY_RESOLUTION_TOP_K,
-            cls.ENTITY_RESOLUTION_SIM_THRESHOLD,
-            cls.ENTITY_RESOLUTION_KNN_CONCURRENCY,
             cls.RESOLUTION_BATCH_SIZE,
             cls.RESOLUTION_MAX_CONCURRENT_TASKS,
             cls.KG_MAX_SAFE_RESUME_NODES,
@@ -264,10 +250,6 @@ class GraphRAGConfig:
             "RECALC_GLOBAL_PAGERANK_AFTER_MERGE", "0"
         ) == "1"
         cls.USE_INCREMENTAL_RESOLUTION = os.environ.get("USE_INCREMENTAL_RESOLUTION", "0") == "1"
-        cls.USE_KNN_FOR_RESOLUTION = os.environ.get("USE_KNN_FOR_RESOLUTION", "0") == "1"
-        cls.ENTITY_RESOLUTION_TOP_K = int(os.environ.get("ENTITY_RESOLUTION_TOP_K", "20"))
-        cls.ENTITY_RESOLUTION_SIM_THRESHOLD = float(os.environ.get("ENTITY_RESOLUTION_SIM_THRESHOLD", "0.7"))
-        cls.ENTITY_RESOLUTION_KNN_CONCURRENCY = int(os.environ.get("ENTITY_RESOLUTION_KNN_CONCURRENCY", "8"))
         cls.RESOLUTION_BATCH_SIZE = int(os.environ.get("RESOLUTION_BATCH_SIZE", "100"))
         cls.RESOLUTION_MAX_CONCURRENT_TASKS = int(os.environ.get("RESOLUTION_MAX_CONCURRENT_TASKS", "5"))
         cls.EMBED_BATCH_SIZE = int(os.environ.get("GRAPHRAG_EMBED_BATCH_SIZE", "64"))

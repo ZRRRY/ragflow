@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 _INSERT_BULK_SIZE = max(1, int(os.environ.get("GRAPHRAG_INSERT_BULK_SIZE", 64)))
 _INSERT_CONCURRENCY = max(1, int(os.environ.get("GRAPHRAG_INSERT_CONCURRENCY", 4)))
 
-# OpenSearch / Elasticsearch default limit for the number of terms in a terms
+# Elasticsearch default limit for the number of terms in a terms
 # query/filter.  Splitting large to_node lists avoids "max_terms_count" errors
 # during bulk edge deletion.
 _MAX_TERMS_COUNT = max(1, int(os.environ.get("GRAPHRAG_DELETE_MAX_TERMS_COUNT", 65536)))
@@ -82,7 +82,7 @@ async def _post_insert_refresh(tenant_id: str, callback=None, label: str = "set_
     queries see the new data immediately.
 
     Opt out via ``SET_GRAPH_DELTA_REFRESH_AFTER_INSERT=0`` to rely on the
-    default OpenSearch refresh_interval (1s). Used by both the
+    default Elasticsearch refresh_interval (1s). Used by both the
     monolithic and delta ``set_graph`` paths so they share a single
     refresh policy.
     """
@@ -116,7 +116,7 @@ async def _delete_relation_edges_bulk(
     """Delete relation edges for a single ``from_node`` in ``to_nodes`` batches.
 
     Each ``to_entity_kwd`` terms list is capped at ``_MAX_TERMS_COUNT`` to stay
-    below the OpenSearch / Elasticsearch ``index.max_terms_count`` default.
+    below the Elasticsearch ``index.max_terms_count`` default.
     """
     for batch_offset in range(0, len(to_nodes), _MAX_TERMS_COUNT):
         to_batch = to_nodes[batch_offset : batch_offset + _MAX_TERMS_COUNT]
@@ -196,6 +196,9 @@ async def write_merge_state(
         search.index_name(tenant_id),
         kb_id,
     )
+    # Refresh so a concurrent is_doc_merged / query_merge_state (retry or
+    # KG-PP overlap) does not read a stale merge_state record.
+    await _post_insert_refresh(tenant_id, label="write_merge_state")
 
 
 async def query_merge_state(
@@ -276,42 +279,6 @@ async def query_existing_entities(tenant_id, kb_id, node_names):
                     existing[ent_name] = fields
         except Exception as e:
             logging.warning("query_existing_entities batch %d failed: %s", i, e)
-
-    return existing
-
-
-async def fetch_node_vectors(tenant_id, kb_id, node_names, vector_dim):
-    """Batch-read node vectors (``q_{vector_dim}_vec``) from the doc store.
-
-    Returns a dict mapping ``entity_name -> vector``.
-    """
-    if not node_names:
-        return {}
-
-    vector_field = f"q_{vector_dim}_vec"
-    BATCH_SIZE = 100
-    existing = {}
-
-    for i in range(0, len(node_names), BATCH_SIZE):
-        batch = node_names[i:i + BATCH_SIZE]
-        conds = {
-            "fields": ["entity_kwd", vector_field],
-            "size": len(batch),
-            "knowledge_graph_kwd": ["entity"],
-            "entity_kwd": batch,
-        }
-        try:
-            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
-            for id in es_res.ids:
-                fields = es_res.field[id]
-                ent_name = fields.get("entity_kwd")
-                if isinstance(ent_name, list):
-                    ent_name = ent_name[0]
-                vec = fields.get(vector_field)
-                if ent_name and vec is not None:
-                    existing[ent_name] = vec
-        except Exception as e:
-            logging.warning("fetch_node_vectors batch %d failed: %s", i, e)
 
     return existing
 
@@ -523,6 +490,108 @@ async def _query_node_relations_legacy(tenant_id, kb_id, node_names):
     return all_fields
 
 
+class GraphTopologyTruncatedError(RuntimeError):
+    """A scroll-based graph load was cut off by the hits cap.
+
+    Ranking on a truncated topology must never be written back to the index,
+    so callers (e.g. ``recalc_global_pagerank``) must abort when this raises.
+    """
+
+
+async def get_graph_topology_from_index(tenant_id, kb_id, skip_entity_type=None, hits_cap=None):
+    """Load only the graph topology (entity names + edge endpoints).
+
+    PageRank depends on topology alone, so unlike ``get_graph_from_index``
+    this never transfers ``content_with_weight`` (descriptions) — at large-KB
+    scale that is roughly an order of magnitude less resident memory.
+
+    ``skip_entity_type`` is a predicate over the ``entity_type_kwd`` value;
+    nodes it accepts (and their incident edges) are excluded, mirroring the
+    structural-node filtering done at rank write-back time.
+
+    Returns ``None`` when the backend lacks ``search_with_scroll`` or the KB
+    has no entity chunks. Raises ``GraphTopologyTruncatedError`` when any
+    scroll (entities or relations) is cut off by the hits cap.
+    """
+    if not hasattr(settings.docStoreConn, "search_with_scroll"):
+        return None
+
+    cap = hits_cap if hits_cap is not None else GraphRAGConfig.SEARCH_WITH_SCROLL_HITS_CAP
+    index_name = search.index_name(tenant_id)
+
+    async def _scroll(query_body, fields, label):
+        res = await thread_pool_exec(
+            settings.docStoreConn.search_with_scroll,
+            index_name,
+            query_body,
+            fields,
+            hits_cap=cap,
+        )
+        if res.get("_truncated"):
+            raise GraphTopologyTruncatedError(
+                f"{label} scroll hit the hits_cap={cap} for kb={kb_id}; "
+                "raise GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP to proceed"
+            )
+        return settings.docStoreConn.get_fields(res, fields)
+
+    graph = nx.Graph()
+    excluded: set = set()
+
+    ent_fields = ["entity_kwd", "entity_type_kwd"]
+    ent_query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"kb_id": [kb_id]}},
+                    {"terms": {"knowledge_graph_kwd": ["entity"]}},
+                ]
+            }
+        }
+    }
+    for _cid, d in (await _scroll(ent_query, ent_fields, "entity")).items():
+        name = d.get("entity_kwd")
+        if isinstance(name, list):
+            name = name[0] if name else None
+        if not name:
+            continue
+        ent_type = d.get("entity_type_kwd")
+        if isinstance(ent_type, list):
+            ent_type = ent_type[0] if ent_type else None
+        if skip_entity_type is not None and skip_entity_type(ent_type):
+            excluded.add(name)
+            continue
+        graph.add_node(name)
+
+    if len(graph.nodes) == 0:
+        return None
+
+    rel_fields = ["from_entity_kwd", "to_entity_kwd"]
+    rel_query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"kb_id": [kb_id]}},
+                    {"terms": {"knowledge_graph_kwd": ["relation"]}},
+                ]
+            }
+        }
+    }
+    for _cid, d in (await _scroll(rel_query, rel_fields, "relation")).items():
+        src = d.get("from_entity_kwd")
+        tgt = d.get("to_entity_kwd")
+        if isinstance(src, list):
+            src = src[0] if src else None
+        if isinstance(tgt, list):
+            tgt = tgt[0] if tgt else None
+        if not src or not tgt or src == tgt:
+            continue
+        if src in excluded or tgt in excluded:
+            continue
+        graph.add_edge(src, tgt)
+
+    return graph
+
+
 async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
     """Assemble the global graph from discrete ``entity`` and ``relation``
     chunks stored in the doc store (incremental / decoupled storage mode).
@@ -542,8 +611,9 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
     total_relations = 0
     excluded_nodes = set()
 
-    # search_with_scroll is only implemented by OpenSearch.  ES / Infinity
-    # callers fall back to None and let the caller pick the monolithic path.
+    # search_with_scroll is injected into ESConnection by es_conn_extras.
+    # Backends without it (Infinity / OceanBase) fall back to None and let
+    # the caller pick the monolithic path.
     if not hasattr(settings.docStoreConn, "search_with_scroll"):
         return None
 
@@ -674,10 +744,12 @@ async def get_graph_from_index_for_visualization(
     seen_sources = set()
 
     ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
-    num_centers = 8
-    neighbors_per_center = 16
-    fallback_topk = 120
-    max_nodes = num_centers + num_centers * neighbors_per_center + fallback_topk
+    # Size the hub centers and their top neighbors from the caller-provided
+    # max_nodes budget; the pagerank fallback fill then uses whatever capacity
+    # remains, with the caps below enforcing max_nodes as a hard upper bound.
+    # The default 256 keeps the historical 8 + 8*16 + 120 shape.
+    num_centers = max(1, max_nodes // 32)
+    neighbors_per_center = max(1, min(16, max_nodes // 16))
 
     def _parse_entity_doc(_cid, d):
         try:
@@ -1305,10 +1377,10 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
     # Backends without native should (Infinity/OceanBase) keep the legacy 2× path.
     index_name = search.index_name(tenant_id)
 
-    if GraphRAGConfig.USE_INCREMENTAL_GRAPH and hasattr(settings.docStoreConn, "os"):
-        raw = settings.docStoreConn.os
+    if GraphRAGConfig.USE_INCREMENTAL_GRAPH and hasattr(settings.docStoreConn, "es"):
+        raw = settings.docStoreConn.es
         body = {
-            "size": 1,
+            "size": 2,
             "query": {
                 "bool": {
                     "should": [
