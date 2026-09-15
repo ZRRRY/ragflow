@@ -479,6 +479,7 @@ def init_settings():
     # 关联：common/doc_store_audit.py
     try:
         from common.doc_store_audit import install_with_fallback
+
         install_with_fallback(docStoreConn)
     except ImportError as e:
         logging.warning(f"doc_store_audit hook unavailable, skipping install: {e}")
@@ -491,6 +492,7 @@ def init_settings():
     # 关联：rag/llm/siliconflow_timeout_patch.py
     try:
         from rag.llm.siliconflow_timeout_patch import install as install_siliconflow_timeout
+
         install_siliconflow_timeout()
     except ImportError as e:
         logging.warning(f"siliconflow_timeout_patch hook unavailable, skipping install: {e}")

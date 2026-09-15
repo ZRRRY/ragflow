@@ -1,0 +1,115 @@
+kind: knowledge_graph
+display_name: Chapter graph (书籍/章节)
+description: >-
+  Knowledge graph template for books and chapter-structured documents.
+  Extracts one 书籍 (book) entity and its 章节 (chapter) entities from the
+  document heading structure, links them with contains relations, and links
+  general entities to the chapters that mention them via involves relations.
+config:
+  kind: knowledge_graph
+  rechunk_rules: |
+    - Group only adjacent source chunks into coherent semantic units for this knowledge-compilation task.
+    - Preserve source order: use every source chunk exactly once; do not omit, overlap, duplicate, or reorder chunks.
+    - Split when the topic, section, or semantic focus changes; do not merge unrelated content.
+    - Keep the Markdown heading hierarchy intact: never detach a heading line ("#", "##", ...) from the section it introduces, and never alter heading text.
+    - Keep self-contained tables, lists, figures, and code blocks intact; do not split their internal structure.
+    - Do not invent, rewrite, or return source text; return only chunk grouping metadata.
+  entity:
+    description: >-
+      You are a robust graph entity extractor for book/chapter-structured knowledge graphs.
+    fields:
+      - type: 书籍
+        description: The book or work itself; at most one per document.
+        rule: |
+          - Entity name is the book title: prefer the document's top-level "# " Markdown H1 heading; fall back to the document title.
+          - Extract at most one 书籍 entity per document; skip entirely when no reliable book title exists.
+          - Description format: 书籍《书名》.
+      - type: 章节
+        description: A chapter or top-level section of the book.
+        rule: |
+          - Entity name MUST be "《书名》章节标题" (the book title in 《》 prefixed directly to the chapter title).
+          - Source chapter titles from "## " Markdown H2 headings; when the document has no Markdown headings, use the first non-empty line (<= 100 characters) of each section instead.
+          - Description format: 《书名》的章节：章节标题.
+          - Never duplicate 章节 entities; cap at 64 per document, keeping the earliest in source order.
+      - type: person
+        description: A natural person (individual human).
+        rule: |
+          - Full name preferred (e.g., "Elon Musk", not "Musk" alone if ambiguous).
+          - Include titles only if integral to identity (e.g., "Dr. Smith").
+          - Max length: 60 characters.
+      - type: org
+        description: Organization, company, institution, agency, or any collective group.
+        rule: |
+          - Use the official name when possible (e.g., "United Nations").
+          - Abbreviations accepted if widely known (e.g., "UN", "NASA").
+          - Max length: 80 characters.
+      - type: product
+        description: Tangible or intangible product, service, software, or offering.
+        rule: |
+          - Include version numbers if relevant (e.g., "iPhone 14").
+          - Generic categories (e.g., "smartphone") only if no specific name is given.
+          - Max length: 100 characters.
+      - type: regulation
+        description: Law, policy, standard, guideline, or regulatory document.
+        rule: |
+          - Use official title or identifier (e.g., "GDPR", "OSHA standard 1910").
+          - Include jurisdiction if known (e.g., "EU GDPR").
+          - Max length: 120 characters.
+      - type: location
+        description: Geographic place (country, city, address, region, natural feature).
+        rule: |
+          - Hierarchical format allowed (e.g., "Paris, France").
+          - Avoid overly vague terms (e.g., "there") unless resolved.
+          - Max length: 80 characters.
+      - type: other
+        description: Entities that do not fit any above category.
+        rule: |
+          - Use sparingly; prefer mapping to a defined type when possible.
+          - Still provide a meaningful label.
+          - Max length: 80 characters.
+  relation:
+    description: >-
+      You are an expert in extracting semantic relations between entities.
+    fields:
+      - type: contains
+        description: Containment of a chapter inside its book.
+        rule: |
+          - Direction from book to chapter: (书籍 contains 章节).
+          - Link the single 书籍 entity to every 章节 entity of the same book.
+          - Suggested keywords: "contains", "章节", "书籍".
+      - type: involves
+        description: A chapter mentions or discusses an entity.
+        rule: |
+          - Direction from chapter to mentioned entity: (章节 involves 实体).
+          - Link a 章节 to an entity that is neither 书籍 nor 章节 only when the entity name literally appears in that chapter's text span.
+          - Name matching is case-insensitive substring with ASCII word-boundary guards: an ASCII name (e.g. "AI") matches only when the characters immediately before and after the match are NOT ASCII letters, digits, or "_" (so "AI" must not match inside "fail" or "remain"); CJK names match as plain substrings.
+          - Suggested keywords: "involves", "章节", "实体".
+      - type: owns
+        description: Ownership or possession (legal or de facto).
+        rule: |
+          - Direction from owner to owned: (A owns B).
+      - type: part_of
+        description: Mereological relation — component to whole.
+        rule: |
+          - Direction from part to whole: (A part_of B).
+      - type: caused_by
+        description: Causal relation — event, action, or state leads to another.
+        rule: |
+          - Direction from effect to cause: (A caused_by B) meaning B causes A.
+      - type: regulates
+        description: Regulatory or governing relation (law/standard controls entity).
+        rule: |
+          - Direction from regulator to regulated: (A regulates B).
+      - type: located_in
+        description: Spatial containment — entity situated inside a location.
+        rule: |
+          - Direction from located entity to containing location: (A located_in B).
+      - type: other
+        description: Any meaningful relation not covered by the above types.
+        rule: |
+          - Provide an explicit label in a "relation_label" field.
+          - Direction must be clear.
+  global_rules: |
+    - Extract at most one 书籍 entity per document and at most 64 章节 entities; beyond the cap, keep the earliest in source order.
+    - 书籍 and 章节 entities must come from the document structure (headings or section first lines); never invent them.
+    - Entities that are neither 书籍 nor 章节 follow the general extraction rules above.

@@ -554,6 +554,8 @@ def delete_knowledge_graph(tenant_id, dataset_id):
     except Exception as e:
         logging.exception(e)
         return get_error_data_result(message="Internal server error")
+
+
 # === CUSTOM END [graph-delete-wrapper] ===
 
 
