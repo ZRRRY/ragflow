@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index d289bd94e..7eb6665c1 100644
+index 77c6acb57..6832711ea 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -52,6 +52,7 @@ uv-x86_64*.tar.gz
+@@ -56,6 +56,7 @@ stagehand-server*
  .lh/
  .venv
  docker/data
@@ -10,8 +10,8 @@ index d289bd94e..7eb6665c1 100644
  
  # OceanBase data and conf
  docker/oceanbase/conf
-@@ -237,7 +238,13 @@ bin/*
- !bin/.gitkeep
+@@ -245,8 +246,14 @@ bin/*
+ /ragflow_server
  .claude/settings.local.json
  
 -.run/
@@ -25,3 +25,4 @@ index d289bd94e..7eb6665c1 100644
 +.run/
  .omc/
  .marscode/
+ .omx/

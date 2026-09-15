@@ -1,8 +1,8 @@
 diff --git a/web/src/locales/en.ts b/web/src/locales/en.ts
-index b11faf62b..316962e3a 100644
+index fe0cff53e..704b01e83 100644
 --- a/web/src/locales/en.ts
 +++ b/web/src/locales/en.ts
-@@ -3015,6 +3015,12 @@ Important structured information may include: names, dates, locations, events, k
+@@ -3757,6 +3757,12 @@ Important structured information may include: names, dates, locations, events, k
        downloadTip: 'Files being downloaded from data sources. ',
        processingTip: 'Files being processed by ingestion pipeline.',
        totalFiles: 'Total files',

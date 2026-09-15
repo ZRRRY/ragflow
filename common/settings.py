@@ -484,18 +484,19 @@ def init_settings():
         logging.warning(f"doc_store_audit hook unavailable, skipping install: {e}")
     # === CUSTOM END [doc-store-audit-hook] ===
 
-    # === CUSTOM BEGIN [es-conn-extras] ===
-    # 原因：注入自定义 ESConnection.count 方法，供 GraphRAG 增量/优化逻辑使用。
-    # 日期：2026-06-20
-    # 关联：common/doc_store/es_conn_extras.py
+    # === CUSTOM BEGIN [siliconflow-timeout] ===
+    # 原因：安装 SiliconFlow Embedding 可配置超时 patch（兜底 import 异常，避免阻塞启动）。
+    #      原由 rag/graphrag/config.py import 时安装，该文件已随 GraphRAG 增量定制删除。
+    # 日期：2026-09
+    # 关联：rag/llm/siliconflow_timeout_patch.py
     try:
-        from common.doc_store.es_conn_extras import install as install_es_conn_extras
-        install_es_conn_extras()
+        from rag.llm.siliconflow_timeout_patch import install as install_siliconflow_timeout
+        install_siliconflow_timeout()
     except ImportError as e:
-        logging.warning(f"es_conn_extras hook unavailable, skipping install: {e}")
+        logging.warning(f"siliconflow_timeout_patch hook unavailable, skipping install: {e}")
     except Exception as e:
-        logging.exception(f"es_conn_extras install failed, continuing without extras: {e}")
-    # === CUSTOM END [es-conn-extras] ===
+        logging.exception(f"siliconflow_timeout_patch install failed, continuing without patch: {e}")
+    # === CUSTOM END [siliconflow-timeout] ===
 
     retriever = search.Dealer(docStoreConn)
     from rag.graphrag import search as kg_search

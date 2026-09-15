@@ -2,7 +2,7 @@
 # 原因：SiliconFlow Embedding API 在 GraphRAG 批量 embedding 时 30s 经常超时，
 #      通过 monkey patch 把超时改为可配置，避免直接修改官方 embedding_model.py。
 # 日期：2026-06-21
-# 关联：rag/graphrag/config.py
+# 关联：common/settings.py（init_settings 内安装）
 # === CUSTOM END [siliconflow-timeout] ===
 
 import logging

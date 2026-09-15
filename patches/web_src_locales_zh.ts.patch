@@ -1,8 +1,8 @@
 diff --git a/web/src/locales/zh.ts b/web/src/locales/zh.ts
-index 4714ca1fc..2373bf361 100644
+index 95814f635..e168a2c2e 100644
 --- a/web/src/locales/zh.ts
 +++ b/web/src/locales/zh.ts
-@@ -2634,6 +2634,12 @@ Tokenizer 会根据所选方式将内容存储为对应的数据结构。`,
+@@ -3283,6 +3283,12 @@ Tokenizer 会根据所选方式将内容存储为对应的数据结构。`,
        downloadTip: '正在从数据源下载文件。',
        processingTip: '正在由pipeline处理文件。',
        totalFiles: '文件总数',

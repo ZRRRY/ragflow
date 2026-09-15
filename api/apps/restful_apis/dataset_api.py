@@ -536,6 +536,27 @@ async def get_knowledge_graph(tenant_id, dataset_id):
         return get_error_data_result(message="Internal server error")
 
 
+# === CUSTOM BEGIN [graph-delete-wrapper] ===
+# 原因：backward_compat.py 调用 dataset_api.delete_knowledge_graph，上游 v0.27.2
+#      仍未在 restful_apis/dataset_api.py 定义该函数（坏引用修复）。公开的
+#      DELETE /datasets/<id>/graph 端点已由上游 delete_index 路由覆盖，此处仅补函数。
+# 日期：2026-09
+# 关联：api/apps/backward_compat.py、api/apps/services/dataset_api_service.py
+@login_required
+@add_tenant_id_to_kwargs
+def delete_knowledge_graph(tenant_id, dataset_id):
+    try:
+        success, result = dataset_api_service.delete_knowledge_graph(dataset_id, tenant_id)
+        if success:
+            return get_result(data=result)
+        else:
+            return get_result(data=False, message=result, code=RetCode.AUTHENTICATION_ERROR)
+    except Exception as e:
+        logging.exception(e)
+        return get_error_data_result(message="Internal server error")
+# === CUSTOM END [graph-delete-wrapper] ===
+
+
 @manager.route("/datasets/<dataset_id>/artifacts", methods=["HEAD"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs
