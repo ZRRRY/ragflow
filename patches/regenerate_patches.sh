@@ -18,6 +18,7 @@ FILES=(
     "rag/graphrag/general/index.py"
     "rag/graphrag/utils.py"
     "rag/svr/task_executor.py"
+    "rag/utils/es_conn.py"
     "web/src/locales/en.ts"
     "web/src/locales/zh.ts"
     "web/src/pages/dataset/dataset-overview/index.tsx"
