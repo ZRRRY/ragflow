@@ -25,6 +25,7 @@ that the default (all flags off) is equivalent to the official v0.26.1 path.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -77,16 +78,19 @@ _SET_GRAPH_STREAM_WINDOW = max(1, int(os.environ.get("GRAPHRAG_SET_GRAPH_STREAM_
 _SET_GRAPH_PIPELINE_DEPTH = max(1, int(os.environ.get("GRAPHRAG_SET_GRAPH_PIPELINE_DEPTH", 1)))
 
 
-async def _post_insert_refresh(tenant_id: str, callback=None, label: str = "set_graph"):
+async def _post_insert_refresh(tenant_id: str, callback=None, label: str = "set_graph", force: bool = False):
     """Refresh the doc store index after a bulk insert so downstream
     queries see the new data immediately.
 
-    Opt out via ``SET_GRAPH_DELTA_REFRESH_AFTER_INSERT=0`` to rely on the
-    default Elasticsearch refresh_interval (1s). Used by both the
-    monolithic and delta ``set_graph`` paths so they share a single
-    refresh policy.
+    Per-call refreshes are gated by ``SET_GRAPH_DELTA_REFRESH_AFTER_INSERT``
+    (default off) to avoid an index-level refresh per merged document; each
+    merge/resolution/community phase performs one explicit ``force=True``
+    refresh at its end, so correctness never depends on the per-call knob.
+    With the knob off, visibility within a phase relies on the engine's
+    natural refresh_interval (ES default 1s). Used by both the monolithic and
+    delta ``set_graph`` paths so they share a single refresh policy.
     """
-    if not GraphRAGConfig.SET_GRAPH_DELTA_REFRESH_AFTER_INSERT:
+    if not force and not GraphRAGConfig.SET_GRAPH_DELTA_REFRESH_AFTER_INSERT:
         return
     refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
     if refresh_fn is None:
@@ -102,6 +106,49 @@ async def _post_insert_refresh(tenant_id: str, callback=None, label: str = "set_
             "%s: post-insert refresh_idx failed (will rely on default refresh_interval)",
             label,
         )
+
+
+async def refresh_graphrag_index(tenant_id: str, callback=None, label: str = "phase_end"):
+    """阶段末尾的无条件索引 refresh（不受 SET_GRAPH_DELTA_REFRESH_AFTER_INSERT 门控）。
+
+    merge / resolution / community 各阶段在全部写入完成后调用一次，保证下一阶段
+    （或用户 KG 查询）读到一致视图。这是 per-call refresh 关闭后的可见性保证点。
+    """
+    await _post_insert_refresh(tenant_id, callback=callback, label=label, force=True)
+
+
+_DELETE_REFRESH_SUPPORT: dict[type, bool] = {}
+
+
+def _delete_supports_refresh(conn) -> bool:
+    """探测底层 doc store 的 delete() 是否支持 refresh 关键字参数。
+
+    目前仅 ESConnection.delete 接受该参数。audit wrapper 经 functools.wraps 包装，
+    inspect.signature 会穿透到原始方法，因此探测结果反映真实后端能力。
+    结果按连接类型缓存。
+    """
+    conn_type = type(conn)
+    supported = _DELETE_REFRESH_SUPPORT.get(conn_type)
+    if supported is None:
+        try:
+            supported = "refresh" in inspect.signature(conn.delete).parameters
+        except (AttributeError, TypeError, ValueError):
+            supported = False
+        _DELETE_REFRESH_SUPPORT[conn_type] = supported
+    return supported
+
+
+async def _docstore_delete(condition: dict, tenant_id: str, kb_id: str) -> int:
+    """GraphRAG merge 热路径的 doc-store 删除。
+
+    默认以 refresh=false 执行 delete_by_query（不再每次强制索引级 refresh）；
+    可见性由阶段末 ``refresh_graphrag_index`` 与引擎自然 refresh_interval 兜底。
+    GRAPHRAG_DELETE_FORCE_REFRESH=1 或后端不支持 refresh 参数时回退旧行为。
+    """
+    conn = settings.docStoreConn
+    if GraphRAGConfig.GRAPHRAG_DELETE_FORCE_REFRESH or not _delete_supports_refresh(conn):
+        return await thread_pool_exec(conn.delete, condition, search.index_name(tenant_id), kb_id)
+    return await thread_pool_exec(conn.delete, condition, search.index_name(tenant_id), kb_id, refresh=False)
 
 
 async def _delete_relation_edges_bulk(
@@ -123,14 +170,13 @@ async def _delete_relation_edges_bulk(
         for attempt in range(max_retries):
             try:
                 async with _utils.chat_limiter:
-                    await thread_pool_exec(
-                        settings.docStoreConn.delete,
+                    await _docstore_delete(
                         {
                             "knowledge_graph_kwd": ["relation"],
                             "from_entity_kwd": from_node,
                             "to_entity_kwd": to_batch,
                         },
-                        search.index_name(tenant_id),
+                        tenant_id,
                         kb_id,
                     )
                 break
@@ -156,16 +202,15 @@ async def write_merge_state(
     extra: dict | None = None,
 ):
     """写入文档的合并状态。同一 doc_id 的旧记录会被删除后再写入新记录。"""
-    # 清理旧记录
+    # 清理旧记录（refresh=false；可见性由阶段末 refresh_graphrag_index 兜底）
     try:
-        await thread_pool_exec(
-            settings.docStoreConn.delete,
+        await _docstore_delete(
             {
                 "knowledge_graph_kwd": ["merge_state"],
                 "source_id": [doc_id],
                 "kb_id": kb_id,
             },
-            search.index_name(tenant_id),
+            tenant_id,
             kb_id,
         )
     except Exception:
@@ -196,9 +241,10 @@ async def write_merge_state(
         search.index_name(tenant_id),
         kb_id,
     )
-    # Refresh so a concurrent is_doc_merged / query_merge_state (retry or
-    # KG-PP overlap) does not read a stale merge_state record.
-    await _post_insert_refresh(tenant_id, label="write_merge_state")
+    # 不再逐次 refresh：resume 判重（is_doc_merged）只读终态 "merged"，其写入到下一次
+    # 读取之间至少相隔一个文档的 merge（分钟级），ES 自然 refresh_interval 与阶段末
+    # refresh_graphrag_index 已保证可见性。
+
 
 
 async def query_merge_state(
@@ -1125,10 +1171,9 @@ async def _pre_delete_added_updated(
         sorted_nodes = sorted(change.added_updated_nodes)
         for i in range(0, len(sorted_nodes), BATCH_SIZE):
             batch = sorted_nodes[i:i + BATCH_SIZE]
-            await thread_pool_exec(
-                settings.docStoreConn.delete,
+            await _docstore_delete(
                 {"knowledge_graph_kwd": ["entity"], "entity_kwd": batch},
-                search.index_name(tenant_id),
+                tenant_id,
                 kb_id
             )
 
@@ -1199,10 +1244,9 @@ async def set_graph_delta(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
         sorted_nodes = sorted(change.removed_nodes)
         for i in range(0, len(sorted_nodes), BATCH_SIZE):
             batch = sorted_nodes[i:i + BATCH_SIZE]
-            await thread_pool_exec(
-                settings.docStoreConn.delete,
+            await _docstore_delete(
                 {"knowledge_graph_kwd": ["entity"], "entity_kwd": batch},
-                search.index_name(tenant_id),
+                tenant_id,
                 kb_id
             )
 

@@ -15,7 +15,7 @@
 | `rag_graphrag_general_index.py.patch` | `rag/graphrag/general/index.py` | 激活 GraphRAG incremental patch |
 | `rag_graphrag_utils.py.patch` | `rag/graphrag/utils.py` | 增量图读写路由 dispatch |
 | `rag_svr_task_executor.py.patch` | `rag/svr/task_executor.py` | 激活 task_executor 扩展 patch |
-| `rag_utils_es_conn.py.patch` | `rag/utils/es_conn.py` | ES bulk insert 去掉 `refresh=wait_for`（可见性由调用方显式 refresh 保证） |
+| `rag_utils_es_conn.py.patch` | `rag/utils/es_conn.py` | ES bulk insert 去掉 `refresh=wait_for`；`delete` 增加 `refresh` 参数（GraphRAG merge 热路径传 `refresh=false`，可见性由调用方阶段末显式 refresh 保证） |
 | `web_src_locales_en.ts.patch` | `web/src/locales/en.ts` | `totalChunks` i18n key |
 | `web_src_locales_zh.ts.patch` | `web/src/locales/zh.ts` | `totalChunks` i18n key |
 | `web_src_pages_dataset_dataset-overview_index.tsx.patch` | `web/src/pages/dataset/dataset-overview/index.tsx` | Total chunks StatCard UI |

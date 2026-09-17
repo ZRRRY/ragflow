@@ -89,6 +89,7 @@ from rag.graphrag.utils_extras import (
     query_existing_entities,
     query_existing_relations,
     query_node_relations,
+    refresh_graphrag_index,
     set_graph,
     write_merge_state,
 )
@@ -544,16 +545,17 @@ async def run_graphrag_for_kb(
                                 msg=f"[GraphRAG] merge_subgraph doc:{doc_id} already merged, skipping retry."
                             )
                             return None
-                        # Only mark as merging when we are actually going to merge,
-                        # otherwise an already-merged doc would be overwritten with "merging".
-                        await write_merge_state(
-                            tenant_id,
-                            kb_id,
-                            doc_id,
-                            state="merging",
-                            expected_nodes=len(sg.nodes),
-                            expected_edges=len(sg.edges),
-                        )
+                        # 中间态 "merging" 默认不再写入（GRAPHRAG_MERGE_STATE_MARK_MERGING=0）：
+                        # 每 doc 省一次 delete+insert；resume 判重只依赖终态 "merged"。
+                        if GraphRAGConfig.GRAPHRAG_MERGE_STATE_MARK_MERGING:
+                            await write_merge_state(
+                                tenant_id,
+                                kb_id,
+                                doc_id,
+                                state="merging",
+                                expected_nodes=len(sg.nodes),
+                                expected_edges=len(sg.edges),
+                            )
                     else:
                         # Official full-graph path: load global graph and check source_id.
                         current_graph = await get_graph(tenant_id, kb_id)
@@ -614,6 +616,11 @@ async def run_graphrag_for_kb(
                         expected_nodes=len(sg.nodes),
                         expected_edges=len(sg.edges),
                     )
+
+        # 整批 merge 结束后做一次显式 refresh：per-doc/per-window 的 refresh 均已关闭，
+        # 这里是本阶段写入对下游（pagerank recalc / resolution / KG 查询）可见性的保证点。
+        if ok_docs:
+            await refresh_graphrag_index(tenant_id, callback=callback, label="merge_batch_end")
 
         if ok_docs and final_graph is None:
             callback(msg=f"[GraphRAG] dataset:{kb_id} merge finished (no in-memory graph returned).")
@@ -1771,6 +1778,7 @@ async def resolve_entities_incremental(
     )
 
     await set_graph(tenant_id, kb_id, embed_bdl, reso.graph, change, callback)
+    await refresh_graphrag_index(tenant_id, callback=callback, label="resolution_end")
     await cleanup_checkpoints(tenant_id, kb_id, RESOLUTION_CHECKPOINT)
     now = asyncio.get_running_loop().time()
     logging.info("[P3] incremental resolution done in %.2fs.", now - start)
@@ -1888,6 +1896,7 @@ async def _extract_community_core(
             logging.exception("Failed to prune %d stale community reports for kb %s", len(stale_ids), kb_id)
 
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled after community indexing.", callback)
+    await refresh_graphrag_index(tenant_id, callback=callback, label="community_end")
     await cleanup_checkpoints(tenant_id, kb_id, COMMUNITY_CHECKPOINT)
 
     now = asyncio.get_running_loop().time()

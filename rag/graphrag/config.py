@@ -60,9 +60,18 @@ class GraphRAGConfig:
     # 字符级 fallback：候选对总数上限，达到后停止扫描（防 OOM）
     RESOLUTION_CHAR_MAX_CANDIDATES = int(os.environ.get("RESOLUTION_CHAR_MAX_CANDIDATES", "5000"))
     # set_graph_delta 末尾是否主动 refresh（与 bulk refresh="false" 配套）。
-    # 1=insert 后立即 refresh（下游 query 立即可见，~1s 阻塞开销）
-    # 0=依赖 ES 默认 refresh_interval（1s 自然 flush，下游 query 短暂 stale）
-    SET_GRAPH_DELTA_REFRESH_AFTER_INSERT = os.environ.get("SET_GRAPH_DELTA_REFRESH_AFTER_INSERT", "1") == "1"
+    # 1=每次 insert 后立即 refresh（下游 query 立即可见，~1s 阻塞开销，每 doc 一次）
+    # 0=依赖 ES 默认 refresh_interval（1s 自然 flush）；merge/resolution/community
+    #   各阶段末尾会做一次显式 refresh（refresh_graphrag_index）兜底可见性。
+    SET_GRAPH_DELTA_REFRESH_AFTER_INSERT = os.environ.get("SET_GRAPH_DELTA_REFRESH_AFTER_INSERT", "0") == "1"
+    # merge 热路径 delete_by_query 是否强制 refresh=true。
+    # 0=不强制（refresh=false；可见性由阶段末显式 refresh + 1s 自然刷新兜底）
+    # 1=恢复旧行为（每次删除强制索引级 refresh，大索引上开销显著）
+    GRAPHRAG_DELETE_FORCE_REFRESH = os.environ.get("GRAPHRAG_DELETE_FORCE_REFRESH", "0") == "1"
+    # 是否在每篇文档 merge 前写入中间态 merge_state="merging"。
+    # 0=只写终态（merged/failed），每 doc 省一次 delete+insert；resume 判重只读 "merged"
+    # 1=恢复旧行为（merge 前先写 "merging"，仅用于调试观察）
+    GRAPHRAG_MERGE_STATE_MARK_MERGING = os.environ.get("GRAPHRAG_MERGE_STATE_MARK_MERGING", "0") == "1"
     # search_with_scroll 单次查询返回 hits 上限，防止大 KB 全图加载时 worker OOM。
     # 默认值 50000 保持与原硬编码一致；超大 KB 可通过环境变量提高。
     SEARCH_WITH_SCROLL_HITS_CAP = int(os.environ.get("GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP", "50000"))

@@ -139,7 +139,7 @@ def make_audited_delete(original_delete):
     """Build a wrapper that audits KG deletes but is otherwise identical."""
 
     @functools.wraps(original_delete)
-    def audited_delete(condition, indexName, knowledgebaseId):
+    def audited_delete(condition, indexName, knowledgebaseId, **kwargs):
         try:
             is_audited, key_fields, matched = _is_audited(condition)
             if is_audited:
@@ -155,7 +155,7 @@ def make_audited_delete(original_delete):
         except Exception:
             # Audit must never block a real delete.
             _logger.debug("docStoreConn.delete audit hook failed (non-fatal)", exc_info=True)
-        return original_delete(condition, indexName, knowledgebaseId)
+        return original_delete(condition, indexName, knowledgebaseId, **kwargs)
 
     # Explicit marker attribute used by install() to detect already-wrapped
     # callables. Robust against monkeypatching of __name__ and against chains

@@ -529,7 +529,7 @@ class ESConnection(ESConnectionBase):
                 break
         return False
 
-    def delete(self, condition: dict, index_name: str, knowledgebase_id: str) -> int:
+    def delete(self, condition: dict, index_name: str, knowledgebase_id: str, refresh: bool = True) -> int:
         assert "_id" not in condition
         condition["kb_id"] = knowledgebase_id
 
@@ -575,7 +575,7 @@ class ESConnection(ESConnectionBase):
                 res = self.es.delete_by_query(
                     index=index_name,
                     body=Search().query(qry).to_dict(),
-                    refresh=True)
+                    refresh=refresh)
                 return res["deleted"]
             except ConnectionTimeout:
                 self.logger.exception("ES request timeout")

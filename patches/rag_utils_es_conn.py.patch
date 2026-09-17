@@ -1,5 +1,5 @@
 diff --git a/rag/utils/es_conn.py b/rag/utils/es_conn.py
-index eed2e67c2..7b776d5e0 100644
+index eed2e67c2..6d9e417e5 100644
 --- a/rag/utils/es_conn.py
 +++ b/rag/utils/es_conn.py
 @@ -322,8 +322,17 @@ class ESConnection(ESConnectionBase):
@@ -21,3 +21,21 @@ index eed2e67c2..7b776d5e0 100644
                  if re.search(r"False", str(r["errors"]), re.IGNORECASE):
                      return res
  
+@@ -520,7 +529,7 @@ class ESConnection(ESConnectionBase):
+                 break
+         return False
+ 
+-    def delete(self, condition: dict, index_name: str, knowledgebase_id: str) -> int:
++    def delete(self, condition: dict, index_name: str, knowledgebase_id: str, refresh: bool = True) -> int:
+         assert "_id" not in condition
+         condition["kb_id"] = knowledgebase_id
+ 
+@@ -566,7 +575,7 @@ class ESConnection(ESConnectionBase):
+                 res = self.es.delete_by_query(
+                     index=index_name,
+                     body=Search().query(qry).to_dict(),
+-                    refresh=True)
++                    refresh=refresh)
+                 return res["deleted"]
+             except ConnectionTimeout:
+                 self.logger.exception("ES request timeout")
