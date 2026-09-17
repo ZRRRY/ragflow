@@ -72,6 +72,9 @@ class GraphRAGConfig:
     # 0=只写终态（merged/failed），每 doc 省一次 delete+insert；resume 判重只读 "merged"
     # 1=恢复旧行为（merge 前先写 "merging"，仅用于调试观察）
     GRAPHRAG_MERGE_STATE_MARK_MERGING = os.environ.get("GRAPHRAG_MERGE_STATE_MARK_MERGING", "0") == "1"
+    # merge 前置存在性查询（query_existing_entities / query_existing_relations）的批间并发度。
+    # 1=恢复旧的串行批次行为；>1 时批次并发发出（对 ES 的瞬时查询压力随之线性上升）。
+    GRAPHRAG_QUERY_CONCURRENCY = int(os.environ.get("GRAPHRAG_QUERY_CONCURRENCY", "4"))
     # search_with_scroll 单次查询返回 hits 上限，防止大 KB 全图加载时 worker OOM。
     # 默认值 50000 保持与原硬编码一致；超大 KB 可通过环境变量提高。
     SEARCH_WITH_SCROLL_HITS_CAP = int(os.environ.get("GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP", "50000"))

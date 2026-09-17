@@ -1454,7 +1454,7 @@ async def merge_subgraph_incremental(
     node_names = list(subgraph.nodes())
 
     logging.info("[P2] Querying %d entities for existing data...", len(node_names))
-    existing_entities = await query_existing_entities(tenant_id, kb_id, node_names)
+    existing_entities = await query_existing_entities(tenant_id, kb_id, node_names, callback=callback)
     logging.info("[P2] Found %d existing entities.", len(existing_entities))
 
     delta_graph = nx.Graph()
@@ -1498,7 +1498,7 @@ async def merge_subgraph_incremental(
 
     edge_pairs = list(subgraph.edges())
     logging.info("[P2] Querying %d relations for existing data...", len(edge_pairs))
-    existing_relations = await query_existing_relations(tenant_id, kb_id, edge_pairs)
+    existing_relations = await query_existing_relations(tenant_id, kb_id, edge_pairs, callback=callback)
     logging.info("[P2] Found %d existing relations.", len(existing_relations))
 
     for source, target, attr in subgraph.edges(data=True):
@@ -1577,7 +1577,7 @@ async def resolve_entities_incremental(
         logging.info("[P3] No new nodes, skipping resolution.")
         return
 
-    new_node_fields = await query_existing_entities(tenant_id, kb_id, list(union_nodes))
+    new_node_fields = await query_existing_entities(tenant_id, kb_id, list(union_nodes), callback=callback)
 
     new_nodes_by_type = defaultdict(list)
     node_attrs = {}
@@ -1686,7 +1686,7 @@ async def resolve_entities_incremental(
         logging.info("[P3] No candidates found, skipping resolution.")
         return
 
-    neighbor_attrs = await query_existing_entities(tenant_id, kb_id, list(candidate_neighbors))
+    neighbor_attrs = await query_existing_entities(tenant_id, kb_id, list(candidate_neighbors), callback=callback)
 
     candidate_resolution = defaultdict(list)
     for a, b in candidate_pairs:

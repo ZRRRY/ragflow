@@ -35,6 +35,7 @@ from collections import defaultdict, deque
 import networkx as nx
 
 from common import settings
+from common.asyncio_utils import LoopLocalSemaphore
 from common.doc_store.doc_store_base import OrderByExpr
 from common.misc_utils import get_uuid, thread_pool_exec
 from rag.graphrag.config import GraphRAGConfig
@@ -76,6 +77,38 @@ _SET_GRAPH_STREAM_WINDOW = max(1, int(os.environ.get("GRAPHRAG_SET_GRAPH_STREAM_
 # requests in flight against the doc store.  Override with
 # GRAPHRAG_SET_GRAPH_PIPELINE_DEPTH.
 _SET_GRAPH_PIPELINE_DEPTH = max(1, int(os.environ.get("GRAPHRAG_SET_GRAPH_PIPELINE_DEPTH", 1)))
+
+# 存在性查询（query_existing_entities / query_existing_relations）的批间并发限流。
+# 独立于 chat_limiter（LLM/embedding 专用），避免与 embed 批互相排队。
+# 并发度由 GRAPHRAG_QUERY_CONCURRENCY 控制（默认 4）。
+_query_limiter = LoopLocalSemaphore(GraphRAGConfig.GRAPHRAG_QUERY_CONCURRENCY)
+
+
+class _QueryProgress:
+    """Throttled progress reporter for existence queries.
+
+    每批完成调用一次 ``advance``；至多每 ``interval`` 秒向 callback 上报一次，
+    最后一批必报，避免高频 set_progress 刷库。
+    """
+
+    def __init__(self, callback, label: str, total_batches: int, interval: float = 1.0):
+        self._callback = callback
+        self._label = label
+        self._total = total_batches
+        self._interval = interval
+        self._done = 0
+        self._last = 0.0
+
+    def advance(self, found: int) -> None:
+        self._done += 1
+        if not self._callback:
+            return
+        now = time.monotonic()
+        if self._done >= self._total or now - self._last >= self._interval:
+            self._last = now
+            self._callback(
+                msg=f"Querying existing {self._label}: {self._done}/{self._total} batches done, {found} found"
+            )
 
 
 async def _post_insert_refresh(tenant_id: str, callback=None, label: str = "set_graph", force: bool = False):
@@ -295,19 +328,23 @@ async def is_doc_merged(tenant_id: str, kb_id: str, doc_id: str) -> bool:
     return state_meta is not None and state_meta.get("state") == "merged"
 
 
-async def query_existing_entities(tenant_id, kb_id, node_names):
+async def query_existing_entities(tenant_id, kb_id, node_names, callback=None):
     """Batch-query existing entity documents from the doc store by name.
 
     Returns a dict mapping ``entity_name -> doc fields``.
+
+    批次间按 ``GRAPHRAG_QUERY_CONCURRENCY`` 有界并发（旧行为为串行循环）；
+    单批失败仅告警跳过（与旧行为一致）。callback 非空时每批完成后节流上报进度。
     """
     if not node_names:
         return {}
 
     BATCH_SIZE = 100
+    batches = [(i, node_names[i:i + BATCH_SIZE]) for i in range(0, len(node_names), BATCH_SIZE)]
     existing = {}
+    progress = _QueryProgress(callback, "entities", len(batches))
 
-    for i in range(0, len(node_names), BATCH_SIZE):
-        batch = node_names[i:i + BATCH_SIZE]
+    async def _query_batch(i, batch):
         conds = {
             "fields": ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"],
             "size": len(batch),
@@ -315,7 +352,8 @@ async def query_existing_entities(tenant_id, kb_id, node_names):
             "entity_kwd": batch,
         }
         try:
-            es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
+            async with _query_limiter:
+                es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
             for id in es_res.ids:
                 fields = es_res.field[id]
                 ent_name = fields.get("entity_kwd")
@@ -325,11 +363,13 @@ async def query_existing_entities(tenant_id, kb_id, node_names):
                     existing[ent_name] = fields
         except Exception as e:
             logging.warning("query_existing_entities batch %d failed: %s", i, e)
+        progress.advance(len(existing))
 
+    await asyncio.gather(*(_query_batch(i, batch) for i, batch in batches))
     return existing
 
 
-async def query_existing_relations(tenant_id, kb_id, edge_pairs):
+async def query_existing_relations(tenant_id, kb_id, edge_pairs, callback=None):
     """Batch-query existing relation documents from the doc store.
 
     ``edge_pairs`` is a list of ``(from_node, to_node)`` tuples.
@@ -337,6 +377,9 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
 
     Phase 2.3: 用 search_after 分页代替 ``size: 10000`` 硬卡，绕开 OS / ES
     的 max_result_window 截断。后端不支持 search_after 时回退到旧路径。
+
+    批次间按 ``GRAPHRAG_QUERY_CONCURRENCY`` 有界并发（旧行为为串行循环）；
+    单批失败仅告警跳过（与旧行为一致）。callback 非空时每批完成后节流上报进度。
     """
     if not edge_pairs:
         return {}
@@ -355,11 +398,12 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
     SEARCH_AFTER_PAGE_SIZE = 1000
     index_name = search.index_name(tenant_id)
     existing: dict = {}
+    batches = [(i, edge_pairs[i:i + INPUT_BATCH_SIZE]) for i in range(0, len(edge_pairs), INPUT_BATCH_SIZE)]
+    progress = _QueryProgress(callback, "relations", len(batches))
 
     # 每个 batch 单独发 search_after 翻页查询，filter 与旧实现保持一致
     # (from_entity_kwd ∈ all_nodes AND to_entity_kwd ∈ all_nodes)
-    for i in range(0, len(edge_pairs), INPUT_BATCH_SIZE):
-        batch = edge_pairs[i:i + INPUT_BATCH_SIZE]
+    async def _query_batch(i, batch):
         all_nodes = list(set(u for u, v in batch) | set(v for u, v in batch))
 
         filters = {
@@ -367,20 +411,21 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
             "from_entity_kwd": all_nodes,
             "to_entity_kwd": all_nodes,
         }
+        hits = None
         try:
-            hits = await _collect_all_search_after(
-                filters=filters,
-                index_name=index_name,
-                kb_id=kb_id,
-                fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
-                sort_field="from_entity_kwd",
-                page_size=SEARCH_AFTER_PAGE_SIZE,
-            )
+            async with _query_limiter:
+                hits = await _collect_all_search_after(
+                    filters=filters,
+                    index_name=index_name,
+                    kb_id=kb_id,
+                    fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+                    sort_field="from_entity_kwd",
+                    page_size=SEARCH_AFTER_PAGE_SIZE,
+                )
         except Exception as e:
             logging.warning("query_existing_relations batch %d search_after failed: %s", i, e)
-            continue
 
-        for fields in hits:
+        for fields in hits or []:
             # search_after 返回的 doc 不一定带 id（取决于 _source 投影），从 fields 中取
             from_node = fields.get("from_entity_kwd")
             to_node = fields.get("to_entity_kwd")
@@ -391,7 +436,9 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs):
             if from_node and to_node:
                 key = _utils.get_from_to(from_node, to_node)
                 existing[key] = fields
+        progress.advance(len(existing))
 
+    await asyncio.gather(*(_query_batch(i, batch) for i, batch in batches))
     return existing
 
 
