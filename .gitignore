@@ -248,3 +248,6 @@ docs/graphrag_review/
 .run/
 .omc/
 .marscode/
+
+# Local LLM credentials for the standalone summarize script
+tools/scripts/summarize_entity_description.config.json

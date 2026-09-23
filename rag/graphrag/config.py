@@ -75,6 +75,23 @@ class GraphRAGConfig:
     # merge 前置存在性查询（query_existing_entities / query_existing_relations）的批间并发度。
     # 1=恢复旧的串行批次行为；>1 时批次并发发出（对 ES 的瞬时查询压力随之线性上升）。
     GRAPHRAG_QUERY_CONCURRENCY = int(os.environ.get("GRAPHRAG_QUERY_CONCURRENCY", "4"))
+    # 关系存在性查询是否按 from_entity 精确分组（消除批内 from×to 笛卡尔放大）。
+    # 1=精确（每个 from_node 一次 from=u AND to∈targets 查询，命中集恰为所需边，
+    #   查询成本不随全局图规模增长）；0=旧行为（批内全部节点互查）。
+    GRAPHRAG_REL_QUERY_EXACT = os.environ.get("GRAPHRAG_REL_QUERY_EXACT", "1") == "1"
+    # merge 属性合并是否幂等 + 跳过无变化实体/边（不进 delete/embed/insert）。
+    # 1=幂等合并（description 按 <SEP> 片段去重、同 doc 重复合并不再累加 weight），
+    #   合并结果与索引一致的项直接跳过——重试/续跑/重跑成本趋近于零；
+    # 0=旧行为（无条件拼接/累加 + 全量重写）。
+    GRAPHRAG_MERGE_SKIP_UNCHANGED = os.environ.get("GRAPHRAG_MERGE_SKIP_UNCHANGED", "1") == "1"
+    # 进度回调异步化：取消检查仍同步走 Redis（~0.1ms），MySQL 进度写投入专用
+    # 单线程执行器（有界队列 64，溢出丢弃；终态 prog<0/>=1.0 同步透传不丢）。
+    # 消除 update_progress（每次调用 5 次往返 + 2 次 autocommit，WSL2 磁盘下
+    # 实测单次 4-23s）对事件循环的串行阻塞。1=开启；0=旧行为（同步写库）。
+    GRAPHRAG_ASYNC_PROGRESS = os.environ.get("GRAPHRAG_ASYNC_PROGRESS", "1") == "1"
+    # KG chunk 分词的描述截断字符数（content_ltks 仅供存储兜底，KG 检索不读该字段）。
+    # 默认 4096：超长累积描述的分词 CPU 从 O(全文) 降为 O(上限)；0=不截断（旧行为）。
+    GRAPHRAG_TOKENIZE_DESC_MAX_CHARS = int(os.environ.get("GRAPHRAG_TOKENIZE_DESC_MAX_CHARS", "4096"))
     # search_with_scroll 单次查询返回 hits 上限，防止大 KB 全图加载时 worker OOM。
     # 默认值 50000 保持与原硬编码一致；超大 KB 可通过环境变量提高。
     SEARCH_WITH_SCROLL_HITS_CAP = int(os.environ.get("GRAPHRAG_SEARCH_WITH_SCROLL_HITS_CAP", "50000"))

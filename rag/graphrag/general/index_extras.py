@@ -81,6 +81,7 @@ from rag.graphrag.utils import (
 )
 from rag.graphrag.utils_extras import (
     GraphTopologyTruncatedError,
+    _AsyncCallback,
     does_graph_contains,
     get_graph,
     get_graph_from_index,
@@ -194,6 +195,10 @@ async def run_graphrag_for_kb(
 ) -> dict:
     tenant_id, kb_id = row["tenant_id"], row["kb_id"]
     task_id = row["id"]
+    # 进度回调异步化（GRAPHRAG_ASYNC_PROGRESS）：MySQL 进度写移出事件循环，
+    # 取消检查/终态透传保持同步；详见 utils_extras._AsyncCallback。
+    if GraphRAGConfig.GRAPHRAG_ASYNC_PROGRESS and callback and task_id:
+        callback = _AsyncCallback(callback, task_id)
     start = asyncio.get_running_loop().time()
     fields_for_chunks = ["content_with_weight", "doc_id"]
     graphrag_config = kb_parser_config.get("graphrag", {})
@@ -1457,6 +1462,9 @@ async def merge_subgraph_incremental(
     existing_entities = await query_existing_entities(tenant_id, kb_id, node_names, callback=callback)
     logging.info("[P2] Found %d existing entities.", len(existing_entities))
 
+    # 变化检测开关：幂等合并（描述去重）+ 合并结果与索引一致时跳过 delete/embed/insert
+    skip_unchanged = GraphRAGConfig.GRAPHRAG_MERGE_SKIP_UNCHANGED
+
     delta_graph = nx.Graph()
     delta_graph.graph["source_id"] = list(subgraph.graph.get("source_id", []))
 
@@ -1472,9 +1480,17 @@ async def merge_subgraph_incremental(
             new_desc = attr.get("description", "")
             if new_desc:
                 old_desc = merged_attr.get("description", "")
-                merged_attr["description"] = (
-                    old_desc + GRAPH_FIELD_SEP + new_desc if old_desc else new_desc
-                )
+                if skip_unchanged:
+                    # 幂等：按 <SEP> 片段去重，只追加未出现过的描述
+                    old_parts = [p for p in old_desc.split(GRAPH_FIELD_SEP) if p]
+                    new_parts = [p for p in new_desc.split(GRAPH_FIELD_SEP) if p]
+                    add_parts = [p for p in new_parts if p not in old_parts]
+                    if add_parts:
+                        merged_attr["description"] = GRAPH_FIELD_SEP.join(old_parts + add_parts)
+                else:
+                    merged_attr["description"] = (
+                        old_desc + GRAPH_FIELD_SEP + new_desc if old_desc else new_desc
+                    )
             old_sources = set(merged_attr.get("source_id", []))
             new_sources = set(attr.get("source_id", []))
             merged_attr["source_id"] = sorted(old_sources | new_sources)
@@ -1488,7 +1504,9 @@ async def merge_subgraph_incremental(
                 merged_attr["pagerank"] = old_meta.get("pagerank", 0.001)
 
             delta_graph.add_node(node_name, **merged_attr)
-            change.added_updated_nodes.add(node_name)
+            # 合并结果与索引一致：无新增描述/来源/字段，跳过该节点的删/嵌/写
+            if not skip_unchanged or merged_attr != old_meta:
+                change.added_updated_nodes.add(node_name)
         else:
             new_attr = dict(attr)
             if "pagerank" not in new_attr:
@@ -1511,28 +1529,49 @@ async def merge_subgraph_incremental(
                 old_meta = {}
 
             merged_attr = dict(old_meta)
-            merged_attr["weight"] = merged_attr.get("weight", 0) + attr.get("weight", 0)
-            new_desc = attr.get("description", "")
-            if new_desc:
-                old_desc = merged_attr.get("description", "")
-                merged_attr["description"] = (
-                    old_desc + GRAPH_FIELD_SEP + new_desc if old_desc else new_desc
-                )
+            old_sources = set(merged_attr.get("source_id", []))
+            new_sources = set(attr.get("source_id", []))
+            # 幂等语义：本 doc 已贡献过该边（source_id 覆盖）时不再重复累加 weight/拼接描述。
+            # skip_unchanged=0 时退化为旧行为（无条件累加/拼接）。
+            already_contributed = skip_unchanged and bool(new_sources) and new_sources <= old_sources
+            if not already_contributed:
+                merged_attr["weight"] = merged_attr.get("weight", 0) + attr.get("weight", 0)
+                new_desc = attr.get("description", "")
+                if new_desc:
+                    old_desc = merged_attr.get("description", "")
+                    if skip_unchanged:
+                        old_parts = [p for p in old_desc.split(GRAPH_FIELD_SEP) if p]
+                        add_parts = [p for p in new_desc.split(GRAPH_FIELD_SEP) if p and p not in old_parts]
+                        if add_parts:
+                            merged_attr["description"] = GRAPH_FIELD_SEP.join(old_parts + add_parts)
+                    else:
+                        merged_attr["description"] = (
+                            old_desc + GRAPH_FIELD_SEP + new_desc if old_desc else new_desc
+                        )
             old_kw = set(merged_attr.get("keywords", []))
             new_kw = set(attr.get("keywords", []))
             merged_attr["keywords"] = sorted(old_kw | new_kw)
-            old_sources = set(merged_attr.get("source_id", []))
-            new_sources = set(attr.get("source_id", []))
             merged_attr["source_id"] = sorted(old_sources | new_sources)
             for k, v in attr.items():
                 if k not in merged_attr:
                     merged_attr[k] = v
 
             delta_graph.add_edge(source, target, **merged_attr)
-            change.added_updated_edges.add(edge_key)
+            # 变化检测：合并结果与索引一致则跳过该边的删/嵌/写
+            if not skip_unchanged or merged_attr != old_meta:
+                change.added_updated_edges.add(edge_key)
         else:
             delta_graph.add_edge(source, target, **attr)
             change.added_updated_edges.add(edge_key)
+
+    logging.info(
+        "[P2] change detection: %d/%d nodes and %d/%d edges changed (skip_unchanged=%s).",
+        len(change.added_updated_nodes),
+        len(node_names),
+        len(change.added_updated_edges),
+        len(edge_pairs),
+        skip_unchanged,
+    )
 
     for node_name in delta_graph.nodes:
         delta_graph.nodes[node_name]["rank"] = int(delta_graph.degree(node_name))

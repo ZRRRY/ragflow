@@ -1,5 +1,5 @@
 diff --git a/.gitignore b/.gitignore
-index d289bd94e..7eb6665c1 100644
+index d289bd94e..a31969a50 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -52,6 +52,7 @@ uv-x86_64*.tar.gz
@@ -10,7 +10,7 @@ index d289bd94e..7eb6665c1 100644
  
  # OceanBase data and conf
  docker/oceanbase/conf
-@@ -237,7 +238,13 @@ bin/*
+@@ -237,7 +238,16 @@ bin/*
  !bin/.gitkeep
  .claude/settings.local.json
  
@@ -25,3 +25,6 @@ index d289bd94e..7eb6665c1 100644
 +.run/
  .omc/
  .marscode/
++
++# Local LLM credentials for the standalone summarize script
++tools/scripts/summarize_entity_description.config.json

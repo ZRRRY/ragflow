@@ -29,11 +29,15 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 import networkx as nx
 
+from api.db.services.task_service import has_canceled
 from common import settings
 from common.asyncio_utils import LoopLocalSemaphore
 from common.doc_store.doc_store_base import OrderByExpr
@@ -109,6 +113,72 @@ class _QueryProgress:
             self._callback(
                 msg=f"Querying existing {self._label}: {self._done}/{self._total} batches done, {found} found"
             )
+
+
+# 进度回调异步化（GRAPHRAG_ASYNC_PROGRESS）：MySQL 进度写（update_progress，
+# 每次调用 5 次往返 + 2 次 autocommit，WSL2 磁盘下实测单次 4-23s）不再阻塞
+# 事件循环。取消检查保持同步（Redis GET，~0.1ms），语义与原 set_progress 一致；
+# 终态（prog<0 或 >=1.0）同步透传，不丢不乱序；其余进度写由单线程执行器按
+# 提交顺序落库，队列有界，溢出丢弃——遥测允许有损，数据面不受影响。
+_progress_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="graphrag-progress")
+
+
+class _AsyncCallback:
+    """进度回调包装器：取消检查同步走 Redis，MySQL 进度写异步落库。"""
+
+    def __init__(self, callback, task_id: str, max_pending: int = 64):
+        self._callback = callback
+        self._task_id = task_id
+        self._max_pending = max_pending
+        self._pending = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, *args, **kwargs):
+        if self._task_id and has_canceled(self._task_id):
+            # 与原 set_progress 语义一致：同步落库 [Canceled] 标记后抛出
+            # TaskCanceledException。取消是稀有终态，同步成本可接受。
+            self._callback(*args, **kwargs)
+            return
+        prog = kwargs.get("prog")
+        if prog is not None and (prog < 0 or prog >= 1.0):
+            # 终态进度同步透传：不丢、不乱序（每个任务至多一次）。
+            self._callback(*args, **kwargs)
+            return
+        with self._lock:
+            if self._pending >= self._max_pending:
+                return
+            self._pending += 1
+        _progress_writer.submit(self._drain, args, kwargs)
+
+    def _drain(self, args, kwargs) -> None:
+        try:
+            self._callback(*args, **kwargs)
+        except Exception:
+            # 遥测写失败不得冒泡；取消由 __call__ 的同步检查负责传播。
+            logger.exception("async progress write failed (task_id=%s)", self._task_id)
+        finally:
+            with self._lock:
+                self._pending -= 1
+
+
+# KG chunk 的 content_ltks/content_sm_ltks 分词辅助：
+# KG 检索（rag/graphrag/search.py）不读 content_ltks，该字段仅作存储兜底，
+# 因此超长累积描述按 GRAPHRAG_TOKENIZE_DESC_MAX_CHARS 截断后再分词。
+# lru_cache 按文本去重——change detection 后大量 chunk 的描述文本跨 doc 重复，
+# 分词是 GIL 内的纯 CPU 操作（实测线程池无法并行），缓存是最有效的削减。
+# 注意缓存的是分词结果而非输入本身，单条占内存很小。
+@lru_cache(maxsize=5000)
+def _cached_tokenize_pair(text: str) -> tuple[str, str]:
+    ltks = rag_tokenizer.tokenize(text)
+    return ltks, rag_tokenizer.fine_grained_tokenize(ltks)
+
+
+def _tokenize_kg_description(text: str) -> tuple[str, str]:
+    """对 KG chunk 描述做（截断+缓存）分词，返回 (content_ltks, content_sm_ltks)。"""
+    cap = GraphRAGConfig.GRAPHRAG_TOKENIZE_DESC_MAX_CHARS
+    if cap and len(text) > cap:
+        text = text[:cap]
+    return _cached_tokenize_pair(text)
 
 
 async def _post_insert_refresh(tenant_id: str, callback=None, label: str = "set_graph", force: bool = False):
@@ -375,11 +445,13 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs, callback=None):
     ``edge_pairs`` is a list of ``(from_node, to_node)`` tuples.
     Returns a dict mapping ``(from, to) -> doc fields``.
 
-    Phase 2.3: 用 search_after 分页代替 ``size: 10000`` 硬卡，绕开 OS / ES
-    的 max_result_window 截断。后端不支持 search_after 时回退到旧路径。
+    精确路径（默认，``GRAPHRAG_REL_QUERY_EXACT=1``）：按 from_node 分组，每组一次
+    ``from=u AND to∈targets`` 查询，命中集恰为所需边——查询成本只取决于 u 在
+    本文档中的度数，不随全局图规模增长。旧批内互查路径保留为回退；后端不支持
+    search_after 时走 legacy size 截断路径。
 
-    批次间按 ``GRAPHRAG_QUERY_CONCURRENCY`` 有界并发（旧行为为串行循环）；
-    单批失败仅告警跳过（与旧行为一致）。callback 非空时每批完成后节流上报进度。
+    组间按 ``GRAPHRAG_QUERY_CONCURRENCY`` 有界并发；单组失败仅告警跳过。
+    callback 非空时每组完成后节流上报进度。
     """
     if not edge_pairs:
         return {}
@@ -388,7 +460,65 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs, callback=None):
     if not _supports_search_after(conn):
         # Fallback: 旧 size 截断路径
         return await _query_existing_relations_legacy(tenant_id, kb_id, edge_pairs)
+    if not GraphRAGConfig.GRAPHRAG_REL_QUERY_EXACT:
+        return await _query_existing_relations_amplified(tenant_id, kb_id, edge_pairs, callback=callback)
 
+    index_name = search.index_name(tenant_id)
+    existing: dict = {}
+
+    # 按 from_node 分组（同组内 (from,to) 去重）：from=u AND to∈targets 的
+    # 每条命中都是请求过的边，无笛卡尔放大。
+    buckets: dict[str, set[str]] = defaultdict(set)
+    for from_node, to_node in edge_pairs:
+        buckets[from_node].add(to_node)
+    groups = sorted(buckets.items())
+    progress = _QueryProgress(callback, "relations", len(groups))
+
+    async def _query_from(from_node, to_nodes):
+        filters = {
+            "knowledge_graph_kwd": ["relation"],
+            "from_entity_kwd": [from_node],
+            "to_entity_kwd": sorted(to_nodes),
+        }
+        hits = None
+        try:
+            async with _query_limiter:
+                hits = await _collect_all_search_after(
+                    filters=filters,
+                    index_name=index_name,
+                    kb_id=kb_id,
+                    fields=["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
+                    sort_field="from_entity_kwd",
+                    page_size=1000,
+                )
+        except Exception as e:
+            logging.warning("query_existing_relations from=%s failed: %s", from_node, e)
+
+        for fields in hits or []:
+            # search_after 返回的 doc 不一定带 id（取决于 _source 投影），从 fields 中取
+            hit_from = fields.get("from_entity_kwd")
+            hit_to = fields.get("to_entity_kwd")
+            if isinstance(hit_from, list):
+                hit_from = hit_from[0]
+            if isinstance(hit_to, list):
+                hit_to = hit_to[0]
+            if hit_from and hit_to:
+                key = _utils.get_from_to(hit_from, hit_to)
+                existing[key] = fields
+        progress.advance(len(existing))
+
+    await asyncio.gather(*(_query_from(from_node, to_nodes) for from_node, to_nodes in groups))
+    return existing
+
+
+async def _query_existing_relations_amplified(tenant_id, kb_id, edge_pairs, callback=None):
+    """旧批内互查路径（``GRAPHRAG_REL_QUERY_EXACT=0`` 时启用）。
+
+    每批 50 对边取并集节点互查（from∈all AND to∈all），命中集随全局图密度
+    超线性增长。仅保留作为回退，不建议长期使用。
+
+    批次间按 ``GRAPHRAG_QUERY_CONCURRENCY`` 有界并发；单批失败仅告警跳过。
+    """
     # INPUT_BATCH_SIZE: 每次喂入 query 的 edge_pairs 数量(输入维度)。
     # 注意:实际 ES 单次 search_after round-trip 的 filter 范围 =
     # |union(batch from_nodes ∪ to_nodes)|(可能远大于 INPUT_BATCH_SIZE,
@@ -1043,6 +1173,7 @@ async def _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback=No
 
     for node in change.added_updated_nodes:
         node_attrs = graph.nodes[node]
+        desc_ltks, desc_sm_ltks = _tokenize_kg_description(node_attrs.get("description", ""))
         chunk = {
             "id": get_uuid(),
             "important_kwd": [node],
@@ -1051,13 +1182,13 @@ async def _batch_embed_nodes(kb_id, embd_mdl, graph, change, chunks, callback=No
             "knowledge_graph_kwd": "entity",
             "entity_type_kwd": node_attrs.get("entity_type", ""),
             "content_with_weight": json.dumps(node_attrs, ensure_ascii=False),
-            "content_ltks": rag_tokenizer.tokenize(node_attrs.get("description", "")),
+            "content_ltks": desc_ltks,
             "source_id": node_attrs.get("source_id", []),
             "kb_id": kb_id,
             "available_int": 0,
             "removed_kwd": "N",
         }
-        chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
+        chunk["content_sm_ltks"] = desc_sm_ltks
         # Preserve the fields expected by v0.26.0 KGSearch / UI
         chunk["rank_flt"] = float(node_attrs.get("pagerank", 0) or 0)
         chunk["n_hop_with_weight"] = json.dumps(_utils.n_neighbor(graph, node) or [], ensure_ascii=False)
@@ -1097,13 +1228,14 @@ async def _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback=No
         edge_attrs = graph.get_edge_data(from_node, to_node)
         if not edge_attrs:
             continue
+        desc_ltks, desc_sm_ltks = _tokenize_kg_description(edge_attrs.get("description", ""))
         chunk = {
             "id": get_uuid(),
             "from_entity_kwd": from_node,
             "to_entity_kwd": to_node,
             "knowledge_graph_kwd": "relation",
             "content_with_weight": json.dumps(edge_attrs, ensure_ascii=False),
-            "content_ltks": rag_tokenizer.tokenize(edge_attrs.get("description", "")),
+            "content_ltks": desc_ltks,
             "important_kwd": edge_attrs.get("keywords", []),
             "source_id": edge_attrs.get("source_id", []),
             "weight_int": int(edge_attrs.get("weight", 0)),
@@ -1111,7 +1243,7 @@ async def _batch_embed_edges(kb_id, embd_mdl, graph, change, chunks, callback=No
             "available_int": 0,
             "removed_kwd": "N",
         }
-        chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
+        chunk["content_sm_ltks"] = desc_sm_ltks
         # 与书籍/章节相关的结构关系不需要语义向量，直接入库；不进入批量 embedding。
         from_type = graph.nodes[from_node].get("entity_type")
         to_type = graph.nodes[to_node].get("entity_type")
