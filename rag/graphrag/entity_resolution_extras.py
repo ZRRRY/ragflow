@@ -64,6 +64,8 @@ def build_excluded_types(excluded_from_config: list[str] | None = None) -> set[s
     are handled the same way as the Chinese defaults.
     """
     result: set[str] = set(EXCLUDED_RESOLUTION_TYPES)
+    for aliases in _EXCLUDED_TYPE_ALIASES.values():
+        result.update(aliases)
     if not excluded_from_config:
         return result
     for cfg_type in excluded_from_config:

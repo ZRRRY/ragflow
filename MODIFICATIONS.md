@@ -26,17 +26,17 @@ git diff <旧tag>..<新tag> -- <官方文件>
 
 | # | 定制位置 | 复制/依赖的官方逻辑 | 需 diff 的官方文件 | 风险等级 | 最近核对 |
 |---|----------|--------------------|-------------------|---------|---------|
-| 1 | `rag/graphrag/general/index_extras.py` `run_graphrag_for_kb` | 官方同名编排函数（`index.py:257`）近全文复制加增量分支，上游编排层 bugfix 不传播 | `rag/graphrag/general/index.py` | **高** | 2026-09-12 |
+| 1 | `rag/graphrag/general/index_extras.py` `run_graphrag_for_kb` | 官方同名编排函数（`index.py:257`）近全文复制加增量分支，上游编排层 bugfix 不传播；增量恢复允许空图，社区阶段在消解后及每次重试时读取完整图 | `rag/graphrag/general/index.py` | **高** | 2026-10-28 |
 | 2 | `index_extras.py` `resolve_entities_incremental` + `index_patch.py` wrapper | 官方 `resolve_entities`（`index.py:758`）调用约定（8 位置参数 + `task_id=`/`entity_types=`）| 同上 | **高**（曾因签名漂移致 TypeError，2026-07-16 已修复并加回归测试） | 2026-09-12 |
 | 3 | `index_patch.py` `_wrap_extract_community` | 官方 `extract_community`（`index.py:804`）形参表 | 同上 | 低（2026-09-12 已改为 `inspect.signature` 按名绑定，漂移时打 WARNING 而非静默错位） | 2026-09-12 |
-| 4 | `rag/svr/task_executor_extras.py` | `sys.modules` 模块查找（生产为 `__main__`）；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值（有兜底默认值） | `rag/svr/task_executor.py` | **高** | 2026-09-12 |
+| 4 | `rag/svr/task_executor_extras.py` | `sys.modules` 模块查找（生产为 `__main__`）；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值（有兜底默认值）；后处理按 KB 的 `embd_id` 选择模型，持有知识库锁后读图 | `rag/svr/task_executor.py` | **高** | 2026-10-28 |
 | 5 | `api/apps/services/dataset_api_service_extras.py` `get_knowledge_graph` | 整函数替换官方实现；截断策略已偏离（边 128→512、丢孤立节点、无向去重） | `api/apps/services/dataset_api_service.py` | 中（上游改进被屏蔽） | 2026-09-12 |
-| 6 | `rag/graphrag/document_delete_extras.py` | 官方文档删除 GraphRAG 清理流程副本（增量路径条件化；2026-09-12 起 subgraph 的 `must_not` 兜底与官方对齐，显式 ID 列举改用 scroll 分页） | `api/db/services/document_service.py` | 中 | 2026-09-12 |
-| 7 | `common/doc_store/es_conn_extras.py` | 遍历 `@singleton` 闭包 cell 定位 ESConnection 类（2026-09-12 起按 `__module__` 匹配，不再硬编码类名）；注入 `count`/`search_with_scroll`/insert 包装 | `rag/utils/es_conn.py`、`common/decorator.py`（`singleton`） | 低（有 RuntimeError 兜底） | 2026-09-12 |
+| 6 | `rag/graphrag/document_delete_extras.py` | 官方文档删除 GraphRAG 清理流程副本（增量路径按 `source_id` 清理，不依赖 graph JSON；2026-10-27 起同步清理字段和 JSON 内来源） | `api/db/services/document_service.py` | 中 | 2026-10-27 |
+| 7 | `common/doc_store/es_conn_extras.py` | 遍历 `@singleton` 闭包 cell 定位 ESConnection 类（2026-09-12 起按 `__module__` 匹配，不再硬编码类名）；注入 `count`/`search_with_scroll`/insert 包装（scroll 初始请求应用 `_source` 投影并保留 `_id`） | `rag/utils/es_conn.py`、`common/decorator.py`（`singleton`） | 低（有 RuntimeError 兜底） | 2026-10-27 |
 | 8 | `rag/llm/siliconflow_timeout_patch.py` | 替换 `SILICONFLOWEmbed._call`，假定其内部超时处理结构不变 | `rag/llm/embedding_model.py`（`SILICONFLOWEmbed`） | 低（有子类守卫） | 2026-09-12 |
 | 9 | `rag/utils/redis_conn_patch.py` | 替换 `RedisDistributedLock.spin_acquire`（依赖官方 `delete_if_equal` 锁协议）；新增 `RedisDB.ttl` | `rag/utils/redis_conn.py` | 中（无 hasattr 守卫，上游同名改动被静默覆盖） | 2026-09-12 |
 | 10 | `rag/graphrag/entity_resolution.py` 尾部 CUSTOM 块 | import 时类重绑定 `EntityResolution`→`IncrementalEntityResolution`；依赖「CUSTOM 块位于文件末尾」的执行顺序，且与 `entity_resolution_extras.py` 存在循环 import | `rag/graphrag/entity_resolution.py` | 中（上游在文件尾部新增代码即打破） | 2026-09-12 |
-| 11 | `rag/graphrag/utils.py` `set_graph` 无条件委托 | 官方原实现改名 `_set_graph_impl`，extras 包装后按 flag 路由 | `rag/graphrag/utils.py` | 低 | 2026-09-12 |
+| 11 | `rag/graphrag/utils.py` `set_graph` 无条件委托 | 官方原实现改名 `_set_graph_impl`，extras 包装后按 flag 路由；全量写入也必须强制刷新，全图查询截断异常不得回退旧 JSON | `rag/graphrag/utils.py` | 低 | 2026-10-28 |
 
 > 2026-09-12：OpenSearch 后端弃用，原第 7 项 `common/doc_store/opensearch_conn_extras.py` 已整体删除（该文件 monkey-patch 从未真正生效——patch 装在了 `@singleton` 工厂闭包而非真类上）；上游官方文件 `rag/utils/opensearch_conn.py` 保持原样不动。
 
@@ -91,7 +91,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | | `api/apps/services/dataset_api_service_extras.py` | KG 可视化装配与截断策略 |
 | 前端 | `web/src/pages/dataset/dataset-overview/hook-extras.ts` | 分块总数统计数据源 |
 | | `web/src/assets/svg/data-flow/total-chunks-icon{,-bri}.svg` | 统计卡图标（暗/亮主题） |
-| 测试 | `test/unit_test/rag/graphrag/test_graphrag_utils_extras.py` | 书籍/章节跳过 embedding（当前唯一测试） |
+| 测试 | `test/unit_test/rag/graphrag/` | GraphRAG 工具、分页、checkpoint、拓扑、增量写入/删除/消解回归测试；`test_review_findings.py` 覆盖五项审查问题及失败边界 |
 | 运维 | `docker/finisher/`（3 个文件） | 卡死任务收尾脚本（默认 dry-run）+ README + 辅助 SQL |
 | 管理 | `patches/`（12 patch + apply/regenerate 脚本 + README） | 官方文件改动的双轨管理 |
 | | `MAINTENANCE.md`、本文档 | 维护规范与漂移清单 |
@@ -112,7 +112,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 |----------|--------|----------|
 | `USE_INCREMENTAL_MERGE` | `0` | Merge 阶段：1=仅合并新增 subgraph，0=官方默认全图 merge |
 | `GRAPHRAG_MERGE_TIMEOUT_SECONDS` | `1800` | Merge 阶段单步超时（秒）；官方 `index.py` 的默认值由 `index_patch.apply_patch()` 在运行时覆写，`index_extras.py` 自带同默认值 |
-| `GRAPHRAG_SET_GRAPH_STREAM_WINDOW` | `256` | `set_graph_delta` 流式 embed→insert 的窗口大小，避免大变更集的全部向量一次性驻留内存导致 executor OOM；删除（removed + 预删旧版本）已前移到嵌入/插入之前，中途崩溃由 merge 重试自愈 |
+| `GRAPHRAG_SET_GRAPH_STREAM_WINDOW` | `256` | `set_graph_delta` 流式 embed→insert 的窗口大小，避免大变更集的全部向量一次性驻留内存导致 executor OOM；2026-10-27 起更新采用原 ID 覆盖写、新记录采用稳定 ID，所有写入及必要刷新成功后才执行明确移除项 |
 | `GRAPHRAG_SET_GRAPH_PIPELINE_DEPTH` | `1` | 流式窗口的流水线深度：最多 d 个窗口同时在入库、下一窗口同时嵌入；内存峰值约 (d+1) 个窗口，ES 在途 bulk 请求数约 4×d（每窗口带 `GRAPHRAG_INSERT_CONCURRENCY` 路并发） |
 
 ### Phase 2.5：增量合并后全局 PageRank 重算
@@ -201,9 +201,29 @@ git diff <旧tag>..<新tag> -- <官方文件>
 19. ~~**`doc_store_audit` `_caller_location(skip_frames=3)` 多跳一帧**~~：改为 2，审计日志定位到真实调用点。
 20. **全局 PageRank 重算大 KB 改造**：图加载改为拓扑专用加载器 `get_graph_topology_from_index`（只取 `entity_kwd`/`entity_type_kwd`/`from_entity_kwd`/`to_entity_kwd`，不取 description，内存约降一个量级）；`_es_search_with_scroll` 返回新增 `_truncated` 标记，实体或关系 scroll 被 `hits_cap` 截断时重算显式放弃（修掉原"边截断无守卫"缺口）；实体写回扫描改为 `search_after` 流式分页 + 窗口化 flush，不再受 `hits_cap` 限制。回归测试：`test_graphrag_topology.py`。
 
+### 2026-10-27 增量一致性修复
+
+21. **写入前预删导致历史属性丢失**：移除实体/关系的更新前删除；查询保留存储 ID，已有记录按原 ID bulk index 覆盖，新记录按知识库、记录类型和规范化业务键生成 SHA-256 稳定 ID。embedding、bulk 写入或必要刷新失败时保留旧数据，重试不会重复插入。显式 `GraphChange` 移除项只在全部更新写入及刷新成功后删除。
+22. **读写与无向边不一致**：文档 merge 和 delta 写入前的必要刷新不再受性能开关控制，失败进入上层重试；关系查询覆盖历史两种存储方向并统一 `get_from_to` 业务键，ID 生成、写入和按 ID 删除使用相同规范化。查询异常、非法 JSON、同业务键重复记录和分页截断均失败关闭，不自动修复历史数据。
+23. **文档删除遗漏 delta 数据**：增量清理不再要求旧式 graph JSON 或 `chunk_num > 0`，按知识库与文档 `source_id` 删除 subgraph/merge_state，并同步清理记录字段及 JSON 内的来源；共享记录有剩余来源时保留，无剩余来源时删除。非增量路径行为不变。
+24. **抽取类型误排除消解及同批候选遗漏**：保留 `entity_types` 调用签名但不作为排除配置；默认仅排除书籍、章节及已有英文别名。候选覆盖“新增—已有”和“新增—新增”，排除自身并排序去重，首次构建和异步全图输入走同一候选逻辑，checkpoint 批次顺序稳定。
+25. **scroll 未应用字段投影**：初始请求即设置 `_source`，仅请求 `_id` 时关闭 `_source`，保留 hit 元数据 ID 并深复制查询体，避免完整描述/向量进入结果累积以及修改调用方参数。
+
+上述改动的函数级回归位于 `test/unit_test/rag/graphrag/test_incremental_integrity.py`。2026-10-27 隔离环境中定向回归 29 项、GraphRAG 目录回归 170 项通过；本机无可用 Elasticsearch，未执行临时索引集成验证。本次未新增公共 HTTP API、数据库表、索引 mapping 或环境变量，未重建/迁移历史图谱。
+
+### 2026-10-28 五项审查问题修复
+
+26. **默认全量写入缺少可见性保证**：`_set_graph_monolithic` 写后执行强制刷新，不受 `SET_GRAPH_DELTA_REFRESH_AFTER_INSERT` 控制；刷新返回 `False` 或抛异常均向上传播。不提供刷新接口的后端保持现有行为。
+27. **增量恢复对空图调用 copy**：增量消解直接使用子图节点集合查询索引，允许图参数为 `None`；官方消解及无子图节点的恢复路径先加载持久化图，缺失时失败，不设置完成标记。
+28. **异步后处理选错嵌入模型**：先读取知识库详情，优先使用 `embd_id`；仅成功读取且未配置该字段时使用租户默认模型。知识库或指定模型不可用时中止，保持现有失败 ack 策略，不静默切换模型。
+29. **社区提取使用消解前的图**：同步与异步后处理均在消解后读取最新全图，社区重试重新加载；索引社区路径不再以 `source_id` 数量判断图是否完整或最新。异步消费者在持有知识库锁后读图；缺失或加载失败不设置社区完成标记。
+30. **全图查询忽略截断**：实体与关系 scroll 均检查 `_truncated`，抛出包含知识库及记录类别的 `GraphTopologyTruncatedError`；`get_graph` 透传该异常，不回退旧 JSON。保留现有查询上限与其他后端错误的兼容回退。
+
+回归测试位于 `test/unit_test/rag/graphrag/test_review_findings.py`，包含原有 11 项复现/对照测试及刷新失败、模型选择、恢复、社区重试、持锁读取、截断失败和无 scroll 后端兼容边界。2026-10-28 在 `.venv-review` 中运行 GraphRAG 目录：210 项通过（原有 170 项 + 本组 40 项）。仅使用服务/模型替身执行真实业务函数，不等同于真实 Elasticsearch 集成验证。未新增公共接口、数据结构或配置开关，未自动重建历史图、向量或社区报告。
+
 ### 仍未处理（第二轮审查复核确认）
 
-- **resume 空指针**、`does_graph_contains` 官方 legacy 路径 size=1 假阴性、search_after 无 PIT、局部 PageRank 污染全局 rank：与第一轮记录一致。
+- `does_graph_contains` 官方 legacy 路径 size=1 假阴性、search_after 无 PIT、局部 PageRank 污染全局 rank：与第一轮记录一致。resume 空指针已于 2026-10-28 修复。
 - **KG-PP 失败/cancel 即 ack 无死信**：第二轮确认 cancel 路径（`task_executor_extras.py` 消费循环内 `has_canceled` 分支）与失败路径同样受影响——任何用户取消都会走此路径；官方 Redis Stream 本身无 DLQ 机制，属于框架级限制。
 - 增量消解的 `IncrementalEntityResolution.__init__` 已加 `*args/**kwargs` 前向兼容，但上游若在 `resolve_entities` 中新增调用参数仍需对照第一节第 2 项核对。
 

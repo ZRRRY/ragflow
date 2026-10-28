@@ -82,9 +82,9 @@ from rag.graphrag.utils import (
 from rag.graphrag.utils_extras import (
     GraphTopologyTruncatedError,
     _AsyncCallback,
+    _graph_record_metadata,
     does_graph_contains,
     get_graph,
-    get_graph_from_index,
     get_graph_topology_from_index,
     is_doc_merged,
     query_existing_entities,
@@ -745,35 +745,22 @@ async def run_graphrag_for_kb(
 
         # In incremental-merge mode ``final_graph`` is the last document's delta
         # graph (merge_subgraph_incremental returns per-doc deltas), never the
-        # global graph. The official resolution / community implementations must
-        # not consume it: reload the full graph from the doc store instead.
-        need_preload_full_graph = (
-            (final_graph is None or _final_graph_is_delta(final_graph))
-            and (
-                (resolution_pending and not GraphRAGConfig.USE_INCREMENTAL_RESOLUTION)
-                or (community_pending and not GraphRAGConfig.USE_ASYNC_COMMUNITY)
-            )
-        )
+        # global graph. Only official resolution needs it here; community loads
+        # a fresh graph after resolution, inside its own retry boundary.
+        need_preload_full_graph = (final_graph is None or _final_graph_is_delta(final_graph)) and resolution_pending and not GraphRAGConfig.USE_INCREMENTAL_RESOLUTION
         if need_preload_full_graph:
             final_graph = await get_graph(tenant_id, kb_id)
             if final_graph is None:
-                callback(
-                    msg=f"[GraphRAG] dataset:{kb_id} no persisted graph found; cannot run resolution/community."
-                )
-                now = asyncio.get_running_loop().time()
-                return {
-                    "ok_docs": ok_docs,
-                    "failed_docs": failed_docs,
-                    "total_docs": len(doc_ids),
-                    "total_chunks": total_chunks,
-                    "seconds": now - start,
-                }
+                raise RuntimeError(f"No persisted graph found for resolution in kb={kb_id}")
             callback(msg=f"[GraphRAG] dataset:{kb_id} loaded persisted graph for resume.")
 
         subgraph_nodes = set()
         for sg in subgraphs.values():
             subgraph_nodes.update(set(sg.nodes()))
-        if not subgraph_nodes:
+        if resolution_pending and not subgraph_nodes:
+            final_graph = await get_graph(tenant_id, kb_id)
+            if final_graph is None:
+                raise RuntimeError(f"No persisted graph found for resolution resume in kb={kb_id}")
             subgraph_nodes = set(final_graph.nodes())
             max_safe_resume_nodes = GraphRAGConfig.KG_MAX_SAFE_RESUME_NODES
             if len(subgraph_nodes) > max_safe_resume_nodes:
@@ -798,7 +785,9 @@ async def run_graphrag_for_kb(
             _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before entity resolution.", callback)
 
             async def run_resolution_attempt():
-                graph_for_resolution = final_graph.copy()
+                # Incremental resolution reads indexed entities using the node
+                # set; a resumed merge need not have an in-memory graph.
+                graph_for_resolution = None if GraphRAGConfig.USE_INCREMENTAL_RESOLUTION else final_graph.copy()
                 await resolve_entities(
                     graph_for_resolution,
                     subgraph_nodes,
@@ -850,8 +839,16 @@ async def run_graphrag_for_kb(
             _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before community extraction.", callback)
 
             async def run_community_attempt():
+                # The indexed dispatcher loads its own graph. The official
+                # extractor needs a fresh snapshot on every attempt, including
+                # when incremental resolution ignored its input graph.
+                graph_for_community = None
+                if not GraphRAGConfig.USE_ASYNC_COMMUNITY:
+                    graph_for_community = await get_graph(tenant_id, kb_id)
+                    if graph_for_community is None:
+                        raise RuntimeError(f"No persisted graph found for community extraction in kb={kb_id}")
                 await extract_community(
-                    final_graph.copy(),
+                    graph_for_community,
                     tenant_id,
                     kb_id,
                     None,
@@ -1456,6 +1453,10 @@ async def merge_subgraph_incremental(
     start = asyncio.get_running_loop().time()
     change = GraphChange()
 
+    # A previous attempt may have partially committed with refresh=false.
+    # Read its writes before merging again, including after refresh failures.
+    await refresh_graphrag_index(tenant_id, label="merge_read")
+
     node_names = list(subgraph.nodes())
 
     logging.info("[P2] Querying %d entities for existing data...", len(node_names))
@@ -1471,10 +1472,7 @@ async def merge_subgraph_incremental(
     for node_name, attr in subgraph.nodes(data=True):
         if node_name in existing_entities:
             old_fields = existing_entities[node_name]
-            try:
-                old_meta = json.loads(old_fields["content_with_weight"])
-            except Exception:
-                old_meta = {}
+            old_meta = json.loads(old_fields["content_with_weight"])
 
             merged_attr = dict(old_meta)
             new_desc = attr.get("description", "")
@@ -1523,10 +1521,7 @@ async def merge_subgraph_incremental(
         edge_key = get_from_to(source, target)
         if edge_key in existing_relations:
             old_fields = existing_relations[edge_key]
-            try:
-                old_meta = json.loads(old_fields["content_with_weight"])
-            except Exception:
-                old_meta = {}
+            old_meta = json.loads(old_fields["content_with_weight"])
 
             merged_attr = dict(old_meta)
             old_sources = set(merged_attr.get("source_id", []))
@@ -1610,7 +1605,8 @@ async def resolve_entities_incremental(
     """
     union_nodes = set(subgraph_nodes or ())
     start = asyncio.get_running_loop().time()
-    excluded_types = build_excluded_types(entity_types)
+    # entity_types configures extraction, not exclusions from resolution.
+    excluded_types = build_excluded_types()
 
     if not union_nodes:
         logging.info("[P3] No new nodes, skipping resolution.")
@@ -1620,14 +1616,11 @@ async def resolve_entities_incremental(
 
     new_nodes_by_type = defaultdict(list)
     node_attrs = {}
-    for node_name in union_nodes:
+    for node_name in sorted(union_nodes):
         fields = new_node_fields.get(node_name)
         if not fields:
             continue
-        try:
-            meta = json.loads(fields["content_with_weight"])
-        except Exception:
-            continue
+        meta = json.loads(fields["content_with_weight"])
         ent_type = meta.get("entity_type", "-")
         new_nodes_by_type[ent_type].append(node_name)
         node_attrs[node_name] = meta
@@ -1665,6 +1658,8 @@ async def resolve_entities_incremental(
                 query_body,
                 ["entity_kwd"],
             )
+            if res.get("_truncated"):
+                raise RuntimeError(f"Resolution candidate names truncated for type {ent_type}")
             fields_map = settings.docStoreConn.get_fields(res, ["entity_kwd"])
             names = set()
             for cid, row in fields_map.items():
@@ -1676,7 +1671,7 @@ async def resolve_entities_incremental(
             return names
         except Exception as e:
             logging.warning("[P3] Failed to fetch existing names for type %s: %s", ent_type, e)
-            return set()
+            raise
 
     # Char-level candidate recall. Phase 2.4 safety: cap the per-type
     # candidate set and batch the new-node side so a 10k existing x 100 new
@@ -1687,7 +1682,7 @@ async def resolve_entities_incremental(
     char_batch = max(1, int(GraphRAGConfig.RESOLUTION_CHAR_BATCH_SIZE))
     max_candidates = max(1, int(GraphRAGConfig.RESOLUTION_CHAR_MAX_CANDIDATES))
 
-    for ent_type, new_nodes in new_nodes_by_type.items():
+    for ent_type, new_nodes in sorted(new_nodes_by_type.items()):
         if not new_nodes or ent_type in excluded_types:
             continue
         if len(candidate_pairs) >= max_candidates:
@@ -1699,7 +1694,10 @@ async def resolve_entities_incremental(
             break
 
         existing_names = await _fetch_existing_names_by_type(tenant_id, kb_id, ent_type)
-        existing_names = existing_names - set(new_nodes)
+        # Include pairs within this batch, including first builds and KG-PP
+        # calls whose new_nodes contains the entire graph.
+        existing_names = sorted(existing_names | set(new_nodes))
+        new_names = set(new_nodes)
 
         for batch_start in range(0, len(new_nodes), char_batch):
             if len(candidate_pairs) >= max_candidates:
@@ -1707,6 +1705,8 @@ async def resolve_entities_incremental(
             batch_new = new_nodes[batch_start : batch_start + char_batch]
             for node_name in batch_new:
                 for existing_name in existing_names:
+                    if existing_name == node_name or (existing_name in new_names and existing_name < node_name):
+                        continue
                     if not is_similarity_str(node_name, existing_name):
                         continue
                     a, b = (
@@ -1728,21 +1728,13 @@ async def resolve_entities_incremental(
     neighbor_attrs = await query_existing_entities(tenant_id, kb_id, list(candidate_neighbors), callback=callback)
 
     candidate_resolution = defaultdict(list)
-    for a, b in candidate_pairs:
+    for a, b in sorted(candidate_pairs):
         type_a = node_attrs.get(a, {}).get("entity_type")
         if type_a is None and a in neighbor_attrs:
-            try:
-                meta = json.loads(neighbor_attrs[a]["content_with_weight"])
-                type_a = meta.get("entity_type", "-")
-            except Exception:
-                type_a = "-"
+            type_a = _graph_record_metadata(neighbor_attrs[a]).get("entity_type", "-")
         type_b = node_attrs.get(b, {}).get("entity_type")
         if type_b is None and b in neighbor_attrs:
-            try:
-                meta = json.loads(neighbor_attrs[b]["content_with_weight"])
-                type_b = meta.get("entity_type", "-")
-            except Exception:
-                type_b = "-"
+            type_b = _graph_record_metadata(neighbor_attrs[b]).get("entity_type", "-")
         if type_a == type_b and type_a not in excluded_types:
             candidate_resolution[type_a].append((a, b))
 
@@ -1755,11 +1747,7 @@ async def resolve_entities_incremental(
         if node_name in node_attrs:
             local_graph.add_node(node_name, **node_attrs[node_name])
     for node_name, fields in neighbor_attrs.items():
-        try:
-            meta = json.loads(fields["content_with_weight"])
-        except Exception:
-            meta = {}
-        local_graph.add_node(node_name, **meta)
+        local_graph.add_node(node_name, **_graph_record_metadata(fields))
 
     all_local_nodes = list(local_graph.nodes())
     rel_fields = await query_node_relations(tenant_id, kb_id, all_local_nodes)
@@ -1771,11 +1759,7 @@ async def resolve_entities_incremental(
         if isinstance(to_node, list):
             to_node = to_node[0]
         if from_node and to_node:
-            try:
-                meta = json.loads(fields["content_with_weight"])
-            except Exception:
-                meta = {}
-            local_graph.add_edge(from_node, to_node, **meta)
+            local_graph.add_edge(from_node, to_node, **_graph_record_metadata(fields))
 
     logging.info(
         "[P3] Recalled %d candidates, local graph: %d nodes, %d edges.",
@@ -1951,17 +1935,17 @@ async def extract_community_indexed(
     callback,
     task_id: str = "",
 ):
-    """Load the full graph from the doc-store index and run community detection.
+    """Load the persisted full graph and run community detection.
 
     This is the P4 async path: it guarantees that community detection sees the
     complete global topology regardless of whether the caller passed a delta
-    subgraph or a full graph.
+    subgraph or a full graph. The storage router preserves the monolithic
+    path for deployments without incremental storage or scroll support.
     """
     start = asyncio.get_running_loop().time()
-    graph = await get_graph_from_index(tenant_id, kb_id)
+    graph = await get_graph(tenant_id, kb_id)
     if graph is None or len(graph.nodes) == 0:
-        logging.info("[P4] No graph found in index, skipping community extraction.")
-        return [], []
+        raise RuntimeError(f"No persisted graph found for community extraction in kb={kb_id}")
 
     logging.info(
         "[P4] Loaded %d nodes, %d edges from index for community detection in %.2fs.",
@@ -1969,9 +1953,7 @@ async def extract_community_indexed(
         len(graph.edges),
         asyncio.get_running_loop().time() - start,
     )
-    return await _extract_community_core(
-        graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id
-    )
+    return await _extract_community_core(graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id)
 
 
 @timeout(60 * 30, 1)
@@ -1985,16 +1967,5 @@ async def extract_community_async(
     callback,
     task_id: str = "",
 ):
-    """Async-community dispatcher: loads the full graph from index when needed."""
-    source_ids = graph.graph.get("source_id", []) if graph else []
-    if len(source_ids) <= 1:
-        logging.info("[P4] Incoming graph appears to be a delta; loading full graph from index.")
-        return await extract_community_indexed(
-            tenant_id, kb_id, llm_bdl, embed_bdl, callback, task_id=task_id
-        )
-    else:
-        logging.info("[P4] Incoming graph appears complete; using it directly for community detection.")
-
-    return await _extract_community_core(
-        graph, tenant_id, kb_id, llm_bdl, callback, task_id=task_id
-    )
+    """Load a fresh full graph; source count cannot establish freshness."""
+    return await extract_community_indexed(tenant_id, kb_id, llm_bdl, embed_bdl, callback, task_id=task_id)

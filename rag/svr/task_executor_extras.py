@@ -362,26 +362,24 @@ async def kg_postprocess_consumer():
                 msg.ack()
                 continue
 
+            kb = KnowledgebaseService.get_detail(kb_id)
+            if not kb:
+                raise RuntimeError(f"Knowledge base {kb_id} not found for postprocessing")
+            kb_parser_config = kb.get("parser_config") or {}
+            graphrag_config = kb_parser_config.get("graphrag", {})
+            entity_types = graphrag_config.get("entity_types", []) or []
+            embedding_id = kb.get("embd_id")
+            if embedding_id:
+                embd_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.EMBEDDING, embedding_id)
+            else:
+                embd_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.EMBEDDING)
+            if not embd_model_config:
+                raise RuntimeError(f"Embedding model {embedding_id!r} unavailable for kb={kb_id}")
+            embedding_model = LLMBundle(tenant_id, embd_model_config, lang=task_language)
             chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.CHAT, kb_task_llm_id)
             chat_model = LLMBundle(tenant_id, chat_model_config, lang=task_language)
-            embd_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.EMBEDDING)
-            embedding_model = LLMBundle(tenant_id, embd_model_config, lang=task_language)
-
-            try:
-                kb = KnowledgebaseService.get_detail(kb_id)
-                kb_parser_config = kb.get("parser_config", {}) if kb else {}
-                graphrag_config = kb_parser_config.get("graphrag", {})
-                entity_types = graphrag_config.get("entity_types", []) or []
-            except Exception:
-                logging.exception("[KG-PP] Failed to load KB parser_config for kb=%s", kb_id)
-                entity_types = []
 
             from rag.graphrag.utils import get_graph
-            final_graph = await get_graph(tenant_id, kb_id)
-            if final_graph is None:
-                logging.error("[KG-PP] kb=%s no persisted graph found, cannot proceed", kb_id)
-                msg.ack()
-                continue
 
             def pp_callback(msg=None, prog=None):
                 if msg:
@@ -417,7 +415,13 @@ async def kg_postprocess_consumer():
 
                 async with kg_limiter:
                     if resolution_pending:
+                        # Read only after acquiring the KB lock, so a preceding
+                        # merge cannot leave this consumer with a stale snapshot.
+                        final_graph = await get_graph(tenant_id, kb_id)
+                        if final_graph is None:
+                            raise RuntimeError(f"No persisted graph found for resolution in kb={kb_id}")
                         from rag.graphrag.general.index import resolve_entities
+
                         subgraph_nodes = set(final_graph.nodes())
                         await resolve_entities(
                             final_graph,
@@ -438,12 +442,10 @@ async def kg_postprocess_consumer():
                         # global topology changed; recompute pagerank once more.
                         # Non-fatal on failure: ranks stay stale until the next
                         # merge-triggered recalc, and community must still run.
-                        if (
-                            GraphRAGConfig.RECALC_GLOBAL_PAGERANK_AFTER_MERGE
-                            and GraphRAGConfig.USE_INCREMENTAL_RESOLUTION
-                        ):
+                        if GraphRAGConfig.RECALC_GLOBAL_PAGERANK_AFTER_MERGE and GraphRAGConfig.USE_INCREMENTAL_RESOLUTION:
                             try:
                                 from rag.graphrag.general.index_extras import recalc_global_pagerank
+
                                 await recalc_global_pagerank(tenant_id, kb_id, pp_callback, task_id=task_id)
                                 logging.info("[KG-PP] kb=%s pagerank recalc done", kb_id)
                             except Exception:
@@ -451,8 +453,14 @@ async def kg_postprocess_consumer():
 
                     if community_pending:
                         from rag.graphrag.general.index import extract_community
+
+                        graph_for_community = None
+                        if not GraphRAGConfig.USE_ASYNC_COMMUNITY:
+                            graph_for_community = await get_graph(tenant_id, kb_id)
+                            if graph_for_community is None:
+                                raise RuntimeError(f"No persisted graph found for community extraction in kb={kb_id}")
                         await extract_community(
-                            final_graph,
+                            graph_for_community,
                             tenant_id,
                             kb_id,
                             None,

@@ -146,10 +146,14 @@ async def search_all_by_search_after(
 
         last_sort = hits[-1].get("sort")
         if not last_sort:
+            raise RuntimeError("Graph pagination response lacks a search_after cursor")
+        if len(hits) < page_size:
             return
         body = _build_query_body(filters, sort_field, page_size, search_after=last_sort)
         body["_source"] = fields
         body["query"]["bool"]["filter"].append({"term": {"kb_id": kb_id}})
+
+    raise RuntimeError(f"Graph pagination exceeded max_pages={max_pages}; refusing truncated results")
 
 
 async def collect_all(

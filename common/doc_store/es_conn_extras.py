@@ -35,6 +35,7 @@ import inspect
 import json
 import logging
 import os
+from copy import deepcopy
 
 from elasticsearch import NotFoundError
 from elasticsearch_dsl import Q
@@ -70,6 +71,11 @@ def _es_search_with_scroll(
     from rag.utils.es_conn import ATTEMPT_TIME
 
     cap = hits_cap if hits_cap is not None else _DEFAULT_HITS_CAP
+    query_body = deepcopy(query_body)
+    # _id is hit metadata, not a source field. Apply the projection before
+    # starting the scroll so vectors/descriptions never enter the hit buffer.
+    source_fields = [field for field in fields if field != "_id"]
+    query_body["_source"] = source_fields if source_fields else False
 
     scroll_id = None
     try:

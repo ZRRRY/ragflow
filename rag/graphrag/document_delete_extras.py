@@ -8,6 +8,7 @@ Isolates Phase 2.5 incremental GraphRAG changes from
 restored to the v0.26.0 baseline.
 """
 
+import json
 import logging
 
 from common import settings
@@ -25,9 +26,9 @@ def cleanup_knowledge_graph_references(doc, chunk_index_name):
     When incremental GraphRAG is disabled, the official logic is executed
     verbatim to keep the default behavior unchanged.
     """
-    # Documents that were never parsed have no chunks and no graph data;
-    # skip the ES round-trips entirely.
-    if not getattr(doc, "chunk_num", 0):
+    # Preserve the official chunk-count shortcut only for the legacy path;
+    # delta records can exist even when the document counter is zero.
+    if not GraphRAGConfig.DELETE_SUBGRAPH_ON_DOC_DELETE and not getattr(doc, "chunk_num", 0):
         return
     if GraphRAGConfig.DELETE_SUBGRAPH_ON_DOC_DELETE:
         _cleanup_knowledge_graph_references_incremental(doc, chunk_index_name)
@@ -66,92 +67,81 @@ def _cleanup_knowledge_graph_references_official(doc, chunk_index_name):
         )
 
 
+def _graph_records_with_source(doc, chunk_index_name, kg_types):
+    """Read only affected records so their embedded provenance can be updated too."""
+    conn = settings.docStoreConn
+    filters = {"knowledge_graph_kwd": kg_types, "source_id": doc.id}
+    fields = ["content_with_weight", "source_id", "knowledge_graph_kwd"]
+    if hasattr(conn, "search_with_scroll"):
+        result = conn.search_with_scroll(
+            chunk_index_name,
+            {"query": {"bool": {"filter": [
+                {"terms": {"kb_id": [doc.kb_id]}},
+                {"terms": {"knowledge_graph_kwd": kg_types}},
+                {"term": {"source_id": doc.id}},
+            ]}}},
+            fields,
+        )
+        if result.get("_truncated"):
+            raise RuntimeError(f"Graph cleanup result was truncated for document {doc.id}")
+        return conn.get_fields(result, fields)
+
+    result = conn.search(fields, [], filters, [], OrderByExpr(), 0, 10000, chunk_index_name, [doc.kb_id])
+    ids = conn.get_doc_ids(result)
+    if conn.get_total(result) > len(ids) or len(ids) >= 10000:
+        raise RuntimeError(f"Graph cleanup result exceeded the backend limit for document {doc.id}")
+    rows = conn.get_fields(result, fields)
+    return {cid: rows[cid] for cid in ids}
+
+
 def _cleanup_knowledge_graph_references_incremental(doc, chunk_index_name):
-    """Phase 2.5 incremental GraphRAG cleanup logic.
+    """Clean by provenance even when delta storage has no graph JSON record."""
+    conn = settings.docStoreConn
+    # Keep content_with_weight and the indexed source_id in agreement. Otherwise
+    # a later merge would resurrect the deleted document from stale JSON.
+    kg_types = ["entity", "relation", "graph", "community_report"]
+    affected = _graph_records_with_source(doc, chunk_index_name, kg_types)
+    emptied_ids = []
+    for cid, fields in affected.items():
+        sources = fields.get("source_id", [])
+        if not isinstance(sources, list):
+            raise ValueError(f"Invalid indexed graph provenance for record {cid}")
+        if doc.id in sources and not [source for source in sources if source != doc.id]:
+            emptied_ids.append(cid)
+        metadata = json.loads(fields["content_with_weight"])
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Invalid graph metadata for record {cid}")
+        sources = metadata.get("source_id", [])
+        if not isinstance(sources, list):
+            raise ValueError(f"Invalid graph provenance for record {cid}")
+        if doc.id not in sources:
+            continue
+        metadata["source_id"] = [source for source in fields.get("source_id", []) if source != doc.id]
+        result = conn.update(
+            {"id": cid}, {"content_with_weight": json.dumps(metadata, ensure_ascii=False)},
+            chunk_index_name, doc.kb_id,
+        )
+        if result is False:
+            raise RuntimeError(f"Failed to update graph provenance for record {cid}")
 
-    Under incremental GraphRAG (delta graph or incremental merge), eagerly
-    delete the document's subgraph so intermediate products do not linger.
-    """
-    # Safety: source_id is a list field, and term-filter behavior on
-    # missing/typed values is backend-dependent. Resolve matching subgraph
-    # chunk IDs explicitly so we never accidentally delete every subgraph in
-    # the KB (or none of them).
-    subgraph_ids = None
-    if hasattr(settings.docStoreConn, "search_with_scroll"):
-        # Single-shot search is capped by index.max_result_window (10000);
-        # scroll pages through everything so very large documents (e.g.
-        # ChapterGraph books) do not leave subgraph chunks behind.
-        query_body = {
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"terms": {"kb_id": [doc.kb_id]}},
-                        {"terms": {"knowledge_graph_kwd": ["subgraph"]}},
-                        {"term": {"source_id": doc.id}},
-                    ]
-                }
-            }
-        }
-        try:
-            scroll_res = settings.docStoreConn.search_with_scroll(chunk_index_name, query_body, ["_id"])
-            subgraph_ids = settings.docStoreConn.get_doc_ids(scroll_res)
-        except Exception:
-            logger.exception("subgraph scroll listing failed for doc %s; falling back to paged search", doc.id)
-            subgraph_ids = None
-    if subgraph_ids is None:
-        subgraph_res = settings.docStoreConn.search(
-            ["_id"],
-            [],
-            {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["subgraph"], "source_id": doc.id},
-            [],
-            OrderByExpr(),
-            0,
-            10000,
-            chunk_index_name,
-            [doc.kb_id],
-        )
-        subgraph_ids = settings.docStoreConn.get_doc_ids(subgraph_res)
-        if len(subgraph_ids) >= 10000:
-            logger.error(
-                "subgraph cleanup for doc %s hit the 10000 listing cap; some subgraph chunks may remain",
-                doc.id,
-            )
-    if subgraph_ids:
-        settings.docStoreConn.delete(
-            {"id": subgraph_ids},
-            chunk_index_name,
-            doc.kb_id,
-        )
-
-    graph_source = settings.docStoreConn.get_fields(
-        settings.docStoreConn.search(
-            ["source_id"],
-            [],
-            {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]},
-            [],
-            OrderByExpr(),
-            0,
-            100,
-            chunk_index_name,
-            [doc.kb_id],
-        ),
-        ["source_id"],
+    # delete_by_query applies to all matching checkpoints without a scroll cap.
+    conn.delete(
+        {"knowledge_graph_kwd": ["subgraph", "merge_state"], "source_id": doc.id},
+        chunk_index_name, doc.kb_id,
     )
-    doc_in_graph_source = any(
-        doc.id in row.get("source_id", [])
-        for row in graph_source.values()
+    result = conn.update(
+        {"knowledge_graph_kwd": kg_types, "source_id": doc.id},
+        {"remove": {"source_id": doc.id}},
+        chunk_index_name, doc.kb_id,
     )
-    if doc_in_graph_source:
-        kg_types = ["entity", "relation", "graph", "subgraph", "community_report"]
-        settings.docStoreConn.update(
-            {"kb_id": doc.kb_id, "knowledge_graph_kwd": kg_types, "source_id": doc.id},
-            {"remove": {"source_id": doc.id}},
-            chunk_index_name,
-            doc.kb_id,
-        )
-        settings.docStoreConn.update({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
-        settings.docStoreConn.delete(
-            {"kb_id": doc.kb_id, "knowledge_graph_kwd": kg_types, "must_not": {"exists": "source_id"}},
-            chunk_index_name,
-            doc.kb_id,
+    if result is False:
+        raise RuntimeError(f"Failed to remove graph provenance for document {doc.id}")
+    # A legacy JSON graph may still exist after enabling incremental mode.
+    result = conn.update({"knowledge_graph_kwd": ["graph"]}, {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
+    if result is False:
+        raise RuntimeError(f"Failed to mark the legacy graph removed for document {doc.id}")
+    for offset in range(0, len(emptied_ids), 1000):
+        conn.delete(
+            {"id": emptied_ids[offset:offset + 1000], "knowledge_graph_kwd": kg_types},
+            chunk_index_name, doc.kb_id,
         )
