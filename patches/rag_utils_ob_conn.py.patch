@@ -1,0 +1,48 @@
+diff --git a/rag/utils/ob_conn.py b/rag/utils/ob_conn.py
+index 3e1b48041..b784b6a72 100644
+--- a/rag/utils/ob_conn.py
++++ b/rag/utils/ob_conn.py
+@@ -24,21 +24,21 @@ from elasticsearch_dsl import Q, Search
+ from pydantic import BaseModel
+ from pymysql.converters import escape_string
+ from pyobvector import ARRAY
+-from sqlalchemy import Column, String, Integer, JSON, Double, Row
++from sqlalchemy import JSON, Column, Double, Integer, Row, String
+ from sqlalchemy.dialects.mysql import LONGTEXT, TEXT
+ from sqlalchemy.sql.type_api import TypeEngine
+ 
+ from common.constants import PAGERANK_FLD, TAG_FLD
+ from common.decorator import singleton
+-from common.doc_store.doc_store_base import MatchExpr, OrderByExpr, FusionExpr, MatchTextExpr, MatchDenseExpr
++from common.doc_store.doc_store_base import FusionExpr, MatchDenseExpr, MatchExpr, MatchTextExpr, OrderByExpr
+ from common.doc_store.ob_conn_base import (
+     OBConnectionBase,
+-    get_value_str,
+-    vector_search_template,
+-    vector_column_pattern,
+-    fulltext_index_name_template,
+     doc_meta_column_names,
+     doc_meta_column_types,
++    fulltext_index_name_template,
++    get_value_str,
++    vector_column_pattern,
++    vector_search_template,
+ )
+ from common.float_utils import get_float
+ from rag.nlp import rag_tokenizer
+@@ -288,8 +288,13 @@ def get_filters(condition: dict) -> list[str]:
+                 filters.append(f"{v} IS NOT NULL")
+         elif k == "must_not" and isinstance(v, dict) and "exists" in v:
+             col = v.get("exists")
+-            if isinstance(col, str) and col in _VALID_FILTER_COLUMNS:
+-                filters.append(f"{col} IS NULL")
++            # === CUSTOM BEGIN [graph-missing-fields] ===
++            # Reason: preserve source_id exclusion alongside compile_kwd isolation.
++            # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
++            for field in col if isinstance(col, list) else [col]:
++                if isinstance(field, str) and field in _VALID_FILTER_COLUMNS:
++                    filters.append(f"{field} IS NULL")
++            # === CUSTOM END [graph-missing-fields] ===
+         elif k == "metadata_filtering_conditions":
+             # Handle metadata filtering conditions
+             metadata_filter = get_metadata_filter_expression(v)

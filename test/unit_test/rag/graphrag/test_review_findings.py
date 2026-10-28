@@ -6,12 +6,18 @@ graph algorithms, orchestration, dispatchers and persistence functions are real;
 the store, Redis locks/checkpoints and model responses are deterministic doubles.
 """
 
+import ast
 import asyncio
+import copy
 import json
+import logging
+import re
 import sys
 from copy import deepcopy
 from itertools import pairwise
-from types import SimpleNamespace
+from pathlib import Path
+from types import MethodType, SimpleNamespace
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -64,6 +70,12 @@ class RefreshStore:
     @staticmethod
     def matches(row, filters):
         for key, wanted in filters.items():
+            if key == "must_not":
+                fields = wanted["exists"]
+                fields = fields if isinstance(fields, list) else [fields]
+                if any(row.get(field) is not None and row.get(field) != [] for field in fields):
+                    return False
+                continue
             actual = row.get(key, [])
             actual = actual if isinstance(actual, list) else [actual]
             wanted = wanted if isinstance(wanted, list) else [wanted]
@@ -105,9 +117,23 @@ class RefreshStore:
         filters = {}
         for clause in query["query"]["bool"]["filter"]:
             filters.update(clause.get("term", clause.get("terms", {})))
+        filters["must_not"] = {"exists": [c["exists"]["field"] for c in query["query"]["bool"].get("must_not", [])]}
         rows = [row for row in self.visible.values() if self.matches(row, filters)]
         truncated = filters["knowledge_graph_kwd"] == [self.truncate_kind]
         return {"rows": rows[:1] if truncated else rows, "_truncated": truncated}
+
+    def update(self, condition, values, index_name, kb_id):
+        for cid, row in self.visible.items():
+            if row["kb_id"] != kb_id or not self.matches(row, condition):
+                continue
+            for key, value in values.items():
+                if key == "remove":
+                    for field, item in value.items():
+                        self.rows[cid][field] = [v for v in self.rows[cid].get(field, []) if v != item]
+                else:
+                    self.rows[cid][key] = deepcopy(value)
+        self.refresh_idx(index_name)
+        return True
 
     async def retrieve(self, condition, index_name, kb_ids):
         fields = condition["fields"]
@@ -676,3 +702,234 @@ async def test_v0264_generated_structure_links_bypass_llm_filter(runtime, monkey
     assert graph.has_edge("BOOK", "CHAPTER")
     assert graph.has_edge("ALICE", "CHAPTER")
     assert not graph.has_edge("ALICE", "BOB")
+
+
+def load_production_functions(relative_path, names, namespace):
+    """Load real functions while omitting service-heavy module initialization."""
+    path = Path(__file__).resolve().parents[4] / relative_path
+    tree = ast.parse(path.read_bytes())
+    functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
+    assert len(functions) == len(names)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)  # noqa: S102 - local production functions
+    return namespace
+
+
+@pytest.fixture
+def es_insert_transport(runtime, monkeypatch):
+    policies = []
+
+    def bulk(*, index, operations, refresh, timeout):
+        policies.append(refresh)
+        for row in operations[1::2]:
+            runtime.store.rows[row["id"]] = deepcopy(row)
+        if refresh == "wait_for":
+            runtime.store.refresh_idx(index)
+        return {"errors": False, "items": []}
+
+    ns = load_production_functions("rag/utils/es_conn.py", {"insert"}, {
+        "copy": copy, "re": re, "ATTEMPT_TIME": 1, "ConnectionTimeout": TimeoutError,
+    })
+    load_production_functions("common/doc_store/es_conn_extras.py", {"_es_insert", "_should_auto_refresh_after_insert"}, ns)
+    connection = SimpleNamespace(es=SimpleNamespace(bulk=bulk), logger=logging.getLogger(__name__), refresh_idx=runtime.store.refresh_idx)
+    connection._original_insert = MethodType(ns["insert"], connection)
+    monkeypatch.setattr(runtime.store, "insert", lambda rows, idx, kb: ns["_es_insert"](connection, rows, idx, kb))
+    return policies
+
+
+async def test_wiki_reduce_is_readable_before_plan(runtime, es_insert_transport):
+    async def inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    wiki = load_production_functions("rag/advanced_rag/knowlege_compile/wiki.py", {"_wiki_persist_reduce", "_wiki_load_reduce_result"}, {
+        "json": json, "logging": logging, "Optional": Optional, "thread_pool_exec": inline,
+        "WIKI_REDUCE_COMPILE_KWD": "artifact_reduce_result", "_stable_row_id": lambda *args: "reduce-row",
+    })
+    reduced = {"entities": [{"name": "ALICE"}], "relations": []}
+    await wiki["_wiki_persist_reduce"](reduced, "tenant", "kb", "hash")
+    assert await wiki["_wiki_load_reduce_result"]("tenant", "kb") == reduced
+    assert es_insert_transport == ["wait_for"]
+
+
+@pytest.mark.parametrize("documents,policy", [
+    ([{"id": "graph", "knowledge_graph_kwd": "relation"}], "false"),
+    ([{"id": "compiled", "knowledge_graph_kwd": "relation", "compile_kwd": "hypergraph"}], "wait_for"),
+    ([{"id": "a", "compile_kwd": "artifact_plan"}, {"id": "b", "compile_kwd": "artifact_reduce_result"}], "wait_for"),
+    ([{"id": "graph", "knowledge_graph_kwd": "entity"}, {"id": "chunk"}], "wait_for"),
+    ([{"id": "chunk"}], "wait_for"),
+])
+def test_insert_visibility_contract(runtime, es_insert_transport, documents, policy):
+    assert runtime.store.insert(documents, "idx", "kb") == []
+    assert es_insert_transport == [policy]
+    assert bool(runtime.store.visible) == (policy == "wait_for")
+
+
+@pytest.fixture
+def mixed_graph(runtime):
+    graph = make_graph("doc1", "ALICE", "BOB")
+    seed_graph(runtime.store, graph)
+    ns = load_production_functions("rag/advanced_rag/knowlege_compile/structure.py", {"_struct_to_es_doc"}, {
+        "json": json, "_stable_row_id": lambda *args: "compiled-relation",
+        "_tokenize_for_search": lambda text: (text, text),
+        "_struct_payload_description": lambda payload: payload.get("description", ""),
+    })
+    relation = ns["_struct_to_es_doc"](
+        {"src": "ALICE", "dst": "BOB", "description": "Compiled template relation"},
+        "hypergraph", "doc2", ["chunk2"], [1., 0.], "relation",
+        src_field="src", target_field="dst", compilation_template_id="template1",
+    )
+    relation["kb_id"] = "kb"
+    # Identical graph keys and source IDs make accidental reads/deletes observable.
+    relation["source_id"] = ["doc1"]
+    runtime.store.rows[relation["id"]] = relation
+    for name in ("ALICE", "COMPILED_ONLY"):
+        runtime.store.rows[f"compiled-{name}"] = {
+            "id": f"compiled-{name}", "kb_id": "kb", "compile_kwd": "list",
+            "knowledge_graph_kwd": "entity", "entity_kwd": name, "source_id": ["doc1"],
+            "content_with_weight": json.dumps({"description": "compiled", "source_id": ["doc1"]}),
+        }
+    runtime.store.rows["compiled-graph"] = {
+        "id": "compiled-graph", "kb_id": "kb", "compile_kwd": "hypergraph",
+        "knowledge_graph_kwd": "graph", "removed_kwd": "N", "source_id": ["doc1"],
+        "content_with_weight": "{}",
+    }
+    runtime.store.refresh_idx("idx")
+    return {cid: deepcopy(row) for cid, row in runtime.store.rows.items() if "compile_kwd" in row}
+
+
+async def test_compiled_records_do_not_override_graph_or_duplicate_delta_keys(runtime, mixed_graph):
+    graph = await utils_extras.get_graph_from_index("tenant", "kb")
+    assert set(graph) == {"ALICE", "BOB"}
+    assert graph.edges["ALICE", "BOB"]["description"] == "related"
+    relations = await utils_extras.query_existing_relations("tenant", "kb", [("ALICE", "BOB")])
+    entities = await utils_extras.query_existing_entities("tenant", "kb", ["ALICE", "COMPILED_ONLY"])
+    assert relations[("ALICE", "BOB")]["id"] == "ALICE-BOB"
+    assert set(entities) == {"ALICE"}
+    topology = await utils_extras.get_graph_topology_from_index("tenant", "kb")
+    assert set(topology) == {"ALICE", "BOB"}
+
+
+async def test_graph_delta_delete_preserves_compiled_relations(runtime, mixed_graph):
+    await utils_extras._delete_relation_edges_bulk("tenant", "kb", "ALICE", ["BOB"])
+    assert "ALICE-BOB" not in runtime.store.rows
+    assert {cid: runtime.store.rows[cid] for cid in mixed_graph} == mixed_graph
+
+
+@pytest.mark.parametrize("incremental", [True, False])
+def test_document_graph_cleanup_preserves_compiled_records(runtime, mixed_graph, monkeypatch, incremental):
+    from rag.graphrag.document_delete_extras import cleanup_knowledge_graph_references
+
+    runtime.store.rows["legacy-graph"] = {
+        "id": "legacy-graph", "kb_id": "kb", "knowledge_graph_kwd": "graph",
+        "source_id": ["doc1"], "content_with_weight": json.dumps({"source_id": ["doc1"]}),
+    }
+    runtime.store.refresh_idx("idx")
+    monkeypatch.setattr(GraphRAGConfig, "DELETE_SUBGRAPH_ON_DOC_DELETE", incremental)
+    cleanup_knowledge_graph_references(SimpleNamespace(id="doc1", kb_id="kb", chunk_num=1), "idx")
+    assert {cid: runtime.store.rows[cid] for cid in mixed_graph} == mixed_graph
+    assert not any(row.get("source_id") == ["doc1"] for cid, row in runtime.store.rows.items() if cid not in mixed_graph)
+
+
+def test_graph_scope_preserves_existing_exclusions_and_input():
+    from rag.graphrag.storage_scope import graph_condition, graph_query
+
+    condition = {"knowledge_graph_kwd": ["graph"], "must_not": {"exists": "source_id"}}
+    scoped = graph_condition(condition)
+    assert scoped["must_not"]["exists"] == ["source_id", "compile_kwd"]
+    assert condition["must_not"]["exists"] == "source_id"
+    assert graph_condition(scoped) == scoped
+    assert RefreshStore.matches({"knowledge_graph_kwd": "graph"}, scoped)
+    assert not RefreshStore.matches({"knowledge_graph_kwd": "graph", "compile_kwd": "list"}, scoped)
+    body = {"query": {"bool": {"should": [{"term": {"removed_kwd": "N"}}], "minimum_should_match": 1}}}
+    guarded = graph_query(body)
+    assert guarded["query"]["bool"]["must_not"] == [{"exists": {"field": "compile_kwd"}}]
+    assert "must_not" not in body["query"]["bool"]
+    assert guarded == graph_query(guarded)
+
+
+async def test_search_after_scopes_every_page(runtime, mixed_graph):
+    def search(*, index, body):
+        assert {"exists": {"field": "compile_kwd"}} in body["query"]["bool"]["must_not"]
+        start = body.get("search_after", ["", -1])[1] + 1
+        rows = [row for row in runtime.store.visible.values() if "compile_kwd" not in row and row["knowledge_graph_kwd"] == "entity"]
+        return {"hits": {"hits": [
+            {"_id": row["id"], "_source": row, "sort": [row["entity_kwd"], start + offset]}
+            for offset, row in enumerate(rows[start:start + body["size"]])
+        ]}}
+
+    runtime.store.es = SimpleNamespace(search=search)
+    rows = await utils_pagination.collect_all({"knowledge_graph_kwd": ["entity"]}, "idx", "kb", ["entity_kwd"], "entity_kwd", page_size=1)
+    assert {row["entity_kwd"] for row in rows} == {"ALICE", "BOB"}
+
+
+@pytest.mark.parametrize("operation", ["search", "update", "delete"])
+def test_es_translates_all_graph_exclusions(operation):
+    from elasticsearch_dsl import Q, Search
+
+    from rag.graphrag.storage_scope import graph_condition
+
+    queries = []
+
+    class UpdateRequest:
+        def __init__(self, **kwargs):
+            pass
+
+        def using(self, connection):
+            return self
+
+        def query(self, query):
+            queries.append(query.to_dict())
+            return self
+
+        def script(self, **kwargs):
+            return self
+
+        def params(self, **kwargs):
+            return self
+
+        def execute(self):
+            return {}
+
+    def search_once(indices, query, **kwargs):
+        queries.append(query["query"])
+        return {"hits": {"hits": []}}
+
+    def delete_by_query(**kwargs):
+        queries.append(kwargs["body"]["query"])
+        return {"deleted": 0}
+
+    ns = load_production_functions("rag/utils/es_conn.py", {operation}, {
+        "Q": Q, "Search": Search, "UpdateByQuery": UpdateRequest, "json": json, "copy": copy, "re": re,
+        "MatchExpr": object, "OrderByExpr": object, "ATTEMPT_TIME": 1,
+        "MAX_RESULT_WINDOW": 10000, "ConnectionTimeout": TimeoutError,
+    })
+    connection = SimpleNamespace(
+        logger=logging.getLogger(__name__), es=SimpleNamespace(delete_by_query=delete_by_query),
+        _es_search_once=search_once,
+    )
+    condition = graph_condition({"knowledge_graph_kwd": ["graph"], "must_not": {"exists": "source_id"}})
+    if operation == "search":
+        ns[operation](connection, [], [], condition, [], None, 0, 10, "idx", ["kb"])
+    elif operation == "update":
+        assert ns[operation](connection, condition, {"removed_kwd": "Y"}, "idx", "kb")
+    else:
+        ns[operation](connection, condition, "idx", "kb")
+    assert queries[0]["bool"]["must_not"] == [{"exists": {"field": "source_id"}}, {"exists": {"field": "compile_kwd"}}]
+
+
+@pytest.mark.parametrize("operation", ["delete_knowledge_graph", "delete_index"])
+def test_dataset_graph_wipe_preserves_compiled_records(runtime, mixed_graph, monkeypatch, operation):
+    from rag.graphrag import phase_markers
+    from rag.graphrag.storage_scope import graph_condition
+
+    monkeypatch.setattr(phase_markers, "clear_phase_markers", MagicMock())
+    kb = SimpleNamespace(id="kb", tenant_id="tenant")
+    ns = load_production_functions("api/apps/services/dataset_api_service.py", {operation}, {
+        "settings": settings, "logging": logging, "graph_condition": graph_condition,
+        "_dataset_extras": SimpleNamespace(graph_delete_keywords=lambda: ["entity", "relation", "graph", "subgraph", "merge_state"]),
+        "_VALID_INDEX_TYPES": {"graph"}, "_INDEX_TYPE_TO_TASK_ID_FIELD": {"graph": "graphrag_task_id"},
+        "KnowledgebaseService": SimpleNamespace(accessible=lambda *args: True, get_by_id=lambda *args: (True, kb), update_by_id=MagicMock()),
+    })
+    args = ("kb", "tenant", "graph") if operation == "delete_index" else ("kb", "tenant")
+    success, _ = ns[operation](*args)
+    assert success
+    assert runtime.store.rows == mixed_graph

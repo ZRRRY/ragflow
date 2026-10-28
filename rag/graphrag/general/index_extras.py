@@ -72,6 +72,7 @@ from rag.graphrag.phase_markers import (
     has_phase_marker,
     set_phase_marker,
 )
+from rag.graphrag.storage_scope import graph_condition, graph_query
 from rag.graphrag.utils import (
     GRAPH_FIELD_SEP,
     GraphChange,
@@ -289,7 +290,7 @@ async def run_graphrag_for_kb(
         try:
             await thread_pool_exec(
                 settings.docStoreConn.delete,
-                {"kb_id": kb_id, "knowledge_graph_kwd": ["subgraph"]},
+                graph_condition({"kb_id": kb_id, "knowledge_graph_kwd": ["subgraph"]}),
                 search.index_name(tenant_id),
                 kb_id,
             )
@@ -305,7 +306,7 @@ async def run_graphrag_for_kb(
         try:
             await thread_pool_exec(
                 settings.docStoreConn.delete,
-                {"kb_id": kb_id, "knowledge_graph_kwd": ["graph", "entity", "relation", "merge_state"]},
+                graph_condition({"kb_id": kb_id, "knowledge_graph_kwd": ["graph", "entity", "relation", "merge_state"]}),
                 search.index_name(tenant_id),
                 kb_id,
             )
@@ -1231,7 +1232,7 @@ async def generate_subgraph(
     )
     await thread_pool_exec(
         settings.docStoreConn.delete,
-        {"knowledge_graph_kwd": "subgraph", "source_id": doc_id},
+        graph_condition({"knowledge_graph_kwd": "subgraph", "source_id": doc_id}),
         search.index_name(tenant_id),
         kb_id,
     )
@@ -1382,7 +1383,7 @@ async def recalc_global_pagerank(
     # Pagination stays stable while we write: the sort keys (entity_kwd +
     # _doc) are immutable across the updates we perform here.
     async for page in search_all_by_search_after(
-        {"knowledge_graph_kwd": ["entity"]},
+        graph_condition({"knowledge_graph_kwd": ["entity"]}),
         search.index_name(tenant_id),
         kb_id,
         ["entity_kwd", "content_with_weight"],
@@ -1647,7 +1648,7 @@ async def resolve_entities_incremental(
     async def _fetch_existing_names_by_type(tenant_id, kb_id, ent_type):
         """Fetch all existing entity names of a given type via scroll."""
         index_name = search.index_name(tenant_id)
-        query_body = {
+        query_body = graph_query({
             "query": {
                 "bool": {
                     "filter": [
@@ -1657,7 +1658,7 @@ async def resolve_entities_incremental(
                     ]
                 }
             }
-        }
+        })
         try:
             # Backends without search_with_scroll (Infinity / OceanBase)
             # return an empty set so resolution can still proceed via
@@ -1891,7 +1892,7 @@ async def _extract_community_core(
             settings.docStoreConn.search,
             ["id"],
             [],
-            {"knowledge_graph_kwd": ["community_report"]},
+            graph_condition({"knowledge_graph_kwd": ["community_report"]}),
             [],
             OrderByExpr(),
             0,
@@ -1908,7 +1909,7 @@ async def _extract_community_core(
         )
         await thread_pool_exec(
             settings.docStoreConn.delete,
-            {"knowledge_graph_kwd": "community_report", "kb_id": kb_id},
+            graph_condition({"knowledge_graph_kwd": "community_report", "kb_id": kb_id}),
             search.index_name(tenant_id),
             kb_id,
         )
@@ -1923,7 +1924,7 @@ async def _extract_community_core(
         try:
             await thread_pool_exec(
                 settings.docStoreConn.delete,
-                {"knowledge_graph_kwd": ["community_report"], "id": stale_ids},
+                graph_condition({"knowledge_graph_kwd": ["community_report"], "id": stale_ids}),
                 search.index_name(tenant_id),
                 kb_id,
             )

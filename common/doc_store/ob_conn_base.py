@@ -23,8 +23,8 @@ from abc import abstractmethod
 from typing import Any
 
 from pymysql.converters import escape_string
-from pyobvector import ObVecClient, FtsIndexParam, FtsParser, VECTOR
-from sqlalchemy import Column, JSON, Table
+from pyobvector import VECTOR, FtsIndexParam, FtsParser, ObVecClient
+from sqlalchemy import JSON, Column, Table
 from sqlalchemy.dialects.mysql import VARCHAR
 
 from common.doc_store.doc_store_base import DocStoreConnection, MatchExpr, OrderByExpr
@@ -588,7 +588,13 @@ class OBConnectionBase(DocStoreConnection):
             if k == "exists":
                 filters.append(f"{v} IS NOT NULL")
             elif k == "must_not" and isinstance(v, dict) and "exists" in v:
-                filters.append(f"{v.get('exists')} IS NULL")
+                excluded = v["exists"]
+                # === CUSTOM BEGIN [graph-missing-fields] ===
+                # Reason: preserve source_id exclusion alongside compile_kwd isolation.
+                # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+                for field in excluded if isinstance(excluded, list) else [excluded]:
+                    filters.append(f"{field} IS NULL")
+                # === CUSTOM END [graph-missing-fields] ===
             elif isinstance(v, list):
                 values: list[str] = []
                 for item in v:

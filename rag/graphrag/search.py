@@ -17,19 +17,25 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
-from copy import deepcopy
+
 import json_repair
 import pandas as pd
 
-from common.misc_utils import get_uuid
-from rag.graphrag.query_analyze_prompt import PROMPTS
-from rag.graphrag.utils import get_entity_type2samples, get_llm_cache, set_llm_cache, get_relation
-from common.token_utils import num_tokens_from_string
-
-from rag.nlp.search import Dealer, index_name
-from common.float_utils import get_float
 from common import settings
 from common.doc_store.doc_store_base import OrderByExpr
+from common.float_utils import get_float
+from common.misc_utils import get_uuid
+from common.token_utils import num_tokens_from_string
+from rag.graphrag.query_analyze_prompt import PROMPTS
+
+# === CUSTOM BEGIN [graphrag-storage-scope] ===
+# Reason: scope GraphRAG callers only; compilation APIs share the same type field.
+# Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+from rag.graphrag.storage_scope import graph_condition
+
+# === CUSTOM END [graphrag-storage-scope] ===
+from rag.graphrag.utils import get_entity_type2samples, get_llm_cache, get_relation, set_llm_cache
+from rag.nlp.search import Dealer, index_name
 
 
 class KGSearch(Dealer):
@@ -110,7 +116,7 @@ class KGSearch(Dealer):
     def get_relevant_ents_by_keywords(self, keywords, filters, idxnms, kb_ids, emb_mdl, sim_thr=0.3, N=56):
         if not keywords:
             return {}
-        filters = deepcopy(filters)
+        filters = graph_condition(filters)
         filters["knowledge_graph_kwd"] = "entity"
         matchDense = self.get_vector(", ".join(keywords), emb_mdl, 1024, sim_thr)
         es_res = self.dataStore.search(["content_with_weight", "entity_kwd", "rank_flt", "n_hop_with_weight"], [], filters, [matchDense], OrderByExpr(), 0, N, idxnms, kb_ids)
@@ -119,7 +125,7 @@ class KGSearch(Dealer):
     def get_relevant_relations_by_txt(self, txt, filters, idxnms, kb_ids, emb_mdl, sim_thr=0.3, N=56):
         if not txt:
             return {}
-        filters = deepcopy(filters)
+        filters = graph_condition(filters)
         filters["knowledge_graph_kwd"] = "relation"
         matchDense = self.get_vector(txt, emb_mdl, 1024, sim_thr)
         es_res = self.dataStore.search(["content_with_weight", "_score", "from_entity_kwd", "to_entity_kwd", "weight_int"], [], filters, [matchDense], OrderByExpr(), 0, N, idxnms, kb_ids)
@@ -128,7 +134,7 @@ class KGSearch(Dealer):
     def get_relevant_ents_by_types(self, types, filters, idxnms, kb_ids, N=56):
         if not types:
             return {}
-        filters = deepcopy(filters)
+        filters = graph_condition(filters)
         filters["knowledge_graph_kwd"] = "entity"
         filters["entity_type_kwd"] = types
         ordr = OrderByExpr()
@@ -279,7 +285,7 @@ class KGSearch(Dealer):
         fields = ["docnm_kwd", "content_with_weight"]
         odr = OrderByExpr()
         odr.desc("weight_flt")
-        fltr = deepcopy(condition)
+        fltr = graph_condition(condition)
         fltr["knowledge_graph_kwd"] = "community_report"
         fltr["entities_kwd"] = entities
         comm_res = self.dataStore.search(fields, [], fltr, [], odr, 0, topn, idxnms, kb_ids)
@@ -297,10 +303,11 @@ class KGSearch(Dealer):
 
 if __name__ == "__main__":
     import argparse
-    from common.constants import LLMType
+
+    from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance, get_tenant_default_model_by_type
     from api.db.services.knowledgebase_service import KnowledgebaseService
     from api.db.services.llm_service import LLMBundle
-    from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type, get_model_config_from_provider_instance
+    from common.constants import LLMType
     from rag.nlp import search
 
     settings.init_settings()

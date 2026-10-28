@@ -3,6 +3,13 @@
 
 from common.misc_utils import thread_pool_exec
 
+# === CUSTOM BEGIN [graphrag-storage-scope] ===
+# Reason: scope GraphRAG callers only; compilation APIs share the same type field.
+# Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+from rag.graphrag.storage_scope import graph_condition
+
+# === CUSTOM END [graphrag-storage-scope] ===
+
 """
 Reference:
  - [graphrag](https://github.com/microsoft/graphrag)
@@ -27,18 +34,20 @@ import numpy as np
 import xxhash
 from networkx.readwrite import json_graph
 
-from common.misc_utils import get_uuid
-from common.connection_utils import timeout
-from common.asyncio_utils import LoopLocalSemaphore
-from rag.nlp import rag_tokenizer, search
-from rag.utils.redis_conn import REDIS_CONN
 from common import settings
+from common.asyncio_utils import LoopLocalSemaphore
+from common.connection_utils import timeout
 from common.doc_store.doc_store_base import OrderByExpr
+from common.misc_utils import get_uuid
+
 # === CUSTOM BEGIN [graphrag-incremental] ===
 # 原因：增量/优化功能开关，用于 utils 路由
 # 日期：2026-06-20
 # 关联：rag/graphrag/utils_extras.py
 from rag.graphrag.config import GraphRAGConfig
+from rag.nlp import rag_tokenizer, search
+from rag.utils.redis_conn import REDIS_CONN
+
 # === CUSTOM END [graphrag-incremental] ===
 
 GRAPH_FIELD_SEP = "<SEP>"
@@ -471,7 +480,7 @@ async def get_relation(tenant_id, kb_id, from_ent_name, to_ent_name, size=1):
         to_ent_name = [to_ent_name]
     ents.extend(to_ent_name)
     ents = list(set(ents))
-    conds = {"fields": ["content_with_weight"], "size": size, "from_entity_kwd": ents, "to_entity_kwd": ents, "knowledge_graph_kwd": ["relation"]}
+    conds = graph_condition({"fields": ["content_with_weight"], "size": size, "from_entity_kwd": ents, "to_entity_kwd": ents, "knowledge_graph_kwd": ["relation"]})
     res = []
     es_res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id] if isinstance(kb_id, str) else kb_id)
     for id in es_res.ids:
@@ -538,10 +547,10 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
         return await utils_extras.does_graph_contains(tenant_id, kb_id, doc_id)
     # === CUSTOM END [graphrag-incremental] ===
     fields = ["source_id"]
-    condition = {
+    condition = graph_condition({
         "knowledge_graph_kwd": ["graph"],
         "removed_kwd": "N",
-    }
+    })
     res = await thread_pool_exec(settings.docStoreConn.search, fields, [], condition, [], OrderByExpr(), 0, 1, search.index_name(tenant_id), [kb_id])
     fields2 = settings.docStoreConn.get_fields(res, fields)
     graph_doc_ids = set()
@@ -552,7 +561,7 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
 
 async def get_graph_doc_ids(tenant_id, kb_id) -> list[str]:
     """Return the list of document IDs referenced by the stored graph for *kb_id*."""
-    conds = {"fields": ["source_id"], "removed_kwd": "N", "size": 1, "knowledge_graph_kwd": ["graph"]}
+    conds = graph_condition({"fields": ["source_id"], "removed_kwd": "N", "size": 1, "knowledge_graph_kwd": ["graph"]})
     res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
     doc_ids = []
     if res.total == 0:
@@ -564,7 +573,7 @@ async def get_graph_doc_ids(tenant_id, kb_id) -> list[str]:
 
 async def get_graph_from_json(tenant_id, kb_id, exclude_rebuild=None):
     """Legacy path: load the monolithic graph JSON blob."""
-    conds = {"fields": ["content_with_weight", "removed_kwd", "source_id"], "size": 1, "knowledge_graph_kwd": ["graph"]}
+    conds = graph_condition({"fields": ["content_with_weight", "removed_kwd", "source_id"], "size": 1, "knowledge_graph_kwd": ["graph"]})
     res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
     if not res.total == 0:
         for id in res.ids:
@@ -771,14 +780,14 @@ async def _set_graph_impl(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
     # All new chunks are ready.  Now delete old data and insert the new data.
     # Deleting only after chunks are built ensures that a crash during embedding
     # generation above does not destroy the old graph/subgraph checkpoints.
-    await thread_pool_exec(settings.docStoreConn.delete, {"knowledge_graph_kwd": ["graph", "subgraph"]}, search.index_name(tenant_id), kb_id)
+    await thread_pool_exec(settings.docStoreConn.delete, graph_condition({"knowledge_graph_kwd": ["graph", "subgraph"]}), search.index_name(tenant_id), kb_id)
 
     if change.removed_nodes:
         BATCH_SIZE = 100
         sorted_nodes = sorted(change.removed_nodes)
         for i in range(0, len(sorted_nodes), BATCH_SIZE):
             batch = sorted_nodes[i : i + BATCH_SIZE]
-            await thread_pool_exec(settings.docStoreConn.delete, {"knowledge_graph_kwd": ["entity"], "entity_kwd": batch}, search.index_name(tenant_id), kb_id)
+            await thread_pool_exec(settings.docStoreConn.delete, graph_condition({"knowledge_graph_kwd": ["entity"], "entity_kwd": batch}), search.index_name(tenant_id), kb_id)
 
     if change.removed_edges:
 
@@ -788,7 +797,7 @@ async def _set_graph_impl(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph,
                 try:
                     async with chat_limiter:
                         await thread_pool_exec(
-                            settings.docStoreConn.delete, {"knowledge_graph_kwd": ["relation"], "from_entity_kwd": from_node, "to_entity_kwd": to_node}, search.index_name(tenant_id), kb_id
+                            settings.docStoreConn.delete, graph_condition({"knowledge_graph_kwd": ["relation"], "from_entity_kwd": from_node, "to_entity_kwd": to_node}), search.index_name(tenant_id), kb_id
                         )
                     return
                 except Exception as e:
@@ -915,7 +924,7 @@ def n_neighbor(graph: nx.Graph, node, n_hop: int = 2):
 
 async def get_entity_type2samples(idxnms, kb_ids: list):
     """Return a mapping of entity type → sample entity names fetched from the document store."""
-    es_res = await settings.retriever.search({"knowledge_graph_kwd": "ty2ents", "kb_id": kb_ids, "size": 10000, "fields": ["content_with_weight"]}, idxnms, kb_ids)
+    es_res = await settings.retriever.search(graph_condition({"knowledge_graph_kwd": "ty2ents", "kb_id": kb_ids, "size": 10000, "fields": ["content_with_weight"]}), idxnms, kb_ids)
 
     res = defaultdict(list)
     for id in es_res.ids:
@@ -950,7 +959,7 @@ async def rebuild_graph(tenant_id, kb_id, exclude_rebuild=None):
     flds = ["knowledge_graph_kwd", "content_with_weight", "source_id"]
     bs = 256
     for i in range(0, 1024 * bs, bs):
-        es_res = await thread_pool_exec(settings.docStoreConn.search, flds, [], {"kb_id": kb_id, "knowledge_graph_kwd": ["subgraph"]}, [], OrderByExpr(), i, bs, search.index_name(tenant_id), [kb_id])
+        es_res = await thread_pool_exec(settings.docStoreConn.search, flds, [], graph_condition({"kb_id": kb_id, "knowledge_graph_kwd": ["subgraph"]}), [], OrderByExpr(), i, bs, search.index_name(tenant_id), [kb_id])
         # tot = settings.docStoreConn.get_total(es_res)
         es_res = settings.docStoreConn.get_fields(es_res, flds)
 

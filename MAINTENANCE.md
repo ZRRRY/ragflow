@@ -114,8 +114,8 @@ git -c http.proxy=http://127.0.0.1:7897 -c http.sslBackend=openssl push fork dev
 # 当前改了哪些官方文件？
 git diff --name-only v0.26.4
 
-# 现状基线（2026-10-28）：17 个已存在的官方文件有差异 =
-#   16 个 patch 管理内（包括 .gitattributes、删除测试隔离和火山引擎地址配置）
+# 现状基线（2026-10-28）：22 个已存在的官方文件有差异 =
+#   21 个 patch 管理内（包括 .gitattributes、删除测试隔离和火山引擎地址配置）
 #   + 1 个前端 tsx（sidebar import 顺序的良性差异，见 MODIFICATIONS.md 第二节）
 # uv.lock 经重新锁定和检查，与官方 v0.26.4 一致；将来由工具生成，不人工拼接
 # 新增官方文件修改时，先评估是否能抽离为 extras/patch

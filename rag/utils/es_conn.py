@@ -14,18 +14,19 @@
 #  limitations under the License.
 #
 
-import re
+import copy
 import json
+import re
 import time
 
-import copy
-from elasticsearch_dsl import UpdateByQuery, Q, Search
 from elastic_transport import ConnectionTimeout
+from elasticsearch_dsl import Q, Search, UpdateByQuery
+
+from common.constants import PAGERANK_FLD, TAG_FLD
 from common.decorator import singleton
-from common.doc_store.doc_store_base import MatchTextExpr, OrderByExpr, MatchExpr, MatchDenseExpr, FusionExpr
+from common.doc_store.doc_store_base import FusionExpr, MatchDenseExpr, MatchExpr, MatchTextExpr, OrderByExpr
 from common.doc_store.es_conn_base import ESConnectionBase
 from common.float_utils import get_float
-from common.constants import PAGERANK_FLD, TAG_FLD
 
 ATTEMPT_TIME = 2
 MAX_RESULT_WINDOW = 10000
@@ -176,7 +177,12 @@ class ESConnection(ESConnectionBase):
                 if isinstance(v, dict):
                     for kk, vv in v.items():
                         if kk == "exists":
-                            bool_query.must_not.append(Q("exists", field=vv))
+                            # === CUSTOM BEGIN [graph-missing-fields] ===
+                            # Reason: preserve source_id exclusion alongside compile_kwd isolation.
+                            # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+                            for field in vv if isinstance(vv, list) else [vv]:
+                                bool_query.must_not.append(Q("exists", field=field))
+                            # === CUSTOM END [graph-missing-fields] ===
                     continue
             if not v:
                 continue
@@ -314,15 +320,14 @@ class ESConnection(ESConnectionBase):
             try:
                 res = []
                 # === CUSTOM BEGIN [es-bulk-no-wait-for-refresh] ===
-                # 原因：bulk 写入不再等待 refresh 可见（实测 GraphRAG 合并阶段单 bulk 均值 6.17s，
-                #       wait_for 是主因）；可见性改由调用方显式保证：
-                #       GraphRAG 路径在写入末尾 refresh_idx（utils_extras._post_insert_refresh），
-                #       单 chunk 写入由 es_conn_extras 的 insert 包装器兜底 refresh_idx，
-                #       doc_metadata_service 已显式 refresh_idx，其余路径容忍默认 refresh_interval(1s)。
-                # 日期：2026-09-14
-                # 关联：common/doc_store/es_conn_extras.py、rag/graphrag/utils_extras.py
+                # Only GraphRAG batches have an explicit phase-end refresh.
+                # Compilation stages read intermediate rows immediately, so they
+                # and ordinary chunk writes retain the official visibility contract.
+                graph_batch = bool(documents) and all(
+                    d.get("knowledge_graph_kwd") and "compile_kwd" not in d for d in documents
+                )
                 r = self.es.bulk(index=index_name, operations=operations,
-                                 refresh="false", timeout="60s")
+                                 refresh="false" if graph_batch else "wait_for", timeout="60s")
                 # === CUSTOM END [es-bulk-no-wait-for-refresh] ===
                 if re.search(r"False", str(r["errors"]), re.IGNORECASE):
                     return res
@@ -404,7 +409,12 @@ class ESConnection(ESConnectionBase):
                 if isinstance(v, dict):
                     for kk, vv in v.items():
                         if kk == "exists":
-                            bool_query.must_not.append(Q("exists", field=vv))
+                            # === CUSTOM BEGIN [graph-missing-fields] ===
+                            # Reason: preserve source_id exclusion alongside compile_kwd isolation.
+                            # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+                            for field in vv if isinstance(vv, list) else [vv]:
+                                bool_query.must_not.append(Q("exists", field=field))
+                            # === CUSTOM END [graph-missing-fields] ===
                     continue
             if isinstance(v, list):
                 bool_query.filter.append(Q("terms", **{k: v}))
@@ -544,7 +554,12 @@ class ESConnection(ESConnectionBase):
                 if isinstance(v, dict):
                     for kk, vv in v.items():
                         if kk == "exists":
-                            bool_query.must_not.append(Q("exists", field=vv))
+                            # === CUSTOM BEGIN [graph-missing-fields] ===
+                            # Reason: preserve source_id exclusion alongside compile_kwd isolation.
+                            # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+                            for field in vv if isinstance(vv, list) else [vv]:
+                                bool_query.must_not.append(Q("exists", field=field))
+                            # === CUSTOM END [graph-missing-fields] ===
             elif isinstance(v, list):
                 bool_query.must.append(Q("terms", **{k: v}))
             elif isinstance(v, str) or isinstance(v, int):

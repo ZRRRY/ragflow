@@ -14,6 +14,7 @@ import logging
 from common import settings
 from common.doc_store.doc_store_base import OrderByExpr
 from rag.graphrag.config import GraphRAGConfig
+from rag.graphrag.storage_scope import graph_condition, graph_query
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +24,7 @@ def cleanup_knowledge_graph_references(doc, chunk_index_name):
 
     Dispatches between the official v0.26.0 behavior and the custom incremental
     GraphRAG behavior based on ``GraphRAGConfig.DELETE_SUBGRAPH_ON_DOC_DELETE``.
-    When incremental GraphRAG is disabled, the official logic is executed
-    verbatim to keep the default behavior unchanged.
+    Both paths exclude compilation records, which share the graph type field.
     """
     # Preserve the official chunk-count shortcut only for the legacy path;
     # delta records can exist even when the document counter is zero.
@@ -37,12 +37,12 @@ def cleanup_knowledge_graph_references(doc, chunk_index_name):
 
 
 def _cleanup_knowledge_graph_references_official(doc, chunk_index_name):
-    """Official v0.26.0 cleanup logic (kept verbatim)."""
+    """Legacy cleanup, restricted to GraphRAG records."""
     graph_source = settings.docStoreConn.get_fields(
         settings.docStoreConn.search(
             ["source_id"],
             [],
-            {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]},
+            graph_condition({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}),
             [],
             OrderByExpr(),
             0,
@@ -54,14 +54,14 @@ def _cleanup_knowledge_graph_references_official(doc, chunk_index_name):
     )
     if len(graph_source) > 0 and doc.id in list(graph_source.values())[0]["source_id"]:
         settings.docStoreConn.update(
-            {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "source_id": doc.id},
+            graph_condition({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "source_id": doc.id}),
             {"remove": {"source_id": doc.id}},
             chunk_index_name,
             doc.kb_id,
         )
-        settings.docStoreConn.update({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
+        settings.docStoreConn.update(graph_condition({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}), {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
         settings.docStoreConn.delete(
-            {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "must_not": {"exists": "source_id"}},
+            graph_condition({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "must_not": {"exists": "source_id"}}),
             chunk_index_name,
             doc.kb_id,
         )
@@ -70,16 +70,16 @@ def _cleanup_knowledge_graph_references_official(doc, chunk_index_name):
 def _graph_records_with_source(doc, chunk_index_name, kg_types):
     """Read only affected records so their embedded provenance can be updated too."""
     conn = settings.docStoreConn
-    filters = {"knowledge_graph_kwd": kg_types, "source_id": doc.id}
+    filters = graph_condition({"knowledge_graph_kwd": kg_types, "source_id": doc.id})
     fields = ["content_with_weight", "source_id", "knowledge_graph_kwd"]
     if hasattr(conn, "search_with_scroll"):
         result = conn.search_with_scroll(
             chunk_index_name,
-            {"query": {"bool": {"filter": [
+            graph_query({"query": {"bool": {"filter": [
                 {"terms": {"kb_id": [doc.kb_id]}},
                 {"terms": {"knowledge_graph_kwd": kg_types}},
                 {"term": {"source_id": doc.id}},
-            ]}}},
+            ]}}}),
             fields,
         )
         if result.get("_truncated"):
@@ -126,22 +126,22 @@ def _cleanup_knowledge_graph_references_incremental(doc, chunk_index_name):
 
     # delete_by_query applies to all matching checkpoints without a scroll cap.
     conn.delete(
-        {"knowledge_graph_kwd": ["subgraph", "merge_state"], "source_id": doc.id},
+        graph_condition({"knowledge_graph_kwd": ["subgraph", "merge_state"], "source_id": doc.id}),
         chunk_index_name, doc.kb_id,
     )
     result = conn.update(
-        {"knowledge_graph_kwd": kg_types, "source_id": doc.id},
+        graph_condition({"knowledge_graph_kwd": kg_types, "source_id": doc.id}),
         {"remove": {"source_id": doc.id}},
         chunk_index_name, doc.kb_id,
     )
     if result is False:
         raise RuntimeError(f"Failed to remove graph provenance for document {doc.id}")
     # A legacy JSON graph may still exist after enabling incremental mode.
-    result = conn.update({"knowledge_graph_kwd": ["graph"]}, {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
+    result = conn.update(graph_condition({"knowledge_graph_kwd": ["graph"]}), {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
     if result is False:
         raise RuntimeError(f"Failed to mark the legacy graph removed for document {doc.id}")
     for offset in range(0, len(emptied_ids), 1000):
         conn.delete(
-            {"id": emptied_ids[offset:offset + 1000], "knowledge_graph_kwd": kg_types},
+            graph_condition({"id": emptied_ids[offset:offset + 1000], "knowledge_graph_kwd": kg_types}),
             chunk_index_name, doc.kb_id,
         )

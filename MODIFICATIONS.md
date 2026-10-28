@@ -42,9 +42,9 @@ git diff <旧tag>..<新tag> -- <官方文件>
 
 ---
 
-## 二、官方文件修改清单（17 个）
+## 二、官方文件修改清单（22 个）
 
-### patch 管理内（16 个，对应 `patches/*.patch`）
+### patch 管理内（21 个，对应 `patches/*.patch`）
 
 | 官方文件 | 改动摘要 | patch 文件 |
 |---------|---------|-----------|
@@ -52,18 +52,23 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | `.gitattributes` | 补丁默认 LF；上游 CRLF 测试的补丁保留原字节，确保上下文可应用 | `.gitattributes.patch` |
 | `api/apps/restful_apis/dataset_api.py` | 新增 `delete_knowledge_graph` 转发函数（修复 main 上 `backward_compat.py` 废弃端点的坏引用） | `api_apps_restful_apis_dataset_api.py.patch` |
 | `api/apps/services/dataset_api_service.py` | `get_knowledge_graph` 委托 extras；删图关键词增加 `merge_state` | `api_apps_services_dataset_api_service.py.patch` |
-| `api/db/services/document_service.py` | 删文档的 GraphRAG 清理逻辑抽至 `document_delete_extras.py`（官方路径逐字保留） | `api_db_services_document_service.py.patch` |
+| `api/db/services/document_service.py` | 删文档的 GraphRAG 清理委托 extras；legacy 和增量路径均排除编译数据 | `api_db_services_document_service.py.patch` |
 | `common/settings.py` | `init_settings()` 中安装 ES extras 与删除审计两个 hook（带异常兜底；OS extras hook 已于 2026-09-12 随 OS 后端弃用移除） | `common_settings.py.patch` |
 | `rag/graphrag/entity_resolution.py` | 尾部 CUSTOM 块：flag 开启时类重绑定 + 额外导出 | `rag_graphrag_entity_resolution.py.patch` |
 | `rag/graphrag/general/index.py` | 尾部调用 `index_patch.apply_patch()` | `rag_graphrag_general_index.py.patch` |
 | `rag/graphrag/utils.py` | `does_graph_contains`/`get_graph` flag 路由；`set_graph` 无条件委托 extras；书籍/章节跳过 embedding | `rag_graphrag_utils.py.patch` |
 | `rag/svr/task_executor.py` | 尾部 import 并调用 `patch_task_executor()` | `rag_svr_task_executor.py.patch` |
-| `rag/utils/es_conn.py` | bulk 不等待刷新，delete 支持 refresh 参数；阶段末由 extras 保证可见性 | `rag_utils_es_conn.py.patch` |
+| `rag/utils/es_conn.py` | 仅纯 GraphRAG bulk 不等待刷新；编译/普通写入 wait_for；delete 支持 refresh；多字段缺失条件 | `rag_utils_es_conn.py.patch` |
 | `test/unit_test/api/apps/services/test_delete_datasets.py` | 隔离自定义 service import 的 Quart 包和 NLP 包，保持删除测试独立运行 | `test_unit_test_api_apps_services_test_delete_datasets.py.patch` |
 | `web/src/locales/en.ts` | 新增 `datasetOverview.totalChunks` 文案 | `web_src_locales_en.ts.patch` |
 | `web/src/locales/zh.ts` | 同上（中文） | `web_src_locales_zh.ts.patch` |
 | `web/src/pages/dataset/dataset-overview/index.tsx` | Total chunks 统计卡、grid-cols-4（带 CUSTOM 标记） | `web_src_pages_dataset_dataset-overview_index.tsx.patch` |
 | `web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts` | 火山引擎 Coding/标准 API 地址选择与提交 | `web_src_pages_user-setting_setting-model_modal_provider-modal_field-config_provider-config-map.ts.patch` |
+| `common/doc_store/infinity_conn_base.py` | 支持组合多个缺失字段条件，避免覆盖原 source_id 条件 | `common_doc_store_infinity_conn_base.py.patch` |
+| `common/doc_store/ob_conn_base.py` | 支持组合多个缺失字段条件，避免覆盖原 source_id 条件 | `common_doc_store_ob_conn_base.py.patch` |
+| `rag/graphrag/search.py` | GraphRAG 检索排除编译数据 | `rag_graphrag_search.py.patch` |
+| `rag/utils/ob_conn.py` | 支持组合多个缺失字段条件，避免覆盖原 source_id 条件 | `rag_utils_ob_conn.py.patch` |
+| `rag/utils/opensearch_conn.py` | 支持组合多个缺失字段条件，避免覆盖原 source_id 条件 | `rag_utils_opensearch_conn.py.patch` |
 
 ### patch 管理外（1 个格式差异）
 
@@ -83,6 +88,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | | `rag/graphrag/general/index_extras.py` | 增量编排、ChapterGraph、增量 merge/消解、异步 community、全局 PageRank 重算 |
 | | `rag/graphrag/general/index_patch.py` | monkey-patch 调度器：保存原函数、按 flag 路由 |
 | | `rag/graphrag/utils_extras.py` | 增量存储层：set_graph_delta、merge_state、在线组图、可视化 256 节点策略、拓扑专用加载（PageRank 用） |
+| | `rag/graphrag/storage_scope.py` | GraphRAG 条件及原生查询排除 compile_kwd，隔离编译记录 |
 | | `rag/graphrag/utils_pagination.py` | search_after + `_doc` tiebreaker 分页（仅 ES/OS 后端） |
 | | `rag/graphrag/entity_resolution_extras.py` | 增量实体消解（excluded_types、候选注入、数字 2-gram 规则） |
 | | `rag/graphrag/document_delete_extras.py` | 文档删除时的 KG 清理（显式 ID 防误删） |
@@ -97,7 +103,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | | `web/src/assets/svg/data-flow/total-chunks-icon{,-bri}.svg` | 统计卡图标（暗/亮主题） |
 | 测试 | `test/unit_test/rag/graphrag/` | GraphRAG 工具、分页、checkpoint、拓扑、增量写入/删除/消解回归测试；`test_review_findings.py` 覆盖五项审查问题及失败边界 |
 | 运维 | `docker/finisher/`（3 个文件） | 卡死任务收尾脚本（默认 dry-run）+ README + 辅助 SQL |
-| 管理 | `patches/`（16 patch + apply/regenerate 脚本 + README） | 官方文件改动的双轨管理 |
+| 管理 | `patches/`（21 patch + apply/regenerate 脚本 + README） | 官方文件改动的双轨管理 |
 | | `MAINTENANCE.md`、本文档 | 维护规范与漂移清单 |
 
 ---
@@ -262,3 +268,14 @@ git diff <旧tag>..<新tag> -- <官方文件>
 - 验证：GraphRAG 220 项通过（新增 10 项），数据集删除 2 项通过；前端生产构建和定制文件 ESLint 通过。前端类型检查在合并版和相同依赖的纯净官方 v0.26.4 上均有相同 223 项错误，没有新增诊断。
 - Python 1021 个文件通过语法解析；官方数据集 API 的 32 个函数保持一致，本地删除包装器和路由仍保留。Ruff 修复新增测试与合并 import 排序问题，仍有历史及上游既有诊断；相对官方标签的定制源码差异通过空白检查。完整合并差异中的上游空白诊断未作无关整理。
 - 测试使用外部服务替身，不包含真实 ES/Redis/模型集成、生产数据库迁移或部署。spaCy 包已安装供测试导入，但未验证各语言 NER 模型。生产切换前仍需在隔离数据上验证多文档构图、共享来源删除、取消/恢复及可视化检索，并备份数据库与 ES。
+
+
+## 九、2026-10-28：修复 v0.26.4 合并审查问题
+
+- ES `insert` 仅对全部属于 GraphRAG 且不带 `compile_kwd` 的批次使用 `refresh=false`；编译数据、普通数据和混合批次恢复官方 `wait_for`。Wiki REDUCE 写入后 PLAN 可立即查询中间结果，GraphRAG 保留阶段末显式刷新优化。
+- `storage_scope.py` 为 GraphRAG 查询和写入前查找、清理条件增加 `must_not exists compile_kwd`。覆盖 legacy JSON、增量关系/实体、scroll、search_after、拓扑/可视化、消解候选、检索、数据集删图和文档来源清理。编译 API 和编译数据格式不变；已有编译记录也被隔离。
+- ES/OpenSearch/Infinity/OceanBase 条件转换接受多个缺失字段，避免隔离条件替换 legacy 清理原有的 `source_id` 条件；OpenSearch 批量更新补充同样的排除支持。
+- 新增回归验证实际 Wiki 持久化/读取、ES bulk 策略与查询/更新/删除 DSL、相同业务键的混存图、分页、增量删除、legacy/增量来源清理和两个数据集删图入口。测试使用传输/存储替身；未运行真实 ES 或其他后端服务集成。
+- patch 清单扩展为 21 项，新增的官方文件修改纳入 v0.26.4 补丁再生成与字节一致性验证。
+
+验证结果：GraphRAG 237 项 + 数据集删除 2 项，共 239 项通过；本次新增 17 项回归测试。

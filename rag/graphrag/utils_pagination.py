@@ -28,8 +28,9 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator
 
-from common.misc_utils import thread_pool_exec
 from common import settings
+from common.misc_utils import thread_pool_exec
+from rag.graphrag.storage_scope import graph_query
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ def _build_query_body(filters: dict, sort_field: str, page_size: int,
     }
     if search_after:
         body["search_after"] = search_after
-    return body
+    return graph_query(body)
 
 
 def _filters_to_clauses(filters: dict) -> list[dict]:
@@ -79,7 +80,13 @@ def _filters_to_clauses(filters: dict) -> list[dict]:
     for k, v in (filters or {}).items():
         if v is None:
             continue
-        if isinstance(v, list):
+        if k == "must_not" and isinstance(v, dict):
+            excluded = v.get("exists", [])
+            clauses.append({"bool": {"must_not": [
+                {"exists": {"field": field}}
+                for field in (excluded if isinstance(excluded, list) else [excluded])
+            ]}})
+        elif isinstance(v, list):
             clauses.append({"terms": {k: v}})
         elif isinstance(v, (str, int, bool)):
             clauses.append({"term": {k: v}})

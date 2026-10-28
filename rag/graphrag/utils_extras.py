@@ -25,8 +25,8 @@ that the default (all flags off) is equivalent to the official v0.26.1 path.
 """
 
 import asyncio
-import inspect
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -43,15 +43,18 @@ from common import settings
 from common.asyncio_utils import LoopLocalSemaphore
 from common.doc_store.doc_store_base import OrderByExpr
 from common.misc_utils import get_uuid, thread_pool_exec
-from rag.graphrag.config import GraphRAGConfig
-from rag.graphrag.utils_pagination import (
-    collect_all as _collect_all_search_after,
-    supports_search_after as _supports_search_after,
-)
-from rag.nlp import rag_tokenizer, search
 
 # Official helpers reused by the custom paths.
 from rag.graphrag import utils as _utils
+from rag.graphrag.config import GraphRAGConfig
+from rag.graphrag.storage_scope import graph_condition, graph_query
+from rag.graphrag.utils_pagination import (
+    collect_all as _collect_all_search_after,
+)
+from rag.graphrag.utils_pagination import (
+    supports_search_after as _supports_search_after,
+)
+from rag.nlp import rag_tokenizer, search
 
 logger = logging.getLogger(__name__)
 
@@ -275,11 +278,11 @@ async def _delete_relation_edges_bulk(
             try:
                 async with _utils.chat_limiter:
                     await _docstore_delete(
-                        {
+                        graph_condition({
                             "knowledge_graph_kwd": ["relation"],
                             "from_entity_kwd": from_node,
                             "to_entity_kwd": to_batch,
-                        },
+                        }),
                         tenant_id,
                         kb_id,
                     )
@@ -309,11 +312,11 @@ async def write_merge_state(
     # 清理旧记录（refresh=false；可见性由阶段末 refresh_graphrag_index 兜底）
     try:
         await _docstore_delete(
-            {
+            graph_condition({
                 "knowledge_graph_kwd": ["merge_state"],
                 "source_id": [doc_id],
                 "kb_id": kb_id,
-            },
+            }),
             tenant_id,
             kb_id,
         )
@@ -362,10 +365,10 @@ async def query_merge_state(
     条同 ``doc_id`` 的 ``merge_state`` 文档。这里取 ``updated_at`` 最大
     的一条，确保行为确定（P3-2）。
     """
-    condition = {
+    condition = graph_condition({
         "knowledge_graph_kwd": ["merge_state"],
         "source_id": [doc_id],
-    }
+    })
     try:
         res = await thread_pool_exec(
             settings.docStoreConn.search,
@@ -472,7 +475,7 @@ async def query_existing_entities(tenant_id, kb_id, node_names, callback=None):
         async with _query_limiter:
             rows = await _query_graph_records(
                 tenant_id, kb_id,
-                {"knowledge_graph_kwd": ["entity"], "entity_kwd": batch},
+                graph_condition({"knowledge_graph_kwd": ["entity"], "entity_kwd": batch}),
                 ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"],
                 "entity_kwd",
             )
@@ -510,7 +513,7 @@ async def query_existing_relations(tenant_id, kb_id, edge_pairs, callback=None):
     async def query_batch(condition):
         async with _query_limiter:
             rows = await _query_graph_records(
-                tenant_id, kb_id, {"knowledge_graph_kwd": ["relation"], **condition},
+                tenant_id, kb_id, graph_condition({"knowledge_graph_kwd": ["relation"], **condition}),
                 ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"],
                 "from_entity_kwd",
             )
@@ -532,7 +535,7 @@ async def query_node_relations(tenant_id, kb_id, node_names):
         for endpoint in ("from_entity_kwd", "to_entity_kwd"):
             rows = await _query_graph_records(
                 tenant_id, kb_id,
-                {"knowledge_graph_kwd": ["relation"], endpoint: node_names[offset:offset + 100]},
+                graph_condition({"knowledge_graph_kwd": ["relation"], endpoint: node_names[offset:offset + 100]}),
                 ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"], endpoint,
             )
             for fields in rows:
@@ -585,7 +588,7 @@ async def get_graph_topology_from_index(tenant_id, kb_id, skip_entity_type=None,
     excluded: set = set()
 
     ent_fields = ["entity_kwd", "entity_type_kwd"]
-    ent_query = {
+    ent_query = graph_query({
         "query": {
             "bool": {
                 "filter": [
@@ -594,7 +597,7 @@ async def get_graph_topology_from_index(tenant_id, kb_id, skip_entity_type=None,
                 ]
             }
         }
-    }
+    })
     for _cid, d in (await _scroll(ent_query, ent_fields, "entity")).items():
         name = d.get("entity_kwd")
         if isinstance(name, list):
@@ -613,7 +616,7 @@ async def get_graph_topology_from_index(tenant_id, kb_id, skip_entity_type=None,
         return None
 
     rel_fields = ["from_entity_kwd", "to_entity_kwd"]
-    rel_query = {
+    rel_query = graph_query({
         "query": {
             "bool": {
                 "filter": [
@@ -622,7 +625,7 @@ async def get_graph_topology_from_index(tenant_id, kb_id, skip_entity_type=None,
                 ]
             }
         }
-    }
+    })
     for _cid, d in (await _scroll(rel_query, rel_fields, "relation")).items():
         src = d.get("from_entity_kwd")
         tgt = d.get("to_entity_kwd")
@@ -669,7 +672,7 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
     # ------------------------------------------------------------------
     ent_flds = ["entity_kwd", "entity_type_kwd", "content_with_weight", "source_id"]
 
-    ent_query = {
+    ent_query = graph_query({
         "query": {
             "bool": {
                 "filter": [
@@ -678,7 +681,7 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
                 ]
             }
         }
-    }
+    })
 
     es_res = await thread_pool_exec(
         settings.docStoreConn.search_with_scroll,
@@ -721,7 +724,7 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
     # ------------------------------------------------------------------
     rel_flds = ["from_entity_kwd", "to_entity_kwd", "content_with_weight", "source_id"]
 
-    rel_query = {
+    rel_query = graph_query({
         "query": {
             "bool": {
                 "filter": [
@@ -730,7 +733,7 @@ async def get_graph_from_index(tenant_id, kb_id, exclude_entity_types=None):
                 ]
             }
         }
-    }
+    })
 
     es_res = await thread_pool_exec(
         settings.docStoreConn.search_with_scroll,
@@ -827,7 +830,7 @@ async def get_graph_from_index_for_visualization(
             settings.docStoreConn.search,
             ent_flds,
             [],
-            {"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]},
+            graph_condition({"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]}),
             [],
             OrderByExpr().desc("rank_flt"),
             0,
@@ -936,7 +939,7 @@ async def get_graph_from_index_for_visualization(
                     settings.docStoreConn.search,
                     ent_flds,
                     [],
-                    {"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]},
+                    graph_condition({"kb_id": [kb_id], "knowledge_graph_kwd": ["entity"]}),
                     [],
                     OrderByExpr().desc("rank_flt"),
                     offset,
@@ -1170,7 +1173,7 @@ async def _delete_removed_graph_records(tenant_id, kb_id, change):
     nodes = sorted(change.removed_nodes - change.added_updated_nodes)
     for offset in range(0, len(nodes), 100):
         await _docstore_delete(
-            {"knowledge_graph_kwd": ["entity"], "entity_kwd": nodes[offset:offset + 100]},
+            graph_condition({"knowledge_graph_kwd": ["entity"], "entity_kwd": nodes[offset:offset + 100]}),
             tenant_id, kb_id,
         )
     updated = {_utils.get_from_to(*pair) for pair in change.added_updated_edges}
@@ -1180,7 +1183,7 @@ async def _delete_removed_graph_records(tenant_id, kb_id, change):
     relation_ids = sorted({fields["id"] for fields in relations.values()})
     for offset in range(0, len(relation_ids), 100):
         await _docstore_delete(
-            {"id": relation_ids[offset:offset + 100], "knowledge_graph_kwd": ["relation"]},
+            graph_condition({"id": relation_ids[offset:offset + 100], "knowledge_graph_kwd": ["relation"]}),
             tenant_id, kb_id,
         )
 
@@ -1298,10 +1301,10 @@ async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
 async def _does_graph_contains_legacy(tenant_id, kb_id, doc_id):
     """Legacy 2× round-trip fallback used when combined bool.should is unavailable."""
     fields = ["source_id"]
-    condition = {
+    condition = graph_condition({
         "knowledge_graph_kwd": ["graph"],
         "removed_kwd": "N",
-    }
+    })
     res = await thread_pool_exec(
         settings.docStoreConn.search,
         fields, [], condition, [], OrderByExpr(),
@@ -1314,10 +1317,10 @@ async def _does_graph_contains_legacy(tenant_id, kb_id, doc_id):
             return True
 
     if GraphRAGConfig.USE_INCREMENTAL_GRAPH:
-        condition = {
+        condition = graph_condition({
             "knowledge_graph_kwd": ["subgraph"],
             "source_id": doc_id,
-        }
+        })
         res = await thread_pool_exec(
             settings.docStoreConn.search,
             fields, [], condition, [], OrderByExpr(),
@@ -1340,7 +1343,7 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
 
     if GraphRAGConfig.USE_INCREMENTAL_GRAPH and hasattr(settings.docStoreConn, "es"):
         raw = settings.docStoreConn.es
-        body = {
+        body = graph_query({
             "size": 2,
             "query": {
                 "bool": {
@@ -1366,7 +1369,7 @@ async def does_graph_contains(tenant_id, kb_id, doc_id):
                     "filter": [{"term": {"kb_id": kb_id}}],
                 }
             },
-        }
+        })
         try:
             res = await thread_pool_exec(raw.search, index=index_name, body=body)
         except Exception as e:

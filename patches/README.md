@@ -2,7 +2,7 @@
 
 本目录保存对官方 RAGFlow 文件的最小化修改 patch。这些 patch 是**无法通过新增文件或 monkey patch 进一步抽离**的必需修改。
 
-当前基线为官方标签 `v0.26.4`，共 16 个 patch。生成脚本比较标签与工作区，包含尚未提交的合并修复，不依赖 `main` 或 merge-base。
+当前基线为官方标签 `v0.26.4`，共 21 个 patch。生成脚本比较标签与工作区，包含尚未提交的合并修复，不依赖 `main` 或 merge-base。
 
 ## 文件列表
 
@@ -18,12 +18,17 @@
 | `rag_graphrag_general_index.py.patch` | `rag/graphrag/general/index.py` | 激活 GraphRAG incremental patch |
 | `rag_graphrag_utils.py.patch` | `rag/graphrag/utils.py` | 增量图读写路由 dispatch |
 | `rag_svr_task_executor.py.patch` | `rag/svr/task_executor.py` | 激活 task_executor 扩展 patch |
-| `rag_utils_es_conn.py.patch` | `rag/utils/es_conn.py` | ES bulk insert 去掉 `refresh=wait_for`；`delete` 增加 `refresh` 参数（GraphRAG merge 热路径传 `refresh=false`，可见性由调用方阶段末显式 refresh 保证） |
+| `rag_utils_es_conn.py.patch` | `rag/utils/es_conn.py` | 仅纯 GraphRAG bulk 跳过等待刷新，编译/普通写入保持 `wait_for`；`delete` 增加 `refresh` 参数（GraphRAG merge 热路径传 `refresh=false`，可见性由调用方阶段末显式 refresh 保证） |
 | `web_src_locales_en.ts.patch` | `web/src/locales/en.ts` | `totalChunks` i18n key |
 | `web_src_locales_zh.ts.patch` | `web/src/locales/zh.ts` | `totalChunks` i18n key |
 | `web_src_pages_dataset_dataset-overview_index.tsx.patch` | `web/src/pages/dataset/dataset-overview/index.tsx` | Total chunks StatCard UI |
 | `web_src_pages_user-setting_setting-model_modal_provider-modal_field-config_provider-config-map.ts.patch` | 火山引擎 provider 配置 | Coding/标准 API 地址选择与提交 |
 | `test_unit_test_api_apps_services_test_delete_datasets.py.patch` | 数据集删除单元测试 | 隔离 Quart 和 NLP 包，避免自定义 import 启动应用 |
+| `common_doc_store_infinity_conn_base.py.patch` | `common/doc_store/infinity_conn_base.py` | 支持组合缺失字段条件 |
+| `common_doc_store_ob_conn_base.py.patch` | `common/doc_store/ob_conn_base.py` | 支持组合缺失字段条件 |
+| `rag_graphrag_search.py.patch` | `rag/graphrag/search.py` | 隔离 GraphRAG 与编译数据 |
+| `rag_utils_ob_conn.py.patch` | `rag/utils/ob_conn.py` | 支持组合缺失字段条件 |
+| `rag_utils_opensearch_conn.py.patch` | `rag/utils/opensearch_conn.py` | 支持组合缺失字段条件 |
 
 ## 官方更新时的工作流
 

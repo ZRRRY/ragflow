@@ -33,6 +33,13 @@ from common import settings
 from common.constants import PAGERANK_FLD, FileSource, StatusEnum
 from common.misc_utils import thread_pool_exec
 
+# === CUSTOM BEGIN [graphrag-storage-scope] ===
+# Reason: scope GraphRAG callers only; compilation APIs share the same type field.
+# Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+from rag.graphrag.storage_scope import graph_condition
+
+# === CUSTOM END [graphrag-storage-scope] ===
+
 _VALID_INDEX_TYPES = {"graph", "raptor", "mindmap", "artifact", "skill"}
 
 _INDEX_TYPE_TO_TASK_TYPE = {
@@ -438,13 +445,13 @@ def delete_knowledge_graph(dataset_id: str, tenant_id: str):
     if not KnowledgebaseService.accessible(dataset_id, tenant_id):
         return False, "No authorization."
     _, kb = KnowledgebaseService.get_by_id(dataset_id)
-    from rag.nlp import search
     from rag.graphrag.phase_markers import clear_phase_markers
+    from rag.nlp import search
     # === CUSTOM BEGIN [graphrag-delete-keywords] ===
     # 原因：增量构建产物 merge_state 需要在删图时一并清理
     # 日期：2026-06-20
     # 关联：api/apps/services/dataset_api_service_extras.py
-    settings.docStoreConn.delete({"knowledge_graph_kwd": _dataset_extras.graph_delete_keywords()},
+    settings.docStoreConn.delete(graph_condition({"knowledge_graph_kwd": _dataset_extras.graph_delete_keywords()}),
                                  search.index_name(kb.tenant_id), dataset_id)
     # === CUSTOM END [graphrag-delete-keywords] ===
     # Wiping the graph invalidates any phase-completion markers used to
@@ -826,13 +833,13 @@ def delete_index(dataset_id: str, tenant_id: str, index_type: str, wipe: bool = 
         TaskService.delete_by_id(task_id)
 
     if wipe and index_type == "graph":
-        from rag.nlp import search
         from rag.graphrag.phase_markers import clear_phase_markers
+        from rag.nlp import search
         # === CUSTOM BEGIN [graphrag-delete-keywords] ===
         # 原因：增量构建产物 merge_state 需要在删图时一并清理
         # 日期：2026-06-20
         # 关联：api/apps/services/dataset_api_service_extras.py
-        settings.docStoreConn.delete({"knowledge_graph_kwd": _dataset_extras.graph_delete_keywords()},
+        settings.docStoreConn.delete(graph_condition({"knowledge_graph_kwd": _dataset_extras.graph_delete_keywords()}),
                                      search.index_name(kb.tenant_id), dataset_id)
         # === CUSTOM END [graphrag-delete-keywords] ===
         # Wiping the graph invalidates any phase-completion markers used to
@@ -1094,12 +1101,11 @@ def check_embedding(dataset_id: str, tenant_id: str, req: dict):
     import random
 
     import numpy as np
-    from common.constants import RetCode
-    from common.doc_store.doc_store_base import OrderByExpr
-    from rag.nlp import search
 
     from api.db.services.llm_service import LLMBundle
-    from common.constants import LLMType
+    from common.constants import LLMType, RetCode
+    from common.doc_store.doc_store_base import OrderByExpr
+    from rag.nlp import search
 
     def _guess_vec_field(src: dict):
         for k in src or {}:
@@ -1901,11 +1907,11 @@ async def update_wiki_page(
         return True, None
     index_nm, _ = pack
 
-    from rag.advanced_rag.knowlege_compile.wiki import (
-        _wiki_transform_links,
-        _wiki_extract_summary,
-    )
     from api.db.services.file_commit_service import FileCommitService
+    from rag.advanced_rag.knowlege_compile.wiki import (
+        _wiki_extract_summary,
+        _wiki_transform_links,
+    )
 
     full_slug = f"{page_type}/{slug}" if "/" not in slug else slug
 

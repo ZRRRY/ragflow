@@ -1,0 +1,50 @@
+diff --git a/common/doc_store/infinity_conn_base.py b/common/doc_store/infinity_conn_base.py
+index 1a97e2a83..1b2a0dcf8 100644
+--- a/common/doc_store/infinity_conn_base.py
++++ b/common/doc_store/infinity_conn_base.py
+@@ -14,25 +14,25 @@
+ #  limitations under the License.
+ #
+ 
++import json
+ import logging
+ import os
+ import random
+ import re
+-import json
+ import time
+ from abc import abstractmethod
+ from typing import Callable, TypeVar
+ 
+ import infinity
++import pandas as pd
+ from infinity.common import ConflictType
+-from infinity.index import IndexInfo, IndexType
+ from infinity.errors import ErrorCode
+-import pandas as pd
+-from common.file_utils import get_project_base_directory
+-from rag.nlp import is_english
++from infinity.index import IndexInfo, IndexType
++
+ from common import settings
+ from common.doc_store.doc_store_base import DocStoreConnection, MatchExpr, OrderByExpr
+-
++from common.file_utils import get_project_base_directory
++from rag.nlp import is_english
+ 
+ # Concurrent CREATE/DROP TABLE on the same Infinity instance can race on
+ # Infinity's RocksDB-backed catalog counters (e.g. ``db|1|next_table_id``).
+@@ -334,7 +334,12 @@ class InfinityConnectionBase(DocStoreConnection):
+                 if isinstance(v, dict):
+                     for kk, vv in v.items():
+                         if kk == "exists":
+-                            cond.append("NOT (%s)" % exists(vv))
++                            # === CUSTOM BEGIN [graph-missing-fields] ===
++                            # Reason: preserve source_id exclusion alongside compile_kwd isolation.
++                            # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
++                            for field in vv if isinstance(vv, list) else [vv]:
++                                cond.append("NOT (%s)" % exists(field))
++                            # === CUSTOM END [graph-missing-fields] ===
+             elif isinstance(v, str):
+                 escaped_v = v.replace("'", "''")
+                 cond.append(f"{k}='{escaped_v}'")

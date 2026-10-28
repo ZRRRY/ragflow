@@ -21,9 +21,11 @@ import networkx as nx
 
 from api.db.services.document_service import DocumentService
 from api.db.services.task_service import has_canceled
-from common.exceptions import TaskCanceledException
+from common import settings
 from common.connection_utils import timeout
-from rag.graphrag.entity_resolution import EntityResolution
+from common.doc_store.doc_store_base import OrderByExpr
+from common.exceptions import TaskCanceledException
+from common.misc_utils import thread_pool_exec
 from rag.graphrag.checkpoints import (
     COMMUNITY_CHECKPOINT,
     RESOLUTION_CHECKPOINT,
@@ -31,6 +33,7 @@ from rag.graphrag.checkpoints import (
     load_checkpoints,
     save_checkpoint,
 )
+from rag.graphrag.entity_resolution import EntityResolution
 from rag.graphrag.general.community_reports_extractor import CommunityReportsExtractor
 from rag.graphrag.general.extractor import Extractor
 from rag.graphrag.general.graph_extractor import GraphExtractor as GeneralKGExt
@@ -43,6 +46,13 @@ from rag.graphrag.phase_markers import (
     has_phase_marker,
     set_phase_marker,
 )
+
+# === CUSTOM BEGIN [graphrag-storage-scope] ===
+# Reason: scope GraphRAG callers only; compilation APIs share the same type field.
+# Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+from rag.graphrag.storage_scope import graph_condition
+
+# === CUSTOM END [graphrag-storage-scope] ===
 from rag.graphrag.utils import (
     GraphChange,
     chunk_id,
@@ -53,12 +63,8 @@ from rag.graphrag.utils import (
     set_graph,
     tidy_graph,
 )
-from common.misc_utils import thread_pool_exec
 from rag.nlp import rag_tokenizer, search
 from rag.utils.redis_conn import RedisDistributedLock
-from common import settings
-from common.doc_store.doc_store_base import OrderByExpr
-
 
 DEFAULT_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 4096
 MIN_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 512
@@ -215,11 +221,11 @@ async def load_subgraph_from_store(tenant_id: str, kb_id: str, doc_id: str):
     Returns a networkx Graph on hit, or None on miss.
     """
     fields = ["content_with_weight", "source_id"]
-    condition = {
+    condition = graph_condition({
         "knowledge_graph_kwd": ["subgraph"],
         "removed_kwd": "N",
         "source_id": [doc_id],
-    }
+    })
     try:
         res = await thread_pool_exec(settings.docStoreConn.search, fields, [], condition, [], OrderByExpr(), 0, 1, search.index_name(tenant_id), [kb_id])
         field_map = settings.docStoreConn.get_fields(res, fields)
@@ -802,7 +808,7 @@ async def generate_subgraph(
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before saving subgraph for doc {doc_id}.", callback)
     await thread_pool_exec(
         settings.docStoreConn.delete,
-        {"knowledge_graph_kwd": "subgraph", "source_id": doc_id},
+        graph_condition({"knowledge_graph_kwd": "subgraph", "source_id": doc_id}),
         search.index_name(tenant_id),
         kb_id,
     )
@@ -978,7 +984,7 @@ async def extract_community(
             settings.docStoreConn.search,
             ["id"],
             [],
-            {"knowledge_graph_kwd": ["community_report"]},
+            graph_condition({"knowledge_graph_kwd": ["community_report"]}),
             [],
             OrderByExpr(),
             0,
@@ -990,7 +996,7 @@ async def extract_community(
         old_ids = list(existing_fields.keys())
     except Exception:
         logging.exception("Failed to enumerate existing community reports for kb %s; falling back to delete-then-insert.", kb_id)
-        await thread_pool_exec(settings.docStoreConn.delete, {"knowledge_graph_kwd": "community_report", "kb_id": kb_id}, search.index_name(tenant_id), kb_id)
+        await thread_pool_exec(settings.docStoreConn.delete, graph_condition({"knowledge_graph_kwd": "community_report", "kb_id": kb_id}), search.index_name(tenant_id), kb_id)
         old_ids = []
 
     await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert community reports")
@@ -1004,7 +1010,7 @@ async def extract_community(
         try:
             await thread_pool_exec(
                 settings.docStoreConn.delete,
-                {"knowledge_graph_kwd": ["community_report"], "id": stale_ids},
+                graph_condition({"knowledge_graph_kwd": ["community_report"], "id": stale_ids}),
                 search.index_name(tenant_id),
                 kb_id,
             )
@@ -1024,6 +1030,8 @@ async def extract_community(
 # 日期：2026-06-20
 # 关联：rag/graphrag/general/index_patch.py
 import sys
+
 from rag.graphrag.general import index_patch
+
 index_patch.apply_patch(sys.modules[__name__])
 # === CUSTOM END [graphrag-incremental] ===

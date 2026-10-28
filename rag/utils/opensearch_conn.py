@@ -14,22 +14,21 @@
 #  limitations under the License.
 #
 
-import logging
-import re
-import json
-import time
-import os
-
 import copy
-from opensearchpy import OpenSearch, NotFoundError
-from opensearchpy import UpdateByQuery, Q, Search, Index
-from opensearchpy import ConnectionTimeout
-from common.decorator import singleton
-from common.file_utils import get_project_base_directory
-from common.doc_store.doc_store_base import DocStoreConnection, MatchExpr, OrderByExpr, MatchTextExpr, MatchDenseExpr, FusionExpr
-from rag.nlp import is_english, rag_tokenizer
-from common.constants import PAGERANK_FLD, TAG_FLD
+import json
+import logging
+import os
+import re
+import time
+
+from opensearchpy import ConnectionTimeout, Index, NotFoundError, OpenSearch, Q, Search, UpdateByQuery
+
 from common import settings
+from common.constants import PAGERANK_FLD, TAG_FLD
+from common.decorator import singleton
+from common.doc_store.doc_store_base import DocStoreConnection, FusionExpr, MatchDenseExpr, MatchExpr, MatchTextExpr, OrderByExpr
+from common.file_utils import get_project_base_directory
+from rag.nlp import is_english, rag_tokenizer
 
 ATTEMPT_TIME = 2
 
@@ -356,7 +355,12 @@ class OSConnection(DocStoreConnection):
                 if isinstance(v, dict):
                     for kk, vv in v.items():
                         if kk == "exists":
-                            bqry.must_not.append(Q("exists", field=vv))
+                            # === CUSTOM BEGIN [graph-missing-fields] ===
+                            # Reason: preserve source_id exclusion alongside compile_kwd isolation.
+                            # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+                            for field in vv if isinstance(vv, list) else [vv]:
+                                bqry.must_not.append(Q("exists", field=field))
+                            # === CUSTOM END [graph-missing-fields] ===
                     continue
             if not v:
                 continue
@@ -595,6 +599,15 @@ class OSConnection(DocStoreConnection):
             if k == "exists":
                 bqry.filter.append(Q("exists", field=v))
                 continue
+            if k == "must_not" and isinstance(v, dict):
+                excluded = v.get("exists", [])
+                # === CUSTOM BEGIN [graph-missing-fields] ===
+                # Reason: preserve source_id exclusion alongside compile_kwd isolation.
+                # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+                for field in excluded if isinstance(excluded, list) else [excluded]:
+                    bqry.must_not.append(Q("exists", field=field))
+                # === CUSTOM END [graph-missing-fields] ===
+                continue
             if isinstance(v, list):
                 bqry.filter.append(Q("terms", **{k: v}))
             elif isinstance(v, str) or isinstance(v, int):
@@ -721,7 +734,12 @@ class OSConnection(DocStoreConnection):
                 if isinstance(v, dict):
                     for kk, vv in v.items():
                         if kk == "exists":
-                            bool_query.must_not.append(Q("exists", field=vv))
+                            # === CUSTOM BEGIN [graph-missing-fields] ===
+                            # Reason: preserve source_id exclusion alongside compile_kwd isolation.
+                            # Date: 2026-10-28. Related: rag/graphrag/storage_scope.py.
+                            for field in vv if isinstance(vv, list) else [vv]:
+                                bool_query.must_not.append(Q("exists", field=field))
+                            # === CUSTOM END [graph-missing-fields] ===
             elif isinstance(v, list):
                 bool_query.must.append(Q("terms", **{k: v}))
             elif isinstance(v, str) or isinstance(v, int):
