@@ -3,8 +3,9 @@
 > 本文档说明如何在当前自定义分支上继续开发，同时避免与官方代码过度耦合。
 >
 > 当前分支结构：
-> - `main` → 纯净 `v0.26.1` release（跟踪 `myfork/main`）
-> - `dev` → `v0.26.1` + 自定义 GraphRAG 增量优化补丁 + patch 管理（跟踪 `myfork/dev`）
+> - 官方基线 → 标签 `v0.26.4`；补丁直接与标签比较，不依赖 `main` 的位置。
+> - `dev-0.26` → `v0.26.4` + 自定义 GraphRAG 增量优化补丁（跟踪 `fork/dev-0.26`）。
+> - `codex/backup-before-v0.26.4-20261028` → 本次升级前的 `e9d16343f`。
 > - `backup-20260620` → 原始补丁提交 `41946525f`（冻结，不再更新）
 
 ---
@@ -45,19 +46,18 @@
 
 ```bash
 # 方式一：更新单个 patch
-git diff main...HEAD -- path/to/official/file.py > patches/path_to_official_file.py.patch
+git diff v0.26.4 -- path/to/official/file.py > patches/path_to_official_file.py.patch
 
 # 方式二：重新生成所有 patch
-bash patches/regenerate_patches.sh
+bash patches/regenerate_patches.sh v0.26.4
 ```
 
 ### 3. 验证 patch 还能打到官方代码上
 
 ```bash
-git checkout -b patch-test main
-bash patches/apply_patches.sh --check
-git checkout dev
-git branch -D patch-test
+git worktree add --detach ../ragflow-patch-test v0.26.4
+git -C ../ragflow-patch-test apply --check "$PWD"/patches/*.patch "$PWD"/patches/.*.patch
+git worktree remove ../ragflow-patch-test
 ```
 
 ---
@@ -77,15 +77,13 @@ git branch -D patch-test
 ## 官方更新时的标准流程
 
 ```bash
-# 1. 同步官方 release
-git fetch origin
-git checkout main
-git reset --hard v0.27.0          # 替换为新 release tag
-git push -f myfork main
+# 1. 核验官方 release（GitHub 使用本地代理；按目标版本替换标签）
+git -c http.proxy=http://127.0.0.1:7897 -c http.sslBackend=openssl fetch origin tag v0.26.4
 
-# 2. 合并到 dev（永远用 merge，不要用 rebase；rerere 已开启，重复冲突自动复用解法）
-git checkout dev
-git merge main
+# 2. 在当前定制分支合并准确标签；使用 merge，不要 rebase
+git switch dev-0.26
+git branch codex/backup-before-next-upgrade
+git merge --no-ff --no-commit v0.26.4
 
 # 3. 重点解决带 CUSTOM 标记的官方文件冲突
 #
@@ -99,13 +97,13 @@ git add uv.lock
 #    （文本合并不会为它们报冲突，但官方逻辑可能已变）
 git diff v0.26.1..v0.27.0 -- rag/graphrag/general/index.py   # 示例：按清单逐项 diff
 
-# 5. 重新生成 patch
-bash patches/regenerate_patches.sh
+# 5. 重新生成 patch（包括工作区中尚未提交的冲突修复）
+bash patches/regenerate_patches.sh v0.26.4
 
 # 6. 提交并推送
 git add -A
-git commit -m "sync: merge v0.27.0 and regenerate patches"
-git push myfork dev
+git commit -m "sync: merge v0.26.4 and adapt GraphRAG customizations"
+git -c http.proxy=http://127.0.0.1:7897 -c http.sslBackend=openssl push fork dev-0.26
 ```
 
 ---
@@ -114,13 +112,13 @@ git push myfork dev
 
 ```bash
 # 当前改了哪些官方文件？
-git diff --name-only main
+git diff --name-only v0.26.4
 
-# 现状基线（2026-07-16）：15 个 =
-#   12 个 patch 管理内（patches/*.patch，均有 CUSTOM 标记或尾部挂载块）
-#   + uv.lock（本地工具链/registry 再生差异，正常，见上方流程第 3 步）
-#   + 2 个前端 tsx（lint-staged prettier 良性差异，见 MODIFICATIONS.md 第二节）
-# 新增第 16 个官方文件时，停下来评估是否能抽离为 extras/patch
+# 现状基线（2026-10-28）：17 个已存在的官方文件有差异 =
+#   16 个 patch 管理内（包括 .gitattributes、删除测试隔离和火山引擎地址配置）
+#   + 1 个前端 tsx（sidebar import 顺序的良性差异，见 MODIFICATIONS.md 第二节）
+# uv.lock 经重新锁定和检查，与官方 v0.26.4 一致；将来由工具生成，不人工拼接
+# 新增官方文件修改时，先评估是否能抽离为 extras/patch
 ```
 
 ---

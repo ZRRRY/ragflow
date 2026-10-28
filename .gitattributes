@@ -1,3 +1,5 @@
 *.sh text eol=lf
 docker/entrypoint.sh text eol=lf executable
 patches/*.patch text eol=lf
+# Preserve CRLF hunk context for this upstream test file.
+patches/test_unit_test_api_apps_services_test_delete_datasets.py.patch -text

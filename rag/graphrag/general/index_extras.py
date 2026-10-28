@@ -57,6 +57,7 @@ from rag.graphrag.general.index import (
     _bounded_int_config,
     _has_cancel_and_exit,
     _lock_acquire_timeout_config,
+    _relationship_looks_valid,
     _run_with_retry,
     _select_extractor,
     extract_community,
@@ -1131,7 +1132,18 @@ async def generate_subgraph(
             )
 
     ents = list(llm_ents)
-    rels = list(llm_rels)
+    # Apply upstream quality checks only to extracted relationships. Chapter
+    # containment and entity-to-chapter links are generated locally below.
+    rels = []
+    ignored_invalid_rels = 0
+    for rel in llm_rels:
+        assert "description" in rel, f"relation {rel} does not have description"
+        if _relationship_looks_valid(rel):
+            rels.append(rel)
+        else:
+            ignored_invalid_rels += 1
+    if ignored_invalid_rels:
+        callback(msg=f"ignored {ignored_invalid_rels} relations due to negative-judgment or misattributed description text.")
 
     if chapter_ents:
         merged_ents = {}

@@ -1,12 +1,12 @@
 # RAGFlow dev 分支修改记录与语义漂移检查清单
 
-> 基准：`main` = 官方 v0.26.1 release；`dev` = v0.26.1 + GraphRAG 增量优化定制。
+> 基准：官方标签 `v0.26.4`；`dev-0.26` = v0.26.4 + GraphRAG 增量优化定制。补丁直接与标签比较。
 >
 > 本文档两大用途：
 > 1. **第一节：语义漂移检查清单** —— 每次合并官方新版后逐项 `git diff` 核对，这是本分支维护的核心动作；
 > 2. 第二~四节：修改清单、环境变量开关等参考资料。
 >
-> 最近全面修订：2026-07-16（按 extras/patches 架构现状重写，替代 2026-06-18 的旧版移植记录）。
+> 最近升级核对：2026-10-28（v0.26.4 合并，保留现有 extras/patches 架构）。
 >
 > 2026-09-12：第二轮全面审查并完成修复（详见第六节）；OpenSearch 后端弃用，`common/doc_store/opensearch_conn_extras.py`、KNN 消解路径及 4 个 KNN 环境变量整体删除。
 
@@ -16,7 +16,7 @@
 
 extras/`*_patch` 文件不会与上游产生文本冲突，但其中的**官方逻辑副本和实现假设**会静默过时——git merge 不会为它们报任何冲突。
 
-合并 main 进 dev 后，对下表每一项执行：
+合并官方标签后，对下表每一项执行：
 
 ```bash
 git diff <旧tag>..<新tag> -- <官方文件>
@@ -27,28 +27,29 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | # | 定制位置 | 复制/依赖的官方逻辑 | 需 diff 的官方文件 | 风险等级 | 最近核对 |
 |---|----------|--------------------|-------------------|---------|---------|
 | 1 | `rag/graphrag/general/index_extras.py` `run_graphrag_for_kb` | 官方同名编排函数（`index.py:257`）近全文复制加增量分支，上游编排层 bugfix 不传播；增量恢复允许空图，社区阶段在消解后及每次重试时读取完整图 | `rag/graphrag/general/index.py` | **高** | 2026-10-28 |
-| 2 | `index_extras.py` `resolve_entities_incremental` + `index_patch.py` wrapper | 官方 `resolve_entities`（`index.py:758`）调用约定（8 位置参数 + `task_id=`/`entity_types=`）| 同上 | **高**（曾因签名漂移致 TypeError，2026-07-16 已修复并加回归测试） | 2026-09-12 |
-| 3 | `index_patch.py` `_wrap_extract_community` | 官方 `extract_community`（`index.py:804`）形参表 | 同上 | 低（2026-09-12 已改为 `inspect.signature` 按名绑定，漂移时打 WARNING 而非静默错位） | 2026-09-12 |
+| 2 | `index_extras.py` `resolve_entities_incremental` + `index_patch.py` wrapper | 官方 `resolve_entities`（`index.py:758`）调用约定（8 位置参数 + `task_id=`/`entity_types=`）| 同上 | **高**（曾因签名漂移致 TypeError，2026-07-16 已修复并加回归测试） | 2026-10-28 |
+| 3 | `index_patch.py` `_wrap_extract_community` | 官方 `extract_community`（`index.py:804`）形参表 | 同上 | 低（2026-09-12 已改为 `inspect.signature` 按名绑定，漂移时打 WARNING 而非静默错位） | 2026-10-28 |
 | 4 | `rag/svr/task_executor_extras.py` | `sys.modules` 模块查找（生产为 `__main__`）；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值（有兜底默认值）；后处理按 KB 的 `embd_id` 选择模型，持有知识库锁后读图 | `rag/svr/task_executor.py` | **高** | 2026-10-28 |
-| 5 | `api/apps/services/dataset_api_service_extras.py` `get_knowledge_graph` | 整函数替换官方实现；截断策略已偏离（边 128→512、丢孤立节点、无向去重） | `api/apps/services/dataset_api_service.py` | 中（上游改进被屏蔽） | 2026-09-12 |
-| 6 | `rag/graphrag/document_delete_extras.py` | 官方文档删除 GraphRAG 清理流程副本（增量路径按 `source_id` 清理，不依赖 graph JSON；2026-10-27 起同步清理字段和 JSON 内来源） | `api/db/services/document_service.py` | 中 | 2026-10-27 |
-| 7 | `common/doc_store/es_conn_extras.py` | 遍历 `@singleton` 闭包 cell 定位 ESConnection 类（2026-09-12 起按 `__module__` 匹配，不再硬编码类名）；注入 `count`/`search_with_scroll`/insert 包装（scroll 初始请求应用 `_source` 投影并保留 `_id`） | `rag/utils/es_conn.py`、`common/decorator.py`（`singleton`） | 低（有 RuntimeError 兜底） | 2026-10-27 |
-| 8 | `rag/llm/siliconflow_timeout_patch.py` | 替换 `SILICONFLOWEmbed._call`，假定其内部超时处理结构不变 | `rag/llm/embedding_model.py`（`SILICONFLOWEmbed`） | 低（有子类守卫） | 2026-09-12 |
-| 9 | `rag/utils/redis_conn_patch.py` | 替换 `RedisDistributedLock.spin_acquire`（依赖官方 `delete_if_equal` 锁协议）；新增 `RedisDB.ttl` | `rag/utils/redis_conn.py` | 中（无 hasattr 守卫，上游同名改动被静默覆盖） | 2026-09-12 |
-| 10 | `rag/graphrag/entity_resolution.py` 尾部 CUSTOM 块 | import 时类重绑定 `EntityResolution`→`IncrementalEntityResolution`；依赖「CUSTOM 块位于文件末尾」的执行顺序，且与 `entity_resolution_extras.py` 存在循环 import | `rag/graphrag/entity_resolution.py` | 中（上游在文件尾部新增代码即打破） | 2026-09-12 |
+| 5 | `api/apps/services/dataset_api_service_extras.py` `get_knowledge_graph` | 整函数替换官方实现；截断策略已偏离（边 128→512、丢孤立节点、无向去重） | `api/apps/services/dataset_api_service.py` | 中（上游改进被屏蔽） | 2026-10-28 |
+| 6 | `rag/graphrag/document_delete_extras.py` | 官方文档删除 GraphRAG 清理流程副本（增量路径按 `source_id` 清理，不依赖 graph JSON；2026-10-27 起同步清理字段和 JSON 内来源） | `api/db/services/document_service.py` | 中 | 2026-10-28 |
+| 7 | `common/doc_store/es_conn_extras.py` | 遍历 `@singleton` 闭包 cell 定位 ESConnection 类（2026-09-12 起按 `__module__` 匹配，不再硬编码类名）；注入 `count`/`search_with_scroll`/insert 包装（scroll 初始请求应用 `_source` 投影并保留 `_id`） | `rag/utils/es_conn.py`、`common/decorator.py`（`singleton`） | 低（有 RuntimeError 兜底） | 2026-10-28 |
+| 8 | `rag/llm/siliconflow_timeout_patch.py` | 替换 `SILICONFLOWEmbed._call`，假定其内部超时处理结构不变 | `rag/llm/embedding_model.py`（`SILICONFLOWEmbed`） | 低（有子类守卫） | 2026-10-28 |
+| 9 | `rag/utils/redis_conn_patch.py` | 替换 `RedisDistributedLock.spin_acquire`（依赖官方 `delete_if_equal` 锁协议）；新增 `RedisDB.ttl` | `rag/utils/redis_conn.py` | 中（无 hasattr 守卫，上游同名改动被静默覆盖） | 2026-10-28 |
+| 10 | `rag/graphrag/entity_resolution.py` 尾部 CUSTOM 块 | import 时类重绑定 `EntityResolution`→`IncrementalEntityResolution`；依赖「CUSTOM 块位于文件末尾」的执行顺序，且与 `entity_resolution_extras.py` 存在循环 import | `rag/graphrag/entity_resolution.py` | 中（上游在文件尾部新增代码即打破） | 2026-10-28 |
 | 11 | `rag/graphrag/utils.py` `set_graph` 无条件委托 | 官方原实现改名 `_set_graph_impl`，extras 包装后按 flag 路由；全量写入也必须强制刷新，全图查询截断异常不得回退旧 JSON | `rag/graphrag/utils.py` | 低 | 2026-10-28 |
 
 > 2026-09-12：OpenSearch 后端弃用，原第 7 项 `common/doc_store/opensearch_conn_extras.py` 已整体删除（该文件 monkey-patch 从未真正生效——patch 装在了 `@singleton` 工厂闭包而非真类上）；上游官方文件 `rag/utils/opensearch_conn.py` 保持原样不动。
 
 ---
 
-## 二、官方文件修改清单（15 个）
+## 二、官方文件修改清单（17 个）
 
-### patch 管理内（12 个，对应 `patches/*.patch`）
+### patch 管理内（16 个，对应 `patches/*.patch`）
 
 | 官方文件 | 改动摘要 | patch 文件 |
 |---------|---------|-----------|
 | `.gitignore` | 忽略 `docker-compose.override.yml`、`*diff*.txt`、`docs/graphrag_review` | `.gitignore.patch` |
+| `.gitattributes` | 补丁默认 LF；上游 CRLF 测试的补丁保留原字节，确保上下文可应用 | `.gitattributes.patch` |
 | `api/apps/restful_apis/dataset_api.py` | 新增 `delete_knowledge_graph` 转发函数（修复 main 上 `backward_compat.py` 废弃端点的坏引用） | `api_apps_restful_apis_dataset_api.py.patch` |
 | `api/apps/services/dataset_api_service.py` | `get_knowledge_graph` 委托 extras；删图关键词增加 `merge_state` | `api_apps_services_dataset_api_service.py.patch` |
 | `api/db/services/document_service.py` | 删文档的 GraphRAG 清理逻辑抽至 `document_delete_extras.py`（官方路径逐字保留） | `api_db_services_document_service.py.patch` |
@@ -57,17 +58,20 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | `rag/graphrag/general/index.py` | 尾部调用 `index_patch.apply_patch()` | `rag_graphrag_general_index.py.patch` |
 | `rag/graphrag/utils.py` | `does_graph_contains`/`get_graph` flag 路由；`set_graph` 无条件委托 extras；书籍/章节跳过 embedding | `rag_graphrag_utils.py.patch` |
 | `rag/svr/task_executor.py` | 尾部 import 并调用 `patch_task_executor()` | `rag_svr_task_executor.py.patch` |
+| `rag/utils/es_conn.py` | bulk 不等待刷新，delete 支持 refresh 参数；阶段末由 extras 保证可见性 | `rag_utils_es_conn.py.patch` |
+| `test/unit_test/api/apps/services/test_delete_datasets.py` | 隔离自定义 service import 的 Quart 包和 NLP 包，保持删除测试独立运行 | `test_unit_test_api_apps_services_test_delete_datasets.py.patch` |
 | `web/src/locales/en.ts` | 新增 `datasetOverview.totalChunks` 文案 | `web_src_locales_en.ts.patch` |
 | `web/src/locales/zh.ts` | 同上（中文） | `web_src_locales_zh.ts.patch` |
 | `web/src/pages/dataset/dataset-overview/index.tsx` | Total chunks 统计卡、grid-cols-4（带 CUSTOM 标记） | `web_src_pages_dataset_dataset-overview_index.tsx.patch` |
+| `web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts` | 火山引擎 Coding/标准 API 地址选择与提交 | `web_src_pages_user-setting_setting-model_modal_provider-modal_field-config_provider-config-map.ts.patch` |
 
-### patch 管理外（3 个，均无需/无法纳入 patch）
+### patch 管理外（1 个格式差异）
 
 | 官方文件 | 说明 |
 |---------|------|
-| `uv.lock` | 本地 uv 0.11.x + `pyproject.toml` 已钉住的 aliyun 镜像重新生成所致（registry URL 与字段格式差异）。**不是手工修改**，合并策略见 `MAINTENANCE.md`「官方更新时的标准流程」第 3 步 |
-| `web/src/components/paddleocr-options-form-field.tsx` | 良性差异：lint-staged 钩子的 prettier 输出（数组拆行、长调用换行），无功能改动；**不可还原**——还原后下次提交会被钩子自动改回。已接受现状，合并遇冲突取任一侧均可 |
-| `web/src/pages/user-setting/sidebar/index.tsx` | 良性差异：同上（import 字母序） |
+| `web/src/pages/user-setting/sidebar/index.tsx` | 良性差异：import 字母序，无功能改动 |
+
+`uv.lock` 使用官方 v0.26.4 为起点，经 uv 0.13.6 离线重新锁定和检查，解析 665 个包，与官方锁文件一致。旧版 PaddleOCR 表单的格式差异已被上游接收，本次合并后无差异。
 
 ---
 
@@ -93,7 +97,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | | `web/src/assets/svg/data-flow/total-chunks-icon{,-bri}.svg` | 统计卡图标（暗/亮主题） |
 | 测试 | `test/unit_test/rag/graphrag/` | GraphRAG 工具、分页、checkpoint、拓扑、增量写入/删除/消解回归测试；`test_review_findings.py` 覆盖五项审查问题及失败边界 |
 | 运维 | `docker/finisher/`（3 个文件） | 卡死任务收尾脚本（默认 dry-run）+ README + 辅助 SQL |
-| 管理 | `patches/`（12 patch + apply/regenerate 脚本 + README） | 官方文件改动的双轨管理 |
+| 管理 | `patches/`（16 patch + apply/regenerate 脚本 + README） | 官方文件改动的双轨管理 |
 | | `MAINTENANCE.md`、本文档 | 维护规范与漂移清单 |
 
 ---
@@ -245,3 +249,16 @@ git diff <旧tag>..<新tag> -- <官方文件>
 3. **新增自定义文件** → 在第三节表格补一行。
 4. **新增/修改环境变量开关** → 同步第四节表格（默认值必须与 `rag/graphrag/config.py` 一致）。
 5. **合并官方新版后** → 完成第一节全部核对，刷新「最近核对」列，并更新文档头部基准版本号。
+
+
+## 八、2026-10-28：合并官方 v0.26.4
+
+- 基线由 v0.26.1 升级至 v0.26.4（`cb93883f3`），升级前提交 `e9d16343f` 保存于 `codex/backup-before-v0.26.4-20261028`。保留全部 GraphRAG 定制及火山引擎端点选择。
+- 自定义 `generate_subgraph` 对 LLM 抽取关系调用官方 `_relationship_looks_valid`，过滤否定判断与主体错配；本地生成的书籍/章节结构关系不经过此过滤。
+- 全量 `_set_graph_impl` 的节点和关系 embedding 批量预热应用既有 `should_skip_embedding` 规则。书籍/章节及其关联边不调用 embedding；普通实体与关系继续批量处理；增量 delta 写图沿用原有批处理。
+- 完成第一节全部 11 项核对：编排/消解/社区接口未漂移；图谱可视化算法未变；文档删除新增导航制品清理已保留，原图谱清理流程未变；ES 官方查询/更新改进与本地刷新策略并存；singleton、SiliconFlow 类和 Redis 锁协议保持兼容；新增 Redis MGET 未被覆盖；实体消解挂载仍在文件末尾。
+- 补丁基线直接使用标签，新增属性配置、数据集删除测试隔离和火山引擎表单配置的 patch；生成脚本包含工作区修改。
+- 修正补丁检查脚本遗漏隐藏文件的问题：`.gitignore.patch` 和 `.gitattributes.patch` 也参与检查。16 个补丁均在纯净标签副本中应用，并逐文件确认与当前定制内容一致。
+- 验证：GraphRAG 220 项通过（新增 10 项），数据集删除 2 项通过；前端生产构建和定制文件 ESLint 通过。前端类型检查在合并版和相同依赖的纯净官方 v0.26.4 上均有相同 223 项错误，没有新增诊断。
+- Python 1021 个文件通过语法解析；官方数据集 API 的 32 个函数保持一致，本地删除包装器和路由仍保留。Ruff 修复新增测试与合并 import 排序问题，仍有历史及上游既有诊断；相对官方标签的定制源码差异通过空白检查。完整合并差异中的上游空白诊断未作无关整理。
+- 测试使用外部服务替身，不包含真实 ES/Redis/模型集成、生产数据库迁移或部署。spaCy 包已安装供测试导入，但未验证各语言 NER 模型。生产切换前仍需在隔离数据上验证多文档构图、共享来源删除、取消/恢复及可视化检索，并备份数据库与 ES。

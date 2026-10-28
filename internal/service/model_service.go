@@ -33,20 +33,71 @@ import (
 )
 
 // parseModelName parses a composite model name in format "model@instance@provider" or "model@provider"
-// Returns modelName, instanceName, providerName separately
+// Returns modelName, instanceName, providerName separately.
+//
+// The composite key is right-anchored: providerName is always the *last*
+// '@'-separated field, instanceName is the second-to-last (when present),
+// and everything to the left is the bare model name. Some model names
+// legitimately contain '@' characters themselves (e.g. LM Studio embedding
+// model IDs such as `text-embedding-nomic-embed-text-v1.5@q8_0`), which
+// produces composite keys like
+// `text-embedding-nomic-embed-text-v1.5@q8_0@lmstudio@LM-Studio`. When the
+// split yields more than 3 fields we rejoin the leading fields back into the
+// modelName so any embedded '@' characters are preserved verbatim.
 func parseModelName(compositeName string) (modelName, instanceName, providerName string, err error) {
 	parts := strings.Split(compositeName, "@")
-	if len(parts) == 3 {
+	switch len(parts) {
+	case 3:
 		// Format: model@instance@provider
 		return parts[0], parts[1], parts[2], nil
-	} else if len(parts) == 2 {
+	case 2:
 		// Format: model@provider -> instance defaults to "default"
 		return parts[0], "default", parts[1], nil
-	} else if len(parts) == 1 {
+	case 1:
 		return parts[0], "", "", fmt.Errorf("provider name missing in model name: %s", compositeName)
 	}
+	// len(parts) > 3: any '@' characters embedded in the leftmost modelName
+	// component must be preserved in that component instead of being dropped
+	// or assigned to the instance/provider fields.
+	n := len(parts)
+	return strings.Join(parts[:n-2], "@"), parts[n-2], parts[n-1], nil
+}
 
-	return "", "", "", fmt.Errorf("invalid model name format: %s", compositeName)
+// splitRightAnchoredModelName is a bare-name-tolerant variant of
+// parseModelName used by the Builtin / TEI short-circuit branches in
+// GetModelConfigFromProviderInstance.
+//
+// Those branches must accept a bare model name (no provider suffix) where
+// parseModelName would return an error, while still preserving any '@'
+// characters embedded in the modelName portion of a multi-segment key.
+// Returns the modelName, instanceName ("default" for the 2-segment form),
+// and providerName ("" for the 1-segment form).
+func splitRightAnchoredModelName(compositeName string) (modelName, instanceName, providerName string) {
+	parts := strings.Split(compositeName, "@")
+	switch len(parts) {
+	case 3:
+		return parts[0], parts[1], parts[2]
+	case 2:
+		// The 2-segment form "model@X" is ambiguous: X could be a provider
+		// suffix (only "Builtin" is recognised by the TEI / Builtin
+		// short-circuits that consume this helper) or part of the model
+		// name itself (e.g. a quantization tag like "q8_0" in
+		// "text-embedding-nomic-embed-text-v1.5@q8_0"). Treat the last
+		// token as a provider only when it actually is one; otherwise
+		// the whole string is the bare model name and the caller falls
+		// through to its non-short-circuit path. The TEI short-circuit's
+		// `modelName == teiModel` exact-match fast path already covers
+		// the bare-default case where the embedded '@' happens to match
+		// the TEI model identifier verbatim.
+		if parts[1] == "Builtin" {
+			return parts[0], "default", parts[1]
+		}
+		return compositeName, "", ""
+	case 1:
+		return parts[0], "", ""
+	}
+	n := len(parts)
+	return strings.Join(parts[:n-2], "@"), parts[n-2], parts[n-1]
 }
 
 func newModelDriverForBaseURL(driver modelModule.ModelDriver, providerName, region, baseURL string) (modelModule.ModelDriver, error) {
@@ -102,11 +153,8 @@ type CheckConnectionRequest struct {
 }
 
 func (m *ModelProviderService) AddModelProvider(providerName, userID string) (common.ErrorCode, error) {
-
-	_, err := dao.GetModelProviderManager().GetProviderByName(providerName)
-	if err != nil {
-		return common.CodeNotFound, err
-	}
+	providerName = strings.TrimSpace(providerName)
+	providerName = strings.ToLower(providerName)
 
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
 	if err != nil {
@@ -118,6 +166,14 @@ func (m *ModelProviderService) AddModelProvider(providerName, userID string) (co
 	}
 
 	tenantID := tenants[0].TenantID
+
+	existing, err := m.modelProviderDAO.GetByTenantIDAndProviderName(tenantID, providerName)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return common.CodeServerError, err
+	}
+	if existing != nil {
+		return common.CodeSuccess, nil
+	}
 
 	providerID := utility.GenerateToken()
 
@@ -170,6 +226,7 @@ func (m *ModelProviderService) ListProvidersOfTenant(userID string) ([]map[strin
 			}
 			return nil, common.CodeServerError, err
 		}
+		provider["name"] = providerName
 		result = append(result, provider)
 	}
 
@@ -187,7 +244,7 @@ func isExcludedTenantProvider(name string) bool {
 	return false
 }
 
-func (m *ModelProviderService) DeleteModelProvider(providerName, userID string) (common.ErrorCode, error) {
+func (m *ModelProviderService) DeleteModelProvider(userID, providerName string) (common.ErrorCode, error) {
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
 	if err != nil {
 		return common.CodeServerError, err
@@ -206,6 +263,8 @@ func (m *ModelProviderService) DeleteModelProvider(providerName, userID string) 
 }
 
 func (m *ModelProviderService) ListSupportedModels(providerName, instanceName, userID string) ([]map[string]interface{}, error) {
+	providerName = strings.TrimSpace(providerName)
+	providerName = strings.ToLower(providerName)
 
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
@@ -280,6 +339,9 @@ func (m *ModelProviderService) ListSupportedModels(providerName, instanceName, u
 }
 
 func (m *ModelProviderService) CreateProviderInstance(providerName, instanceName, apiKey, baseURL, region, userID string) (common.ErrorCode, error) {
+	providerName = strings.TrimSpace(providerName)
+	providerName = strings.ToLower(providerName)
+
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
 	if err != nil {
@@ -327,6 +389,8 @@ func (m *ModelProviderService) CreateProviderInstance(providerName, instanceName
 }
 
 func (m *ModelProviderService) ListProviderInstances(providerName, userID string) ([]map[string]interface{}, common.ErrorCode, error) {
+	providerName = strings.TrimSpace(providerName)
+	providerName = strings.ToLower(providerName)
 
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
@@ -892,10 +956,33 @@ func (m *ModelProviderService) ListTenantAddedModels(userID, modelTypeFilter str
 	return added, common.CodeSuccess, nil
 }
 
-func (m *ModelProviderService) AlterProviderInstance(providerName, instanceName, newInstanceName, apiKey, userID string) (common.ErrorCode, error) {
+func (m *ModelProviderService) AlterProviderInstance(userID, providerName, instanceName, newInstanceName, apiKey string) (common.ErrorCode, error) {
 	return common.CodeSuccess, nil
 }
-func (m *ModelProviderService) DropProviderInstances(providerName, userID string, instances []string) (common.ErrorCode, error) {
+
+func (m *ModelProviderService) getProviderInstancesByNames(providerID string, instanceNames []string) ([]*entity.TenantModelInstance, []string, error) {
+	modelInstances := make([]*entity.TenantModelInstance, 0, len(instanceNames))
+	missingInstanceNames := make([]string, 0)
+
+	for _, instanceName := range instanceNames {
+		modelInstance, err := m.modelInstanceDAO.GetByProviderIDAndInstanceName(providerID, instanceName)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				missingInstanceNames = append(missingInstanceNames, instanceName)
+				continue
+			}
+			return nil, nil, err
+		}
+		modelInstances = append(modelInstances, modelInstance)
+	}
+
+	return modelInstances, missingInstanceNames, nil
+}
+
+func (m *ModelProviderService) DropProviderInstances(providerName, userID string, instanceNames []string) (common.ErrorCode, error) {
+	if len(instanceNames) == 0 {
+		return common.CodeBadRequest, errors.New("instances is required")
+	}
 
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
@@ -912,54 +999,38 @@ func (m *ModelProviderService) DropProviderInstances(providerName, userID string
 	// Check if provider exists
 	provider, err := m.modelProviderDAO.GetByTenantIDAndProviderName(tenantID, providerName)
 	if err != nil {
-		// Tenant hasn't connected this provider. The DELETE request is a
-		// no-op in that case — mirrors Python's drop_provider_instances in
-		// api/apps/services/provider_api_service.py, which simply iterates
-		// the (empty) instance list. The previous contract bubbled
-		// "record not found" as a 500, which broke the front-end "remove
-		// instance" flow when the UI's snapshot was slightly stale.
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return common.CodeSuccess, nil
+			return common.CodeNotFound, fmt.Errorf("no provider found for provider %q", providerName)
 		}
 		return common.CodeServerError, err
 	}
 
-	for _, instanceName := range instances {
-		// Get model instance
-		var tenantModelInstance *entity.TenantModelInstance
-		tenantModelInstance, err = m.modelInstanceDAO.GetByProviderIDAndInstanceName(provider.ID, instanceName)
-		if err != nil {
-			// The instance name isn't in the DB (e.g. UI holds a stale id
-			// after the user already removed it on another tab). Match
-			// Python and skip silently instead of returning 500.
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				continue
-			}
+	modelInstances, missingInstanceNames, err := m.getProviderInstancesByNames(provider.ID, instanceNames)
+	if err != nil {
+		return common.CodeServerError, err
+	}
+	if len(missingInstanceNames) > 0 {
+		return common.CodeNotFound, fmt.Errorf("no instance found for provider %q and instances %q", providerName, missingInstanceNames)
+	}
+
+	for _, modelInstance := range modelInstances {
+		if _, err = m.modelDAO.DeleteByProviderIDAndInstanceID(provider.ID, modelInstance.ID); err != nil {
 			return common.CodeServerError, err
 		}
 
-		// Delete all models of this instance
-		var count int64 = 0
-		count, err = m.modelDAO.DeleteByProviderIDAndInstanceID(provider.ID, tenantModelInstance.ID)
+		count, err := m.modelInstanceDAO.DeleteByProviderIDAndInstanceName(provider.ID, modelInstance.InstanceName)
 		if err != nil {
 			return common.CodeServerError, err
 		}
-
-		// Delete model instance
-		count, err = m.modelInstanceDAO.DeleteByProviderIDAndInstanceName(provider.ID, instanceName)
-		if err != nil {
-			return common.CodeServerError, err
-		}
-
 		if count == 0 {
-			return common.CodeNotFound, errors.New("provider instance not found")
+			return common.CodeNotFound, fmt.Errorf("provider instance %q not found", modelInstance.InstanceName)
 		}
 	}
 
 	return common.CodeSuccess, nil
 }
 
-func (m *ModelProviderService) DropInstanceModels(providerName, instanceName, userID string, models []string) (common.ErrorCode, error) {
+func (m *ModelProviderService) DropInstanceModels(providerName, instanceName, userID string, modelIDs, models []string) (common.ErrorCode, error) {
 
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
@@ -985,7 +1056,27 @@ func (m *ModelProviderService) DropInstanceModels(providerName, instanceName, us
 		return common.CodeServerError, err
 	}
 
+	for _, modelID := range modelIDs {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			return common.CodeBadRequest, errors.New("model ID is required")
+		}
+		var count int64 = 0
+		count, err = m.modelDAO.DeleteByModelIDAndProviderIDAndInstanceID(modelID, provider.ID, modelInstance.ID)
+		if err != nil {
+			return common.CodeServerError, err
+		}
+
+		if count == 0 {
+			return common.CodeNotFound, fmt.Errorf("model %s not found", modelID)
+		}
+	}
+
 	for _, modelName := range models {
+		modelName = strings.TrimSpace(modelName)
+		if modelName == "" {
+			return common.CodeBadRequest, errors.New("model name is required")
+		}
 		// Delete all models of this instance
 		var count int64 = 0
 		count, err = m.modelDAO.DeleteByProviderIDAndInstanceIDAndModelName(provider.ID, modelInstance.ID, modelName)
@@ -1061,7 +1152,16 @@ func (m *ModelProviderService) ListInstanceModels(providerName, instanceName, us
 	return allModels, nil
 }
 
-func (m *ModelProviderService) UpdateModelStatus(providerName, instanceName, modelName, userID, status string) (common.ErrorCode, error) {
+func (m *ModelProviderService) UpdateModelStatus(providerName, instanceName, modelName, userID, modelID, status string) (common.ErrorCode, error) {
+	modelName = strings.TrimSpace(modelName)
+	modelID = strings.TrimSpace(modelID)
+	status = strings.TrimSpace(status)
+	if status != "active" && status != "inactive" {
+		return common.CodeBadRequest, errors.New("status must be active or inactive")
+	}
+	if modelName == "" && modelID == "" {
+		return common.CodeBadRequest, errors.New("model name or model ID is required")
+	}
 
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
@@ -1086,34 +1186,66 @@ func (m *ModelProviderService) UpdateModelStatus(providerName, instanceName, mod
 		return common.CodeServerError, err
 	}
 
-	model, err := m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(provider.ID, instance.ID, modelName)
-	if err != nil {
-		var modelID string
-		modelID = utility.GenerateToken()
+	var model *entity.TenantModel
 
-		var modelSchema *modelModule.Model
-		modelSchema, err = dao.GetModelProviderManager().GetModelByName(providerName, modelName)
-		if err != nil {
-			return common.CodeNotFound, errors.New(fmt.Sprintf("provider %s model %s not found", providerName, modelName))
+	if modelID != "" {
+		model, err = m.modelDAO.GetByID(modelID)
+		if err != nil || model == nil {
+			return common.CodeNotFound, errors.New("model not found")
 		}
 
-		// Get model info from provider
-		model = &entity.TenantModel{
-			ID:         modelID,
-			ModelName:  modelName,
-			ModelType:  modelSchema.ModelTypes[0],
-			ProviderID: provider.ID,
-			InstanceID: instance.ID,
-			Status:     status,
+		if model.ProviderID != provider.ID || model.InstanceID != instance.ID {
+			return common.CodeNotFound, errors.New("model not found")
 		}
-		err = m.modelDAO.Create(model)
+
+		if modelName != "" && model.ModelName != modelName {
+			return common.CodeBadRequest, errors.New("model ID does not match model name")
+		}
+
+		count, err := m.modelDAO.UpdateStatusByIDAndScope(modelID, provider.ID, instance.ID, status)
 		if err != nil {
-			return common.CodeServerError, errors.New("fail to create model")
+			return common.CodeServerError, err
+		}
+		if count == 0 {
+			return common.CodeNotFound, errors.New("model not found")
 		}
 		return common.CodeSuccess, nil
+	} else {
+		model, err = m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(provider.ID, instance.ID, modelName)
+		if err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return common.CodeServerError, err
+			}
+
+			modelID = utility.GenerateToken()
+
+			var modelSchema *modelModule.Model
+			modelSchema, err = dao.GetModelProviderManager().GetModelByName(providerName, modelName)
+			if err != nil {
+				return common.CodeNotFound, errors.New(fmt.Sprintf("provider %s model %s not found", providerName, modelName))
+			}
+
+			// Get model info from provider
+			if len(modelSchema.ModelTypes) == 0 {
+				return common.CodeServerError, fmt.Errorf("provider %s model %s has no model types", providerName, modelName)
+			}
+			model = &entity.TenantModel{
+				ID:         modelID,
+				ModelName:  modelName,
+				ModelType:  modelSchema.ModelTypes[0],
+				ProviderID: provider.ID,
+				InstanceID: instance.ID,
+				Status:     status,
+			}
+			err = m.modelDAO.Create(model)
+			if err != nil {
+				return common.CodeServerError, errors.New("fail to create model")
+			}
+			return common.CodeSuccess, nil
+		}
 	}
 
-	count, err := m.modelDAO.DeleteByModelID(model.ID)
+	count, err := m.modelDAO.UpdateStatusByIDAndScope(model.ID, provider.ID, instance.ID, status)
 	if err != nil {
 		return common.CodeServerError, err
 	}
@@ -1380,23 +1512,28 @@ func (m *ModelProviderService) ChatToModelWithMessages(providerName, instanceNam
 		thinking := info.ModelInfo.Thinking.DefaultValue
 		modelConfig.Thinking = &thinking
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var response *modelModule.ChatResponse
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["chat"] && !info.ModelInfo.ModelTypeMap["vision"] {
-			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a chat or multimodal model", *modelName, *providerName))
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a chat or multimodal model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if info.ModelEntity.ModelType != "chat" && info.ModelEntity.ModelType != "vision" {
-				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a chat or multimodal model", *modelName, *providerName))
+				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a chat or multimodal model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return nil, common.CodeServerError, err
 			}
@@ -1405,7 +1542,7 @@ func (m *ModelProviderService) ChatToModelWithMessages(providerName, instanceNam
 		}
 	}
 
-	response, err = modelDriver.ChatWithMessages(*modelName, messages, info.APIConfig, modelConfig)
+	response, err = modelDriver.ChatWithMessages(resolvedModelName, messages, info.APIConfig, modelConfig)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
@@ -1442,6 +1579,11 @@ func (m *ModelProviderService) ChatToModelStreamWithSender(providerName, instanc
 		thinking := info.ModelInfo.Thinking.DefaultValue
 		modelConfig.Thinking = &thinking
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
@@ -1451,10 +1593,10 @@ func (m *ModelProviderService) ChatToModelStreamWithSender(providerName, instanc
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if info.ModelEntity.ModelType != "chat" && info.ModelEntity.ModelType != "vision" {
-				return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a chat or multimodal model", *modelName, *providerName))
+				return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a chat or multimodal model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return common.CodeServerError, err
 			}
@@ -1463,7 +1605,7 @@ func (m *ModelProviderService) ChatToModelStreamWithSender(providerName, instanc
 		}
 	}
 
-	err = modelDriver.ChatStreamlyWithSender(*modelName, messages, info.APIConfig, modelConfig, sender)
+	err = modelDriver.ChatStreamlyWithSender(resolvedModelName, messages, info.APIConfig, modelConfig, sender)
 	if err != nil {
 		return common.CodeServerError, err
 	}
@@ -1521,22 +1663,27 @@ func (m *ModelProviderService) EmbedText(providerName, instanceName, modelName, 
 	if modelConfig == nil {
 		modelConfig = &modelModule.EmbeddingConfig{}
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["embedding"] {
-			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an embedding model", *modelName, *providerName))
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an embedding model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if info.ModelEntity.ModelType != "embedding" {
-				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an embedding model", *modelName, *providerName))
+				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an embedding model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return nil, common.CodeServerError, err
 			}
@@ -1550,7 +1697,7 @@ func (m *ModelProviderService) EmbedText(providerName, instanceName, modelName, 
 	}
 
 	var response []modelModule.EmbeddingData
-	response, err = modelDriver.Embed(modelName, texts, info.APIConfig, modelConfig)
+	response, err = modelDriver.Embed(&resolvedModelName, texts, info.APIConfig, modelConfig)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
@@ -1582,22 +1729,27 @@ func (m *ModelProviderService) RerankDocument(providerName, instanceName, modelN
 	if modelConfig == nil {
 		modelConfig = &modelModule.RerankConfig{}
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["rerank"] {
-			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a rerank model", *modelName, *providerName))
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a rerank model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if info.ModelEntity.ModelType != "rerank" {
-				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a rerank model", *modelName, *providerName))
+				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a rerank model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return nil, common.CodeServerError, err
 			}
@@ -1607,7 +1759,7 @@ func (m *ModelProviderService) RerankDocument(providerName, instanceName, modelN
 	}
 
 	var response *modelModule.RerankResponse
-	response, err = modelDriver.Rerank(modelName, query, documents, apiConfig, modelConfig)
+	response, err = modelDriver.Rerank(&resolvedModelName, query, documents, info.APIConfig, modelConfig)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
@@ -2203,21 +2355,28 @@ func (m *ModelProviderService) GetModelConfigFromProviderInstance(tenantID strin
 
 	// TEI builtin embedding short-circuit
 	if modelType == entity.ModelTypeEmbedding && strings.Contains(os.Getenv("COMPOSE_PROFILES"), "tei-") {
-		parts := strings.Split(modelName, "@")
-		teiPure := parts[0]
-		teiProvider := ""
-		switch len(parts) {
-		case 2:
-			teiProvider = parts[1]
-		case 3:
-			teiProvider = parts[2]
+		teiModel := os.Getenv("TEI_MODEL")
+		teiBaseURL := os.Getenv("TEI_BASE_URL")
+	
+		// First try exact match: handles bare model IDs like "model@q8_0"
+		// where '@' is part of the model name itself.
+		if modelName == teiModel {
+			builtinDriver := modelModule.GetBuiltinEmbeddingModel(modelName)
+			if builtinDriver == nil {
+				return nil, "", nil, 0, fmt.Errorf("builtin (TEI) embedding model %q not found", modelName)
+			}
+			apiConfig := &modelModule.APIConfig{ApiKey: nil, Region: nil, BaseURL: &teiBaseURL}
+			return builtinDriver, modelName, apiConfig, 0, nil
 		}
-		if teiPure == os.Getenv("TEI_MODEL") && (teiProvider == "Builtin" || teiProvider == "") {
+		
+		// Then try right-anchored parsing for explicit "model@Builtin" or
+		// "model@instance@Builtin" composite keys.
+		teiPure, _, teiProvider := splitRightAnchoredModelName(modelName)
+		if teiPure == teiModel && (teiProvider == "Builtin" || teiProvider == "") {
 			builtinDriver := modelModule.GetBuiltinEmbeddingModel(teiPure)
 			if builtinDriver == nil {
 				return nil, "", nil, 0, fmt.Errorf("builtin (TEI) embedding model %q not found", teiPure)
 			}
-			teiBaseURL := os.Getenv("TEI_BASE_URL")
 			apiConfig := &modelModule.APIConfig{ApiKey: nil, Region: nil, BaseURL: &teiBaseURL}
 			return builtinDriver, teiPure, apiConfig, 0, nil
 		}
@@ -2234,25 +2393,39 @@ func (m *ModelProviderService) GetModelConfigFromProviderInstance(tenantID strin
 	// request that names a Builtin provider must fall through to the standard
 	// branch, which surfaces an accurate "provider not found" instead of
 	// handing back an embedding-only driver.
-	parts := strings.Split(modelName, "@")
-	if modelType == entity.ModelTypeEmbedding && len(parts) >= 2 && parts[len(parts)-1] == "Builtin" {
-		pureModelName := parts[0]
-		builtinDriver := modelModule.GetBuiltinEmbeddingModel(pureModelName)
-		if builtinDriver == nil {
-			return nil, "", nil, 0, fmt.Errorf("builtin embedding model %q not found", pureModelName)
+	if modelType == entity.ModelTypeEmbedding {
+		// The Builtin provider is a local service, not a tenant-enrolled
+		// provider. Extract the model name by looking for the @Builtin
+		// suffix explicitly so model names with embedded '@' characters
+		// (e.g. `model@q8_0@Builtin` or bare `model@q8_0` without any
+		// provider suffix) are handled correctly.
+		var pureModelName string
+		switch {
+		case strings.HasSuffix(modelName, "@default@Builtin"):
+			pureModelName = modelName[:len(modelName)-len("@default@Builtin")]
+		case strings.HasSuffix(modelName, "@Builtin"):
+			pureModelName = modelName[:len(modelName)-len("@Builtin")]
+		default:
+			pureModelName = ""
 		}
-		apiKey := ""
-		region := ""
-		apiConfig := &modelModule.APIConfig{ApiKey: &apiKey, Region: &region}
-		maxTokens := 0
-		if mi, _ := dao.GetModelProviderManager().GetModelByName("Builtin", pureModelName); mi != nil {
-			if mi.MaxTokens == nil {
-				maxTokens = 0
-			} else {
-				maxTokens = *mi.MaxTokens
+		if pureModelName != "" {
+			builtinDriver := modelModule.GetBuiltinEmbeddingModel(pureModelName)
+			if builtinDriver == nil {
+				return nil, "", nil, 0, fmt.Errorf("builtin embedding model %q not found", pureModelName)
 			}
+			apiKey := ""
+			region := ""
+			apiConfig := &modelModule.APIConfig{ApiKey: &apiKey, Region: &region}
+			maxTokens := 0
+			if mi, _ := dao.GetModelProviderManager().GetModelByName("Builtin", pureModelName); mi != nil {
+				if mi.MaxTokens == nil {
+					maxTokens = 0
+				} else {
+					maxTokens = *mi.MaxTokens
+				}
+			}
+			return builtinDriver, pureModelName, apiConfig, maxTokens, nil
 		}
-		return builtinDriver, pureModelName, apiConfig, maxTokens, nil
 	}
 
 	pureModelName, instanceName, providerName, err := parseModelName(modelName)
@@ -2490,4 +2663,40 @@ func (m *ModelProviderService) ListAllModels(pageIndex, pageSize int) ([]map[str
 
 func (m *ModelProviderService) ShowModel(modelName string) (*modelModule.Model, error) {
 	return dao.GetModelProviderManager().GetModelByNameOrAlias(modelName), nil
+}
+
+// isImage2TextLLM returns true when the named LLM is registered as an
+// image2text model for the tenant.
+// Returns false on lookup error or empty LLM ID so callers fall back to
+// chat — matches Python's branch order where only an EXPLICIT image2text
+// registration switches the model type away from chat.
+func (m *ModelProviderService) isImage2TextLLM(tenantID, llmID string) bool {
+	if m == nil || llmID == "" {
+		return false
+	}
+	modelTypes, err := m.GetModelTypeByName(tenantID, llmID)
+	if err != nil {
+		return false
+	}
+	for _, mt := range modelTypes {
+		if mt == entity.ModelTypeImage2Text {
+			return true
+		}
+	}
+	return false
+}
+
+// GetChatModelConfig resolves the model configuration for a chat dialog.
+// If llmID is empty, falls back to the tenant's default chat model.
+// When the named LLM is registered as an image2text model, returns the
+// IMAGE2TEXT driver/config instead of CHAT.
+func (m *ModelProviderService) GetChatModelConfig(tenantID string, llmID string) (modelModule.ModelDriver, string, *modelModule.APIConfig, int, error) {
+	if llmID == "" {
+		return m.GetTenantDefaultModelByType(tenantID, entity.ModelTypeChat)
+	}
+	modelType := entity.ModelTypeChat
+	if m.isImage2TextLLM(tenantID, llmID) {
+		modelType = entity.ModelTypeImage2Text
+	}
+	return m.GetModelConfigFromProviderInstance(tenantID, modelType, llmID)
 }

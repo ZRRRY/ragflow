@@ -1,0 +1,23 @@
+diff --git a/test/unit_test/api/apps/services/test_delete_datasets.py b/test/unit_test/api/apps/services/test_delete_datasets.py
+index a0badec5f..eaed73395 100644
+--- a/test/unit_test/api/apps/services/test_delete_datasets.py
++++ b/test/unit_test/api/apps/services/test_delete_datasets.py
+@@ -40,6 +40,10 @@ def _stub(monkeypatch, name, **attrs):
+ 
+ 
+ def _load_delete_datasets_module(monkeypatch, *, f2d_rows, file_filter_delete):
++    # The custom service dispatch imports through api.apps.services. Isolate
++    # that package too so this unit test never starts the Quart application.
++    _stub(monkeypatch, "api.apps", __path__=[])
++    _stub(monkeypatch, "api.apps.services", __path__=[], dataset_api_service_extras=SimpleNamespace())
+     f2d_delete = MagicMock()
+     kb = SimpleNamespace(id="kb-1", tenant_id="tenant-1", name="test-kb")
+     doc = SimpleNamespace(id="doc-1")
+@@ -130,6 +134,7 @@ def _load_delete_datasets_module(monkeypatch, *, f2d_rows, file_filter_delete):
+         StatusEnum=SimpleNamespace(),
+         LLMType=SimpleNamespace(),
+     )
++    _stub(monkeypatch, "rag.nlp", __path__=[])
+     _stub(
+         monkeypatch,
+         "rag.nlp.search",

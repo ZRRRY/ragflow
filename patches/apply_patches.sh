@@ -5,6 +5,7 @@
 #   bash patches/apply_patches.sh --check  # dry-run only
 
 set -euo pipefail
+shopt -s nullglob dotglob
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -15,10 +16,10 @@ if [[ "${1:-}" == "--check" ]]; then
     CHECK=true
 fi
 
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [[ "$CURRENT_BRANCH" == "dev" ]]; then
-    echo "Warning: you are on the 'dev' branch, which already contains these modifications."
-    echo "Patches are meant to be applied to a clean official branch (e.g. 'main')."
+CURRENT_BRANCH=$(git symbolic-ref --quiet --short HEAD || echo HEAD)
+if [[ ( "$CURRENT_BRANCH" == "dev" || "$CURRENT_BRANCH" == "dev-0.26" ) && "$CHECK" == false ]]; then
+    echo "Warning: you are on '$CURRENT_BRANCH', which already contains these modifications."
+    echo "Patches are meant to be applied to a clean official tag (e.g. 'v0.26.4')."
     echo "Run with --force to proceed anyway, or switch to 'main'."
     if [[ "${1:-}" != "--force" && "${2:-}" != "--force" ]]; then
         exit 0

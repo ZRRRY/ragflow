@@ -1,8 +1,8 @@
 diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
-index c3b720811..d78b8713d 100644
+index 2e85ef7e8..a0e012c47 100644
 --- a/rag/svr/task_executor.py
 +++ b/rag/svr/task_executor.py
-@@ -1905,6 +1905,15 @@ async def main():
+@@ -1926,6 +1926,15 @@ async def main():
      logging.error("BUG!!! You should not reach here!!!")
  
  

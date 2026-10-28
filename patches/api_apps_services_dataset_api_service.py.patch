@@ -1,16 +1,39 @@
 diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
-index 72b4f4f93..fad0aa659 100644
+index f972e35c3..948402581 100644
 --- a/api/apps/services/dataset_api_service.py
 +++ b/api/apps/services/dataset_api_service.py
-@@ -21,6 +21,7 @@ import re
- from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance
- from common.constants import PAGERANK_FLD
- from common import settings
+@@ -13,24 +13,24 @@
+ #  See the License for the specific language governing permissions and
+ #  limitations under the License.
+ #
+-import logging
+ import json
++import logging
+ import os
+ import re
+ 
+-from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance
+-from common.constants import PAGERANK_FLD
+-from common import settings
 +from api.apps.services import dataset_api_service_extras as _dataset_extras
  from api.db.db_models import File
++from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance
++from api.db.services.connector_service import Connector2KbService
  from api.db.services.document_service import DocumentService, queue_raptor_o_graphrag_tasks
  from api.db.services.file2document_service import File2DocumentService
-@@ -413,37 +414,12 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
+ from api.db.services.file_service import FileService
+ from api.db.services.knowledgebase_service import KnowledgebaseService
+-from api.db.services.connector_service import Connector2KbService
+ from api.db.services.task_service import GRAPH_RAPTOR_FAKE_DOC_ID, TaskService
+ from api.db.services.user_service import TenantService, UserService, UserTenantService
+-from common.constants import FileSource, StatusEnum
+ from api.utils.api_utils import deep_merge, get_parser_config, remap_dictionary_keys, verify_embedding_availability
++from common import settings
++from common.constants import PAGERANK_FLD, FileSource, StatusEnum
+ from common.misc_utils import thread_pool_exec
+ 
+ _VALID_INDEX_TYPES = {"graph", "raptor", "mindmap", "artifact", "skill"}
+@@ -419,37 +419,12 @@ async def get_knowledge_graph(dataset_id: str, tenant_id: str):
      :param tenant_id: tenant ID
      :return: (success, result) or (success, error_message)
      """
@@ -54,32 +77,34 @@ index 72b4f4f93..fad0aa659 100644
  
  
  def delete_knowledge_graph(dataset_id: str, tenant_id: str):
-@@ -459,8 +435,13 @@ def delete_knowledge_graph(dataset_id: str, tenant_id: str):
+@@ -465,8 +440,13 @@ def delete_knowledge_graph(dataset_id: str, tenant_id: str):
      _, kb = KnowledgebaseService.get_by_id(dataset_id)
      from rag.nlp import search
      from rag.graphrag.phase_markers import clear_phase_markers
--    settings.docStoreConn.delete({"knowledge_graph_kwd": ["graph", "subgraph", "entity", "relation", "community_report"]},
+-
+-    settings.docStoreConn.delete({"knowledge_graph_kwd": ["graph", "subgraph", "entity", "relation", "community_report"]}, search.index_name(kb.tenant_id), dataset_id)
 +    # === CUSTOM BEGIN [graphrag-delete-keywords] ===
 +    # 原因：增量构建产物 merge_state 需要在删图时一并清理
 +    # 日期：2026-06-20
 +    # 关联：api/apps/services/dataset_api_service_extras.py
 +    settings.docStoreConn.delete({"knowledge_graph_kwd": _dataset_extras.graph_delete_keywords()},
-                                  search.index_name(kb.tenant_id), dataset_id)
++                                 search.index_name(kb.tenant_id), dataset_id)
 +    # === CUSTOM END [graphrag-delete-keywords] ===
      # Wiping the graph invalidates any phase-completion markers used to
      # short-circuit resolution / community detection on resume.
      clear_phase_markers(dataset_id)
-@@ -837,8 +818,13 @@ def delete_index(dataset_id: str, tenant_id: str, index_type: str, wipe: bool =
+@@ -848,8 +828,13 @@ def delete_index(dataset_id: str, tenant_id: str, index_type: str, wipe: bool =
      if wipe and index_type == "graph":
          from rag.nlp import search
          from rag.graphrag.phase_markers import clear_phase_markers
--        settings.docStoreConn.delete({"knowledge_graph_kwd": ["graph", "subgraph", "entity", "relation", "community_report"]},
+-
+-        settings.docStoreConn.delete({"knowledge_graph_kwd": ["graph", "subgraph", "entity", "relation", "community_report"]}, search.index_name(kb.tenant_id), dataset_id)
 +        # === CUSTOM BEGIN [graphrag-delete-keywords] ===
 +        # 原因：增量构建产物 merge_state 需要在删图时一并清理
 +        # 日期：2026-06-20
 +        # 关联：api/apps/services/dataset_api_service_extras.py
 +        settings.docStoreConn.delete({"knowledge_graph_kwd": _dataset_extras.graph_delete_keywords()},
-                                      search.index_name(kb.tenant_id), dataset_id)
++                                     search.index_name(kb.tenant_id), dataset_id)
 +        # === CUSTOM END [graphrag-delete-keywords] ===
          # Wiping the graph invalidates any phase-completion markers used to
          # short-circuit resolution / community detection on resume.

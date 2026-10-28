@@ -1,4 +1,4 @@
-"""Behavioral regressions for the five ZRRRY review findings.
+"""Behavioral regressions for the ZRRRY review findings and upstream upgrades.
 
 Assertions describe the required behavior, so unfixed defects fail normally.
 Run this module alone or with the GraphRAG suite. No live services are needed:
@@ -571,3 +571,108 @@ async def test_indexed_community_preserves_monolithic_backend_fallback(runtime, 
     await index_extras.extract_community_async(None, "tenant", "kb", None, None, runtime.model, lambda **kwargs: None)
     assert len(runtime.community_inputs) == 1
     assert set(runtime.community_inputs[0]) == {"Alice", "Bob"}
+
+
+@pytest.mark.parametrize("entity_type", ["Book", "Chapter", "书籍", "章节"])
+async def test_v0264_full_writer_skips_structural_embedding(runtime, monkeypatch, entity_type):
+    graph = make_graph("doc1", "STRUCTURE")
+    graph.nodes["STRUCTURE"]["entity_type"] = entity_type
+    monkeypatch.setattr(utils.REDIS_CONN, "mget", lambda keys: [None] * len(keys))
+    encode = MagicMock(side_effect=runtime.model.encode)
+    runtime.model.encode = encode
+    change = utils.GraphChange(added_updated_nodes={"STRUCTURE"})
+
+    await utils._set_graph_impl("tenant", "kb", runtime.model, graph, change, lambda **kwargs: None)
+
+    encode.assert_not_called()
+    entities = [row for row in runtime.store.rows.values() if row["knowledge_graph_kwd"] == "entity"]
+    assert len(entities) == 1
+    assert not any(key.endswith("_vec") for key in entities[0])
+
+
+async def test_v0264_full_writer_batches_only_semantic_nodes_and_edges(runtime, monkeypatch):
+    graph = make_graph("doc1", "BOOK", "CHAPTER", "ALICE", "BOB")
+    graph.nodes["BOOK"]["entity_type"] = "Book"
+    graph.nodes["CHAPTER"]["entity_type"] = "Chapter"
+    cache = {}
+    monkeypatch.setattr(utils.REDIS_CONN, "mget", lambda keys: [None] * len(keys))
+    monkeypatch.setattr(utils, "get_embed_cache", lambda model, key: cache.get(key))
+    monkeypatch.setattr(utils, "set_embed_cache", lambda model, key, value: cache.__setitem__(key, value))
+    encode = MagicMock(side_effect=runtime.model.encode)
+    runtime.model.encode = encode
+    change = utils.GraphChange(added_updated_nodes=set(graph.nodes), added_updated_edges=set(graph.edges))
+
+    await utils._set_graph_impl("tenant", "kb", runtime.model, graph, change, lambda **kwargs: None)
+
+    assert encode.call_count == 2
+    assert set(encode.call_args_list[0].args[0]) == {"ALICE", "BOB"}
+    assert encode.call_args_list[1].args[0] == ["ALICE->BOB: related"]
+    for row in runtime.store.rows.values():
+        if row["knowledge_graph_kwd"] not in {"entity", "relation"}:
+            continue
+        structural = row.get("entity_kwd") in {"BOOK", "CHAPTER"} or row.get("from_entity_kwd") in {"BOOK", "CHAPTER"}
+        assert any(key.endswith("_vec") for key in row) is (not structural)
+
+
+@pytest.mark.parametrize(
+    ("description", "keep"),
+    [
+        ("There is no clear relationship between these entities.", False),
+        ("Charlie works for Acme.", False),
+        ("Alice works with Bob.", True),
+        ("related", True),
+    ],
+)
+async def test_v0264_custom_extractor_applies_relationship_quality(runtime, monkeypatch, description, keep):
+    monkeypatch.setattr(GraphRAGConfig, "USE_CHAPTER_GRAPH", False)
+    monkeypatch.setattr(index_extras, "does_graph_contains", AsyncMock(return_value=False))
+    monkeypatch.setattr(index_extras, "write_merge_state", AsyncMock())
+    relation = {"src_id": "ALICE", "tgt_id": "BOB", "description": description, "weight": 1, "keywords": ["related"]}
+    assert index._relationship_looks_valid(relation) is keep
+
+    class ExtractorDouble:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __call__(self, *args, **kwargs):
+            return [{"entity_name": name, "entity_type": "person", "description": name} for name in ("ALICE", "BOB")], [relation]
+
+    graph = await index_extras.generate_subgraph(
+        ExtractorDouble, "tenant", "kb", "doc1", ["text"], "English", ["person"], None, runtime.model, lambda **kwargs: None
+    )
+
+    assert graph.has_edge("ALICE", "BOB") is keep
+    assert set(graph.nodes) == {"ALICE", "BOB"}
+
+
+async def test_v0264_generated_structure_links_bypass_llm_filter(runtime, monkeypatch):
+    monkeypatch.setattr(GraphRAGConfig, "USE_CHAPTER_GRAPH", True)
+    monkeypatch.setattr(index_extras, "does_graph_contains", AsyncMock(return_value=False))
+    monkeypatch.setattr(index_extras, "write_merge_state", AsyncMock())
+    # The text deliberately fails the LLM quality check; generated links must
+    # still survive because their provenance, rather than endpoint type, matters.
+    def link(left, right):
+        return {"src_id": left, "tgt_id": right, "description": "no clear relationship", "weight": 1, "keywords": ["contains"]}
+
+    monkeypatch.setattr(index_extras, "_extract_book_and_chapters", lambda *args: (
+        "BOOK",
+        [{"entity_name": name, "entity_type": kind, "description": name} for name, kind in [("BOOK", "书籍"), ("CHAPTER", "章节")]],
+        [link("BOOK", "CHAPTER")],
+        [["CHAPTER"]],
+    ))
+    monkeypatch.setattr(index_extras, "_link_entities_to_chapters", lambda *args: [link("ALICE", "CHAPTER")])
+
+    class ExtractorDouble:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __call__(self, *args, **kwargs):
+            return [{"entity_name": name, "entity_type": "person", "description": name} for name in ("ALICE", "BOB")], [link("ALICE", "BOB")]
+
+    graph = await index_extras.generate_subgraph(
+        ExtractorDouble, "tenant", "kb", "doc1", ["text"], "English", ["person"], None, runtime.model, lambda **kwargs: None
+    )
+
+    assert graph.has_edge("BOOK", "CHAPTER")
+    assert graph.has_edge("ALICE", "CHAPTER")
+    assert not graph.has_edge("ALICE", "BOB")

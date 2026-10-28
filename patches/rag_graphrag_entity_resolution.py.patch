@@ -1,11 +1,11 @@
 diff --git a/rag/graphrag/entity_resolution.py b/rag/graphrag/entity_resolution.py
-index 6819d003e..197a59bc0 100644
+index 1efd7a2af..1db97f1ea 100644
 --- a/rag/graphrag/entity_resolution.py
 +++ b/rag/graphrag/entity_resolution.py
-@@ -309,3 +309,21 @@ class EntityResolution(Extractor):
+@@ -286,3 +286,21 @@ class EntityResolution(Extractor):
              return len(a & b) > 1
  
-         return len(a & b)*1./max_l >= 0.8
+         return len(a & b) * 1.0 / max_l >= 0.8
 +
 +
 +# === CUSTOM BEGIN [incremental-entity-resolution] ===

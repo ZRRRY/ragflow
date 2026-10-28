@@ -1,8 +1,8 @@
 diff --git a/api/db/services/document_service.py b/api/db/services/document_service.py
-index 12fdc19fe..39e13a069 100644
+index b9642dffa..17634efd6 100644
 --- a/api/db/services/document_service.py
 +++ b/api/db/services/document_service.py
-@@ -36,6 +36,12 @@ from common.time_utils import current_timestamp, get_format_time
+@@ -37,6 +37,12 @@ from common.time_utils import current_timestamp, get_format_time
  
  from rag.nlp import search
  from rag.utils.redis_conn import REDIS_CONN
@@ -15,7 +15,7 @@ index 12fdc19fe..39e13a069 100644
  
  
  class DocumentService(CommonService):
-@@ -498,23 +504,12 @@ class DocumentService(CommonService):
+@@ -521,23 +527,12 @@ class DocumentService(CommonService):
          # Cleanup knowledge graph references (non-critical, log and continue)
          try:
              if chunk_index_exists:

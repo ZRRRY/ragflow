@@ -1,8 +1,8 @@
 diff --git a/common/settings.py b/common/settings.py
-index 1c313b349..8ee55998a 100644
+index d5270eb50..6809dc101 100644
 --- a/common/settings.py
 +++ b/common/settings.py
-@@ -375,6 +375,30 @@ def init_settings():
+@@ -368,6 +368,30 @@ def init_settings():
          STORAGE_IMPL = storage_impl
  
      global retriever, kg_retriever

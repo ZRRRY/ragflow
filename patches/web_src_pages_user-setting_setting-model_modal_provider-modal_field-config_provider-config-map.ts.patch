@@ -1,0 +1,65 @@
+diff --git a/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts b/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts
+index 629ada01d..f3c7baa9f 100644
+--- a/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts
++++ b/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts
+@@ -106,7 +106,8 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
+   [LLMFactory.VolcEngine]: {
+     llmFactory: LLMFactory.VolcEngine,
+     title: 'VolcEngine',
+-    docLink: 'https://www.volcengine.com/docs/82379/1302008',
++    docLink:
++      'https://console.volcengine.com/ark/region%3Acn-beijing/docs/coding-plan-personal-get-started',
+     docLinkI18nKey: 'ollamaLink',
+     fields: [
+       {
+@@ -130,14 +131,26 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
+         ],
+         defaultValue: ['chat'],
+       },
+-      // {
+-      //   name: 'model_name',
+-      //   label: 'modelName',
+-      //   type: 'text',
+-      //   required: true,
+-      //   placeholder: 'volcModelNameMessage',
+-      //   validation: { message: 'volcModelNameMessage' },
+-      // },
++      {
++        name: 'api_base',
++        label: 'addLlmBaseUrl',
++        type: 'inputSelect',
++        required: true,
++        placeholder: 'baseUrlNameMessage',
++        defaultValue: 'https://ark.cn-beijing.volces.com/api/coding/v3',
++        options: [
++          {
++            label: 'https://ark.cn-beijing.volces.com/api/coding/v3',
++            value: 'https://ark.cn-beijing.volces.com/api/coding/v3',
++          },
++          {
++            label: 'https://ark.cn-beijing.volces.com/api/v3',
++            value: 'https://ark.cn-beijing.volces.com/api/v3',
++          },
++        ],
++        shouldRender: 'hideWhenInstanceExists',
++        validation: { message: 'baseUrlNameMessage' },
++      },
+       {
+         name: 'model_name',
+         label: 'addEndpointID',
+@@ -169,6 +182,7 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
+     verifyTransform: (values) => ({
+       apiKey: values.api_key,
+       endpoint_id: values.endpoint_id,
++      baseUrl: values.api_base,
+       modelInfo: buildModelInfoFromValues(values),
+     }),
+     submitTransform: (values) => ({
+@@ -176,6 +190,7 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
+       llm_factory: LLMFactory.VolcEngine,
+       endpoint_id: values.endpoint_id,
+       api_key: values.api_key,
++      api_base: values.api_base,
+       model_info: buildModelInfoFromValues(values),
+     }),
+   },

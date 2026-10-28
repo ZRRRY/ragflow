@@ -1,8 +1,8 @@
 diff --git a/api/apps/restful_apis/dataset_api.py b/api/apps/restful_apis/dataset_api.py
-index 480b949ab..a7afd7ebd 100644
+index 0c4df2590..238c7df33 100644
 --- a/api/apps/restful_apis/dataset_api.py
 +++ b/api/apps/restful_apis/dataset_api.py
-@@ -556,6 +556,19 @@ async def get_knowledge_graph(tenant_id, dataset_id):
+@@ -556,6 +556,18 @@ async def get_knowledge_graph(tenant_id, dataset_id):
          return get_error_data_result(message="Internal server error")
  
  
@@ -18,7 +18,6 @@ index 480b949ab..a7afd7ebd 100644
 +    return dataset_api_extras.delete_knowledge_graph(tenant_id, dataset_id)
 +# === CUSTOM END [graph-delete-wrapper] ===
 +
-+
- @manager.route("/datasets/<dataset_id>/index", methods=["POST"])  # noqa: F821
+ @manager.route("/datasets/<dataset_id>/any_artifact", methods=["GET"])  # noqa: F821
  @login_required
  @add_tenant_id_to_kwargs

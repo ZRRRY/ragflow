@@ -1,5 +1,5 @@
 diff --git a/rag/graphrag/utils.py b/rag/graphrag/utils.py
-index 038646199..a087a523d 100644
+index 5c584af90..5427c9056 100644
 --- a/rag/graphrag/utils.py
 +++ b/rag/graphrag/utils.py
 @@ -34,6 +34,12 @@ from rag.nlp import rag_tokenizer, search
@@ -15,7 +15,7 @@ index 038646199..a087a523d 100644
  
  GRAPH_FIELD_SEP = "<SEP>"
  
-@@ -393,18 +399,24 @@ async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks, nhop_neig
+@@ -434,15 +440,24 @@ async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks, nhop_neig
          "available_int": 0,
      }
      chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
@@ -23,10 +23,7 @@ index 038646199..a087a523d 100644
 -    if ebd is None:
 -        async with chat_limiter:
 -            timeout = 3 if enable_timeout_assertion else 30000000
--            ebd, _ = await asyncio.wait_for(
--                thread_pool_exec(embd_mdl.encode, [ent_name]),
--                timeout=timeout
--            )
+-            ebd, _ = await asyncio.wait_for(thread_pool_exec(embd_mdl.encode, [ent_name]), timeout=timeout)
 -        ebd = ebd[0]
 -        set_embed_cache(embd_mdl.llm_name, ent_name, ebd)
 -    assert ebd is not None
@@ -52,16 +49,18 @@ index 038646199..a087a523d 100644
      chunks.append(chunk)
  
  
-@@ -430,7 +442,7 @@ async def get_relation(tenant_id, kb_id, from_ent_name, to_ent_name, size=1):
+@@ -469,8 +484,8 @@ async def get_relation(tenant_id, kb_id, from_ent_name, to_ent_name, size=1):
      return res
  
  
 -async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta, chunks):
+-    """Convert a graph edge (relation) to an embeddable chunk and append it to *chunks*."""
 +async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta, chunks, skip_embedding=False):
++    """Convert a graph edge to a chunk, optionally skipping structural embeddings."""
      enable_timeout_assertion = os.environ.get("ENABLE_TIMEOUT_ASSERTION")
      chunk = {
          "id": get_uuid(),
-@@ -446,27 +458,41 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
+@@ -486,22 +501,42 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
          "available_int": 0,
      }
      chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
@@ -70,13 +69,7 @@ index 038646199..a087a523d 100644
 -    if ebd is None:
 -        async with chat_limiter:
 -            timeout = 3 if enable_timeout_assertion else 300000000
--            ebd, _ = await asyncio.wait_for(
--                thread_pool_exec(
--                    embd_mdl.encode,
--                    [txt + f": {meta['description']}"]
--                ),
--                timeout=timeout
--            )
+-            ebd, _ = await asyncio.wait_for(thread_pool_exec(embd_mdl.encode, [txt + f": {meta['description']}"]), timeout=timeout)
 -        ebd = ebd[0]
 -        set_embed_cache(embd_mdl.llm_name, txt, ebd)
 -    assert ebd is not None
@@ -107,6 +100,7 @@ index 038646199..a087a523d 100644
  
  
  async def does_graph_contains(tenant_id, kb_id, doc_id):
+     """Return True if *doc_id* is recorded as a source document in the stored graph for *kb_id*."""
      # Get doc_ids of graph
 +    # === CUSTOM BEGIN [graphrag-incremental] ===
 +    # 原因：增量/优化路径路由到自定义模块
@@ -119,17 +113,18 @@ index 038646199..a087a523d 100644
      fields = ["source_id"]
      condition = {
          "knowledge_graph_kwd": ["graph"],
-@@ -495,7 +521,8 @@ async def get_graph_doc_ids(tenant_id, kb_id) -> list[str]:
+@@ -527,8 +562,8 @@ async def get_graph_doc_ids(tenant_id, kb_id) -> list[str]:
      return doc_ids
  
  
 -async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
+-    """Load the knowledge-graph for *kb_id* from the document store, rebuilding if marked removed."""
 +async def get_graph_from_json(tenant_id, kb_id, exclude_rebuild=None):
 +    """Legacy path: load the monolithic graph JSON blob."""
      conds = {"fields": ["content_with_weight", "removed_kwd", "source_id"], "size": 1, "knowledge_graph_kwd": ["graph"]}
      res = await settings.retriever.search(conds, search.index_name(tenant_id), [kb_id])
      if not res.total == 0:
-@@ -514,7 +541,19 @@ async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
+@@ -547,7 +582,19 @@ async def get_graph(tenant_id, kb_id, exclude_rebuild=None):
      return result
  
  
@@ -147,13 +142,43 @@ index 038646199..a087a523d 100644
 +
 +
 +async def _set_graph_impl(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, change: GraphChange, callback):
-     global chat_limiter
-     start = asyncio.get_running_loop().time()
+     """Persist a knowledge-graph snapshot to the document store.
  
-@@ -575,8 +614,16 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
+     Converts *graph* nodes and edges to embedding chunks, pre-warms the Redis
+@@ -595,7 +642,10 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
+     # Without this, set_graph spawns one asyncio task per entity, each calling
+     # embd_mdl.encode([single_name]).  For 17 k+ nodes that is 17 k round-trips.
+     # Pre-warming the cache here collapses N calls to ceil(N/_INSERT_BULK_SIZE).
+-    _node_list = list(change.added_updated_nodes)
++    # === CUSTOM BEGIN [chapter-graph-no-embed] ===
++    # Keep batch pre-warming consistent with graph_node_to_chunk below.
++    _node_list = [node for node in change.added_updated_nodes if not GraphRAGConfig.should_skip_embedding(graph.nodes[node].get("entity_type"))]
++    # === CUSTOM END [chapter-graph-no-embed] ===
+     _node_misses = await thread_pool_exec(_batch_embed_cache_misses, embd_mdl.llm_name, _node_list)
+     _uncached_node_names = [n for n, miss in zip(_node_list, _node_misses) if miss]
+     logging.debug(
+@@ -645,7 +695,15 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
+     # Cache key  = "A->B"  (matches graph_edge_to_chunk lookup key)
+     # Encoded text = "A->B: <description>"  (matches graph_edge_to_chunk encode text)
+     _all_edge_data = [(_fn, _tn, graph.get_edge_data(_fn, _tn)) for _fn, _tn in change.added_updated_edges]
+-    _all_edge_data = [(f, t, a) for f, t, a in _all_edge_data if a]
++    # === CUSTOM BEGIN [chapter-graph-no-embed] ===
++    # Structural edges must skip the pre-warm as well as per-edge encoding.
++    _all_edge_data = [
++        (f, t, a) for f, t, a in _all_edge_data
++        if a
++        and not GraphRAGConfig.should_skip_embedding(graph.nodes[f].get("entity_type"))
++        and not GraphRAGConfig.should_skip_embedding(graph.nodes[t].get("entity_type"))
++    ]
++    # === CUSTOM END [chapter-graph-no-embed] ===
+     _edge_lookup_keys = [f"{f}->{t}" for f, t, _ in _all_edge_data]
+     _edge_misses = await thread_pool_exec(_batch_embed_cache_misses, embd_mdl.llm_name, _edge_lookup_keys) if _all_edge_data else []
+     _uncached_edge_items = [item for item, miss in zip(_all_edge_data, _edge_misses) if miss]
+@@ -683,7 +741,17 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
          edge_attrs = graph.get_edge_data(from_node, to_node)
          if not edge_attrs:
              continue
+-        tasks.append(asyncio.create_task(graph_edge_to_chunk(kb_id, embd_mdl, from_node, to_node, edge_attrs, chunks)))
 +        # === CUSTOM BEGIN [chapter-graph-no-embed] ===
 +        # 原因：识别与书籍/章节相关的结构关系，透传 skip_embedding 给 graph_edge_to_chunk。
 +        # 日期：2026-06-21
@@ -162,13 +187,13 @@ index 038646199..a087a523d 100644
 +        to_type = graph.nodes[to_node].get("entity_type")
 +        skip_edge = GraphRAGConfig.should_skip_embedding(from_type) or GraphRAGConfig.should_skip_embedding(to_type)
 +        # === CUSTOM END [chapter-graph-no-embed] ===
-         tasks.append(asyncio.create_task(
--            graph_edge_to_chunk(kb_id, embd_mdl, from_node, to_node, edge_attrs, chunks)
++        tasks.append(asyncio.create_task(
 +            graph_edge_to_chunk(kb_id, embd_mdl, from_node, to_node, edge_attrs, chunks, skip_embedding=skip_edge)
-         ))
++        ))
          if ii % 100 == 9 and callback:
              callback(msg=f"Get embedding of edges: {ii}/{len(change.added_updated_edges)}")
-@@ -662,6 +709,16 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
+     try:
+@@ -755,6 +823,16 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
          callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
  
  
@@ -183,5 +208,5 @@ index 038646199..a087a523d 100644
 +
 +
  def is_continuous_subsequence(subseq, seq):
-     def find_all_indexes(tup, value):
-         indexes = []
+     """Return True if *subseq* appears as a contiguous sub-path within tuple *seq*."""
+ 
