@@ -1,0 +1,17 @@
+diff --git a/rag/svr/task_executor_refactor/task_handler.py b/rag/svr/task_executor_refactor/task_handler.py
+index cce68a985..127640331 100644
+--- a/rag/svr/task_executor_refactor/task_handler.py
++++ b/rag/svr/task_executor_refactor/task_handler.py
+@@ -508,7 +508,11 @@ class TaskHandler:
+                 logging.info(f"GraphRAG task result for task {ctx.raw_task}:\n{result}")
+ 
+             ctx.recording_context.record("graphrag_result", result)
+-            ctx.progress_cb(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
++            # === CUSTOM BEGIN [graphrag-postprocess-status] ===
++            # The queued consumer owns the terminal task state.
++            if not result.get("postprocess_queued"):
++                ctx.progress_cb(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
++            # === CUSTOM END [graphrag-postprocess-status] ===
+ 
+     async def _run_standard_chunking(
+         self,

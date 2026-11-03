@@ -2,7 +2,7 @@
 
 本目录保存对官方 RAGFlow 文件的最小化修改 patch。这些 patch 是**无法通过新增文件或 monkey patch 进一步抽离**的必需修改。
 
-当前基线为官方标签 `v0.26.4`，共 21 个 patch。生成脚本比较标签与工作区，包含尚未提交的合并修复，不依赖 `main` 或 merge-base。
+当前基线为官方标签 `v0.26.4`，共 23 个 patch。生成脚本比较标签与工作区，包含尚未提交的合并修复，不依赖 `main` 或 merge-base。
 
 ## 文件列表
 
@@ -16,8 +16,10 @@
 | `common_settings.py.patch` | `common/settings.py` | 安装自定义 hook（audit / ES） |
 | `rag_graphrag_entity_resolution.py.patch` | `rag/graphrag/entity_resolution.py` | 增量实体消解子类化分发 |
 | `rag_graphrag_general_index.py.patch` | `rag/graphrag/general/index.py` | 激活 GraphRAG incremental patch |
+| `rag_graphrag_phase_markers.py.patch` | `rag/graphrag/phase_markers.py` | 返回阶段标记删除结果，图变更前清除失败则中止写入 |
 | `rag_graphrag_utils.py.patch` | `rag/graphrag/utils.py` | 增量图读写路由 dispatch |
-| `rag_svr_task_executor.py.patch` | `rag/svr/task_executor.py` | 激活 task_executor 扩展 patch |
+| `rag_svr_task_executor.py.patch` | `rag/svr/task_executor.py` | 激活 task_executor 扩展；异步图谱后处理完成前不标记任务成功 |
+| `rag_svr_task_executor_refactor_task_handler.py.patch` | `rag/svr/task_executor_refactor/task_handler.py` | 异步图谱后处理完成前不标记任务成功 |
 | `rag_utils_es_conn.py.patch` | `rag/utils/es_conn.py` | 仅纯 GraphRAG bulk 跳过等待刷新，编译/普通写入保持 `wait_for`；`delete` 增加 `refresh` 参数（GraphRAG merge 热路径传 `refresh=false`，可见性由调用方阶段末显式 refresh 保证） |
 | `web_src_locales_en.ts.patch` | `web/src/locales/en.ts` | `totalChunks` i18n key |
 | `web_src_locales_zh.ts.patch` | `web/src/locales/zh.ts` | `totalChunks` i18n key |

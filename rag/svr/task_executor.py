@@ -1541,7 +1541,11 @@ async def do_handle_task(task):
             )
             logging.info(f"GraphRAG task result for task {task}:\n{result}")
         get_recording_context().record("graphrag_result", result)
-        progress_callback(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
+        # === CUSTOM BEGIN [graphrag-postprocess-status] ===
+        # The queued consumer owns the terminal task state.
+        if not result.get("postprocess_queued"):
+            progress_callback(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
+        # === CUSTOM END [graphrag-postprocess-status] ===
         return
     elif task_type == "mindmap":
         progress_callback(1, "place holder")

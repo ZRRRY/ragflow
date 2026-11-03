@@ -424,13 +424,19 @@ def test_scroll_projects_source_without_mutating_query(monkeypatch, fields, proj
 
 async def test_search_after_failure_is_not_reported_as_missing(environment, monkeypatch):
     store, _ = environment
-    store.es = SimpleNamespace(search=MagicMock(side_effect=RuntimeError("ES unavailable")))
+    store.es = SimpleNamespace(
+        search=MagicMock(side_effect=RuntimeError("ES unavailable")),
+        open_point_in_time=lambda **kwargs: {"id": "pit"}, close_point_in_time=MagicMock(),
+    )
     with pytest.raises(RuntimeError, match="ES unavailable"):
         await utils_extras.query_existing_entities("tenant", "kb", ["A"])
 
 
 async def test_search_after_limit_is_fail_closed(environment):
     store, _ = environment
-    store.es = SimpleNamespace(search=lambda **kw: {"hits": {"hits": [{"_id": "one", "_source": {}, "sort": ["A", 0]}]}})
+    store.es = SimpleNamespace(
+        search=lambda **kw: {"hits": {"hits": [{"_id": "one", "_source": {}, "sort": ["A", 0]}]}},
+        open_point_in_time=lambda **kwargs: {"id": "pit"}, close_point_in_time=MagicMock(),
+    )
     with pytest.raises(RuntimeError, match="max_pages"):
         await utils_pagination.collect_all({}, "idx", "kb", ["entity_kwd"], "entity_kwd", page_size=1, max_pages=1)

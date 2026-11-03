@@ -47,6 +47,7 @@ from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.llm_service import LLMBundle
 from api.db.services.task_service import TaskService, has_canceled
 from rag.graphrag.config import GraphRAGConfig
+from rag.graphrag.storage_scope import graph_condition
 from rag.graphrag.phase_markers import (
     PHASE_COMMUNITY,
     PHASE_RESOLUTION,
@@ -171,20 +172,22 @@ async def reconcile_stuck_graphrag_tasks():
             index = search.index_name(tenant_id)
             try:
                 n_nodes = await thread_pool_exec(
-                    settings.docStoreConn.count, {"knowledge_graph_kwd": ["entity"]}, index, [kb_id]
+                    settings.docStoreConn.count, graph_condition({"knowledge_graph_kwd": ["entity"]}), index, [kb_id]
                 )
                 n_nodes = int(n_nodes or 0)
             except Exception:
                 logging.exception("[reconcile] entity count failed kb=%s", kb_id)
-                n_nodes = 0
+                REDIS_CONN.delete(claim)
+                continue
             try:
                 n_edges = await thread_pool_exec(
-                    settings.docStoreConn.count, {"knowledge_graph_kwd": ["relation"]}, index, [kb_id]
+                    settings.docStoreConn.count, graph_condition({"knowledge_graph_kwd": ["relation"]}), index, [kb_id]
                 )
                 n_edges = int(n_edges or 0)
             except Exception:
                 logging.exception("[reconcile] relation count failed kb=%s", kb_id)
-                n_edges = 0
+                REDIS_CONN.delete(claim)
+                continue
 
             if n_nodes < min_nodes or n_edges < min_edges:
                 logging.warning(
@@ -381,9 +384,10 @@ async def kg_postprocess_consumer():
 
             from rag.graphrag.utils import get_graph
 
-            def pp_callback(msg=None, prog=None):
+            def pp_callback(msg=None, prog=None, *, task_id=task_id, kb_id=kb_id):
                 if msg:
                     logging.info("[KG-PP] kb=%s: %s", kb_id, msg)
+                te.set_progress(task_id, prog=prog, msg=msg or "GraphRAG postprocessing")
 
             # 唯一 lock_value：官方 acquire/spin_acquire 的第一步是
             # delete_if_equal(lock_key, lock_value)——固定 value 会让后到者
@@ -410,6 +414,7 @@ async def kg_postprocess_consumer():
 
                 if not resolution_pending and not community_pending:
                     logging.info("[KG-PP] kb=%s all phases already done", kb_id)
+                    pp_callback(prog=1.0, msg="Knowledge Graph done (postprocessing already complete)")
                     msg.ack()
                     continue
 
@@ -435,21 +440,15 @@ async def kg_postprocess_consumer():
                             task_id=task_id,
                             entity_types=entity_types,
                         )
-                        set_phase_marker(kb_id, PHASE_RESOLUTION)
-                        logging.info("[KG-PP] kb=%s resolution done", kb_id)
-
                         # Incremental resolution merged/removed nodes, so the
                         # global topology changed; recompute pagerank once more.
-                        # Non-fatal on failure: ranks stay stale until the next
-                        # merge-triggered recalc, and community must still run.
                         if GraphRAGConfig.RECALC_GLOBAL_PAGERANK_AFTER_MERGE and GraphRAGConfig.USE_INCREMENTAL_RESOLUTION:
-                            try:
-                                from rag.graphrag.general.index_extras import recalc_global_pagerank
+                            from rag.graphrag.general.index_extras import recalc_global_pagerank
 
-                                await recalc_global_pagerank(tenant_id, kb_id, pp_callback, task_id=task_id)
-                                logging.info("[KG-PP] kb=%s pagerank recalc done", kb_id)
-                            except Exception:
-                                logging.exception("[KG-PP] kb=%s pagerank recalc failed (non-fatal)", kb_id)
+                            await recalc_global_pagerank(tenant_id, kb_id, pp_callback, task_id=task_id)
+                            logging.info("[KG-PP] kb=%s pagerank recalc done", kb_id)
+                        set_phase_marker(kb_id, PHASE_RESOLUTION)
+                        logging.getLogger(__name__).info("[KG-PP] kb=%s resolution done", kb_id)
 
                     if community_pending:
                         from rag.graphrag.general.index import extract_community
@@ -472,15 +471,26 @@ async def kg_postprocess_consumer():
                         set_phase_marker(kb_id, PHASE_COMMUNITY)
                         logging.info("[KG-PP] kb=%s community done", kb_id)
 
+                pp_callback(prog=1.0, msg="Knowledge Graph done (postprocessing complete)")
                 msg.ack()
                 logging.info("[KG-PP] kb=%s postprocess complete", kb_id)
             finally:
                 kb_lock.release()
-        except Exception:
+        except TaskCanceledException:
+            logging.info("[KG-PP] kb=%s task=%s cancelled", kb_id, task_id)
+            msg.ack()
+        except Exception as error:
             # Ack the message even on failure so it does not stay in the
             # Redis Stream PEL forever and get re-delivered in a loop on the
             # next boot. The failure is already logged.
             logging.exception("[KG-PP] kb=%s postprocess failed", kb_id)
+            try:
+                te.set_progress(task_id, prog=-1.0,
+                                msg=f"[GraphRAG] postprocessing failed; graph preserved; ranks may be partially updated. {error!r}")
+            except TaskCanceledException:
+                pass
+            except Exception:
+                logging.exception("[KG-PP] failed to report task failure kb=%s", kb_id)
             try:
                 msg.ack()
             except Exception:

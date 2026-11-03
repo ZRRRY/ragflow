@@ -20,19 +20,127 @@ Elasticsearch 的 ``index.max_result_window`` 默认 10000，超过会
 会在内存里累积全量结果（10w+ 文档时单次调用峰值 1GB+），所以优先用
 ``search_after`` + PIT (point-in-time) 分页。
 
-只支持 Elasticsearch 后端；Infinity / OceanBase 走 fallback
-（旧的 size=10000 单次查询）。
+分页器只支持 Elasticsearch 后端；不支持的后端显式报错。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any, AsyncIterator
+import sys
+from collections.abc import AsyncIterator
+from contextlib import aclosing
+from typing import Any
 
 from common import settings
 from common.misc_utils import thread_pool_exec
 from rag.graphrag.storage_scope import graph_query
 
 logger = logging.getLogger(__name__)
+
+_PIT_KEEP_ALIVE = "10m"
+_PIT_RENEW_INTERVAL = 60
+
+
+async def _finish_request(request):
+    """Drain a threaded request on cancellation before releasing its resources."""
+    task = asyncio.create_task(request)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cancelling the asyncio waiter cannot stop the underlying ES request.
+        # Recover its latest PIT ID before cleanup, even on repeated cancellation.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                logger.debug("PIT request failed while cancellation was pending", exc_info=True)
+                break
+        if not task.cancelled():
+            task.exception()
+        raise
+
+
+async def _wait_for_renewal(stop):
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=_PIT_RENEW_INTERVAL)
+        return False
+    except TimeoutError:
+        return True
+
+
+class _PointInTime:
+    """Own the PIT ID, serial searches, and renewal while consumers do work."""
+
+    def __init__(self, raw, index_name):
+        self.raw = raw
+        self.index_name = index_name
+        self.id = None
+        self.lock = asyncio.Lock()
+        self.stop = asyncio.Event()
+        self.renewal = None
+        self.error = None
+
+    async def open(self):
+        async def request():
+            opened = await thread_pool_exec(
+                self.raw.open_point_in_time, index=self.index_name, keep_alive=_PIT_KEEP_ALIVE,
+            )
+            self.id = opened["id"]
+            if opened.get("_shards", {}).get("failed", 0):
+                raise RuntimeError("Graph PIT creation returned partial shards")
+
+        await _finish_request(request())
+        self.renewal = asyncio.create_task(self._renew(), name="graphrag-pit-renewal")
+
+    def check_error(self):
+        if self.error is not None:
+            raise RuntimeError("Graph PIT renewal failed; refusing incomplete results") from self.error
+
+    async def search(self, body):
+        async with self.lock:
+            self.check_error()
+            return await self._search(body)
+
+    async def _search(self, body):
+        async def request():
+            res = await thread_pool_exec(
+                self.raw.search,
+                body=body | {"pit": {"id": self.id, "keep_alive": _PIT_KEEP_ALIVE}},
+                allow_partial_search_results=False,
+            )
+            self.id = res.get("pit_id", self.id)
+            if res.get("timed_out") or res.get("_shards", {}).get("failed", 0):
+                raise RuntimeError("Graph pagination returned incomplete results")
+            return res
+
+        return await _finish_request(request())
+
+    async def _renew(self):
+        try:
+            while await _wait_for_renewal(self.stop):
+                async with self.lock:
+                    if self.stop.is_set():
+                        return
+                    await self._search({"size": 0, "query": {"match_none": {}}, "track_total_hits": False})
+        except Exception as error:
+            self.error = error
+            logger.exception("Graph PIT renewal failed for index=%s", self.index_name)
+
+    async def close(self):
+        self.stop.set()
+
+        async def cleanup():
+            if self.renewal is not None:
+                await self.renewal
+            if self.id:
+                try:
+                    await thread_pool_exec(self.raw.close_point_in_time, id=self.id)
+                except Exception:
+                    logger.exception("Failed to close Graph pagination PIT for index=%s", self.index_name)
+
+        await _finish_request(cleanup())
 
 
 def supports_search_after(conn) -> bool:
@@ -46,24 +154,16 @@ def _build_query_body(filters: dict, sort_field: str, page_size: int,
 
     Args:
         filters: 与 Dealer.search req["filters"] 等价的 condition dict
-        sort_field: 用于 search_after 的 sort field 名（必须是 keyword 类型
-            且有 doc_values，例如 entity_kwd / from_entity_kwd）
+        sort_field: keyword/doc_values 字段；无需业务排序时使用 _shard_doc。
         page_size: 每页大小
         search_after: 上一批最后一条的 sort 值；None 表示第一页
     """
-    # search_after requires a globally unique sort tuple. The primary field is
-    # a business keyword (entity_kwd / from_entity_kwd) which can have duplicates
-    # across documents; ``_doc`` is appended as a tiebreaker so pagination never
-    # stalls or skips rows when the primary sort value repeats. ``_doc`` is
-    # preferred over ``_id`` because sorting on ``_id`` requires fielddata, which
-    # Elasticsearch disables by default.
+    # Within a PIT, _shard_doc is unique across shards and stable across writes.
     body: dict[str, Any] = {
         "query": {"bool": {"filter": _filters_to_clauses(filters)}},
         "size": page_size,
-        "sort": [
-            {sort_field: {"order": "asc"}},
-            {"_doc": {"order": "asc"}},
-        ],
+        "sort": [{field: {"order": "asc"}} for field in dict.fromkeys((sort_field, "_shard_doc"))],
+        "track_total_hits": False,
     }
     if search_after:
         body["search_after"] = search_after
@@ -103,22 +203,22 @@ async def search_all_by_search_after(
     fields: list[str],
     sort_field: str,
     page_size: int = 1000,
-    max_pages: int = 1000,
+    max_pages: int = 20000,
 ) -> AsyncIterator[list[dict]]:
     """Async generator: 一次 yield 一个 page 的 hits（已投影到 fields）。
 
-    Phase 2.2: 用 Elasticsearch 原生 search_after 翻页，绕过 max_result_window
-    截断。每次 page_size 一次 ES round-trip，max_pages 上限 1000（即最多
-    100w hit/查询）。中间任意一页 ES 抛异常由调用方决定 retry / break。
+    使用 PIT 快照和 search_after 翻页，绕过 max_result_window 截断。
+    max_pages 默认 20000；达到上限或查询失败时抛异常，不返回截断结果。
+    流式消费者须使用 contextlib.aclosing，确保提前退出时立即释放 PIT。
 
     Args:
         filters: RAGFlow condition dict（与 Dealer.search req["filters"] 一致）
         index_name: 完整 index name（用 rag.nlp.search.index_name(tenant_id) 拼）
         kb_id: dataset id
         fields: 要返回的字段列表（与 Dealer.search req["fields"] 一致）
-        sort_field: 用于 search_after 的 keyword 字段
+        sort_field: 用于 search_after 的 keyword 字段，或全量扫描用的 _shard_doc
         page_size: 每页大小（默认 1000）
-        max_pages: 最大页数（默认 1000）
+        max_pages: 最大页数（默认 20000）
     """
     conn = settings.docStoreConn
     if not supports_search_after(conn):
@@ -134,33 +234,39 @@ async def search_all_by_search_after(
     # 把 kb_id 当作额外 filter clause 拼接
     body["query"]["bool"]["filter"].append({"term": {"kb_id": kb_id}})
 
-    for page_idx in range(max_pages):
-        try:
-            res = await thread_pool_exec(raw.search, index=index_name, body=body)
-        except Exception:
-            logger.exception(
-                "search_after page %d failed for index=%s filters=%s",
-                page_idx, index_name, filters,
-            )
-            raise
+    pit = _PointInTime(raw, index_name)
+    try:
+        await pit.open()
+        for page_idx in range(max_pages):
+            started = asyncio.get_running_loop().time()
+            try:
+                res = await pit.search(body)
+            except Exception:
+                logger.exception(
+                    "search_after page %d failed for index=%s filters=%s",
+                    page_idx, index_name, filters,
+                )
+                raise
+            hits = res.get("hits", {}).get("hits", [])
+            logger.info("Graph pagination index=%s kb=%s page=%d hits=%d seconds=%.3f",
+                        index_name, kb_id, page_idx + 1, len(hits), asyncio.get_running_loop().time() - started)
+            if not hits:
+                return
+            last_sort = hits[-1].get("sort")
+            if not last_sort:
+                raise RuntimeError("Graph pagination response lacks a search_after cursor")
+            yield [h.get("_source", {}) | {"id": h["_id"]} for h in hits]
+            pit.check_error()
+            if len(hits) < page_size:
+                return
+            body["search_after"] = last_sort
 
-        hits = res.get("hits", {}).get("hits", [])
-        if not hits:
-            return
-        # 投影到 fields
-        projected = [h.get("_source", {}) | {"id": h["_id"]} for h in hits]
-        yield projected
-
-        last_sort = hits[-1].get("sort")
-        if not last_sort:
-            raise RuntimeError("Graph pagination response lacks a search_after cursor")
-        if len(hits) < page_size:
-            return
-        body = _build_query_body(filters, sort_field, page_size, search_after=last_sort)
-        body["_source"] = fields
-        body["query"]["bool"]["filter"].append({"term": {"kb_id": kb_id}})
-
-    raise RuntimeError(f"Graph pagination exceeded max_pages={max_pages}; refusing truncated results")
+        raise RuntimeError(f"Graph pagination exceeded max_pages={max_pages}; refusing truncated results")
+    finally:
+        active_error = sys.exception()
+        await pit.close()
+        if active_error is None:
+            pit.check_error()
 
 
 async def collect_all(
@@ -170,12 +276,13 @@ async def collect_all(
     fields: list[str],
     sort_field: str,
     page_size: int = 1000,
-    max_pages: int = 1000,
+    max_pages: int = 20000,
 ) -> list[dict]:
     """一次性收集所有 page（便利函数，调用方应优先用 search_all_by_search_after 流式）。"""
     out: list[dict] = []
-    async for page in search_all_by_search_after(
+    async with aclosing(search_all_by_search_after(
         filters, index_name, kb_id, fields, sort_field, page_size, max_pages
-    ):
-        out.extend(page)
+    )) as pages:
+        async for page in pages:
+            out.extend(page)
     return out

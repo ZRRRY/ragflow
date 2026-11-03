@@ -141,12 +141,12 @@ class _AsyncCallback:
         if self._task_id and has_canceled(self._task_id):
             # 与原 set_progress 语义一致：同步落库 [Canceled] 标记后抛出
             # TaskCanceledException。取消是稀有终态，同步成本可接受。
-            self._callback(*args, **kwargs)
+            _progress_writer.submit(self._callback, *args, **kwargs).result()
             return
         prog = kwargs.get("prog")
         if prog is not None and (prog < 0 or prog >= 1.0):
             # 终态进度同步透传：不丢、不乱序（每个任务至多一次）。
-            self._callback(*args, **kwargs)
+            _progress_writer.submit(self._callback, *args, **kwargs).result()
             return
         with self._lock:
             if self._pending >= self._max_pending:
@@ -163,6 +163,21 @@ class _AsyncCallback:
         finally:
             with self._lock:
                 self._pending -= 1
+
+    async def flush(self):
+        """Finish queued progress before handing off or publishing a terminal state."""
+        barrier = asyncio.wrap_future(_progress_writer.submit(lambda: None))
+        try:
+            await asyncio.shield(barrier)
+        except asyncio.CancelledError:
+            # A task cancellation must not leave stale progress racing its
+            # terminal cancellation update in the caller.
+            while not barrier.done():
+                try:
+                    await asyncio.shield(barrier)
+                except asyncio.CancelledError:
+                    continue
+            raise
 
 
 # KG chunk 的 content_ltks/content_sm_ltks 分词辅助：

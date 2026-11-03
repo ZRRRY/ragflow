@@ -68,7 +68,8 @@ def test_clear_phase_markers_drops_all_named(fake_redis):
     module.set_phase_marker("kb-1", module.PHASE_COMMUNITY)
     module.set_phase_marker("kb-2", module.PHASE_RESOLUTION)
 
-    module.clear_phase_markers("kb-1")
+    assert module.clear_phase_markers("kb-1") is True
+    assert module.clear_phase_markers("kb-1") is True  # Missing keys are success.
 
     assert module.has_phase_marker("kb-1", module.PHASE_RESOLUTION) is False
     assert module.has_phase_marker("kb-1", module.PHASE_COMMUNITY) is False
@@ -82,7 +83,7 @@ def test_phase_marker_helpers_are_silent_on_invalid_input(fake_redis):
     assert module.has_phase_marker("", module.PHASE_RESOLUTION) is False
     assert module.set_phase_marker("", module.PHASE_RESOLUTION) is False
     # Empty kb_id is a silent no-op, never raises.
-    module.clear_phase_markers("")
+    assert module.clear_phase_markers("") is True
 
 
 @pytest.mark.p2
@@ -100,4 +101,11 @@ def test_redis_failure_does_not_break_pipeline(fake_redis):
     # always be allowed to run rather than incorrectly skipping a phase.
     assert module.has_phase_marker("kb-1", module.PHASE_RESOLUTION) is False
     assert module.set_phase_marker("kb-1", module.PHASE_RESOLUTION) is False
-    module.clear_phase_markers("kb-1")  # must not raise
+    assert module.clear_phase_markers("kb-1") is False
+
+
+def test_clear_phase_markers_reports_failed_command_and_attempts_all(fake_redis):
+    module, _, fake = fake_redis
+    fake.delete = MagicMock(side_effect=[False, True])
+    assert module.clear_phase_markers("kb-1") is False
+    assert fake.delete.call_count == 2

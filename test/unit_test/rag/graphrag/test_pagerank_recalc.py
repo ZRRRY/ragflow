@@ -29,8 +29,10 @@ longer bounded by ``hits_cap``; the topology load enforces the cap (covered
 by test_graphrag_topology.py).
 """
 
+import asyncio
 import json
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import networkx as nx
@@ -56,7 +58,7 @@ except Exception:
         if _m not in sys.modules:
             sys.modules[_m] = MagicMock()
 
-from common import settings  # mocked by the shared conftest
+from common.exceptions import TaskCanceledException
 from rag.graphrag.config import GraphRAGConfig
 from rag.graphrag.general import index_extras
 from rag.graphrag.utils_extras import GraphTopologyTruncatedError
@@ -124,7 +126,7 @@ def _setup(monkeypatch, hits, graph, topology_error=None):
     """Wire the fake doc store, topology loader and search_after into index_extras."""
     msgs = []
     store = _FakeDocStore()
-    monkeypatch.setattr(settings, "docStoreConn", store)
+    monkeypatch.setattr(index_extras, "settings", SimpleNamespace(docStoreConn=store))
     monkeypatch.setattr(index_extras, "thread_pool_exec", _run_sync)
 
     async def _fake_topology(tenant_id, kb_id, skip_entity_type=None, hits_cap=None):
@@ -160,6 +162,84 @@ def _collected_updates(store):
 
 class TestRecalcGlobalPagerank:
     @pytest.mark.asyncio
+    async def test_cancellation_checks_scale_with_pages_not_entities(self, monkeypatch):
+        store, _, _, callback = _setup(monkeypatch, _hits(), _graph())
+        check = MagicMock()
+        monkeypatch.setattr(index_extras, "_has_cancel_and_exit", check)
+        hit = _hits()[0]
+
+        async def scan(*args, **kwargs):
+            for offset, count in [(0, 1000), (1000, 1000), (2000, 1)]:
+                yield [dict(hit["_source"], id=f"c{i}") for i in range(offset, offset + count)]
+
+        monkeypatch.setattr(index_extras, "search_all_by_search_after", scan)
+        await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="task")
+
+        assert [len(batch) for batch in store.update_calls] == [1000, 1000, 1]
+        assert len(_collected_updates(store)) == 2001
+        # One initial check, then one per page and one per write, including the tail.
+        assert check.call_count == 7
+        assert store.refreshed is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("page_size", [1, 1000])
+    async def test_cancellation_during_page_processing_prevents_write(self, monkeypatch, page_size):
+        store, _, _, callback = _setup(monkeypatch, _hits(), _graph())
+        cancelled = False
+        closed = []
+        hit = _hits()[0]
+
+        def check(*args, **kwargs):
+            if cancelled:
+                raise TaskCanceledException("cancelled before write")
+
+        def classify(entity_type):
+            nonlocal cancelled
+            cancelled = True
+            return False
+
+        async def scan(*args, **kwargs):
+            try:
+                yield [dict(hit["_source"], id=f"c{i}") for i in range(page_size)]
+            finally:
+                closed.append(True)
+
+        monkeypatch.setattr(index_extras, "_has_cancel_and_exit", check)
+        monkeypatch.setattr(GraphRAGConfig, "should_skip_embedding", classify)
+        monkeypatch.setattr(index_extras, "search_all_by_search_after", scan)
+        with pytest.raises(TaskCanceledException):
+            await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="task")
+        assert store.update_calls == []
+        assert store.refreshed is False
+        assert closed == [True]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancelled", [False, True])
+    async def test_closes_scan_when_page_processing_fails(self, monkeypatch, cancelled):
+        store, _, _, callback = _setup(monkeypatch, _hits(), _graph())
+        closed = []
+        hit = _hits()[0]
+
+        async def scan(*args, **kwargs):
+            try:
+                # Fill the write window while the generator is still suspended.
+                yield [dict(hit["_source"], id=f"c{i}") for i in range(1000)]
+            finally:
+                closed.append(True)
+
+        error = asyncio.CancelledError if cancelled else RuntimeError
+
+        def fail_write(*args, **kwargs):
+            raise error("write interrupted")
+
+        monkeypatch.setattr(index_extras, "search_all_by_search_after", scan)
+        monkeypatch.setattr(store, "update_docs", fail_write)
+        with pytest.raises(error, match="write interrupted"):
+            await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
+        assert closed == [True]
+        assert store.refreshed is False
+
+    @pytest.mark.asyncio
     async def test_writes_partial_updates_with_global_pagerank(self, monkeypatch):
         store, sa_calls, msgs, callback = _setup(monkeypatch, _hits(), _graph())
 
@@ -184,6 +264,7 @@ class TestRecalcGlobalPagerank:
 
         # The scan must use the narrow field projection (no vector fields).
         assert sa_calls[0]["fields"] == ["entity_kwd", "content_with_weight"]
+        assert sa_calls[0]["sort_field"] == "_shard_doc"
         assert store.refreshed is True
         assert any("updated 4 entities, skipped 0" in m for m in msgs)
 
@@ -197,7 +278,8 @@ class TestRecalcGlobalPagerank:
             topology_error=GraphTopologyTruncatedError("relation scroll hit the hits_cap=50000"),
         )
 
-        await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
+        with pytest.raises(GraphTopologyTruncatedError):
+            await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
 
         assert sa_calls == []
         assert store.update_calls == []
@@ -216,14 +298,82 @@ class TestRecalcGlobalPagerank:
         assert any("skipped 1" in m for m in msgs)
 
     @pytest.mark.asyncio
-    async def test_skips_when_backend_lacks_update_docs(self, monkeypatch):
+    async def test_fails_when_backend_lacks_update_docs(self, monkeypatch):
         store, sa_calls, msgs, callback = _setup(monkeypatch, _hits(), _graph())
         monkeypatch.delattr(_FakeDocStore, "update_docs")
 
-        await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
+        with pytest.raises(RuntimeError, match="update_docs"):
+            await index_extras.recalc_global_pagerank("t1", "kb1", callback, task_id="")
 
         assert sa_calls == []
         assert any("update_docs" in m for m in msgs)
+
+    @pytest.mark.asyncio
+    async def test_batches_stay_bounded_across_sparse_pages(self, monkeypatch):
+        store, _, _, callback = _setup(monkeypatch, _hits(), _graph())
+        valid = _hits()[0]["_source"]
+
+        async def scan(*args, **kwargs):
+            yield [dict(valid, id=f"a{i}") for i in range(999)] + [{"id": "invalid"}]
+            yield [dict(valid, id=f"b{i}") for i in range(2002)]
+
+        monkeypatch.setattr(index_extras, "search_all_by_search_after", scan)
+        await index_extras.recalc_global_pagerank("t1", "kb1", callback)
+        assert [len(batch) for batch in store.update_calls] == [1000, 1000, 1000, 1]
+        assert len(_collected_updates(store)) == 3001
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["load", "write", "refresh", "refresh_false", "scan"])
+    async def test_failure_is_propagated_without_success(self, monkeypatch, failure):
+        store, _, msgs, callback = _setup(
+            monkeypatch, _hits(), _graph(), topology_error=RuntimeError("load failed") if failure == "load" else None,
+        )
+        if failure == "write":
+            monkeypatch.setattr(store, "update_docs", lambda *args: ["write failed"])
+        elif failure == "refresh":
+            monkeypatch.setattr(store, "refresh_idx", MagicMock(side_effect=RuntimeError("refresh failed")))
+        elif failure == "refresh_false":
+            monkeypatch.setattr(store, "refresh_idx", lambda *args: False)
+        elif failure == "scan":
+            async def scan(*args, **kwargs):
+                raise RuntimeError("scan failed")
+                yield
+            monkeypatch.setattr(index_extras, "search_all_by_search_after", scan)
+        with pytest.raises(Exception, match=f"{failure.split('_')[0]} failed"):
+            await index_extras.recalc_global_pagerank("t1", "kb1", callback)
+        assert any("graph preserved" in m and "partially updated" in m for m in msgs)
+        assert not any("recalc done" in m for m in msgs)
+
+    @pytest.mark.asyncio
+    async def test_empty_graph_is_a_successful_noop(self, monkeypatch):
+        store, calls, msgs, callback = _setup(monkeypatch, [], nx.Graph())
+        await index_extras.recalc_global_pagerank("t1", "kb1", callback)
+        assert calls == [] and store.update_calls == []
+        assert any("no global graph" in m for m in msgs)
+
+    @pytest.mark.asyncio
+    async def test_write_progress_is_throttled_but_completion_is_immediate(self, monkeypatch):
+        store, _, msgs, callback = _setup(monkeypatch, _hits(), _graph())
+        now = 0
+        monkeypatch.setattr(index_extras, "asyncio", SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: now), CancelledError=asyncio.CancelledError,
+        ))
+        valid = _hits()[0]["_source"]
+
+        async def scan(*args, **kwargs):
+            nonlocal now
+            for offset in range(4):
+                now += 20
+                yield [dict(valid, id=f"{offset}-{i}") for i in range(1000)]
+
+        monkeypatch.setattr(index_extras, "search_all_by_search_after", scan)
+        await index_extras.recalc_global_pagerank("t1", "kb1", callback)
+        progress = [m for m in msgs if "pagerank write-back:" in m]
+        assert len(progress) == 2
+        assert "scanned=2000 updated=2000 skipped=0" in progress[0]
+        assert "scanned=4000 updated=4000 skipped=0" in progress[1]
+        assert "global pagerank recalc done" in msgs[-1]
+        assert store.refreshed
 
 
 class TestFinalGraphIsDelta:

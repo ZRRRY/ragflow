@@ -1,8 +1,21 @@
 diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
-index 2e85ef7e8..a0e012c47 100644
+index 2e85ef7e8..7b41aac4e 100644
 --- a/rag/svr/task_executor.py
 +++ b/rag/svr/task_executor.py
-@@ -1926,6 +1926,15 @@ async def main():
+@@ -1541,7 +1541,11 @@ async def do_handle_task(task):
+             )
+             logging.info(f"GraphRAG task result for task {task}:\n{result}")
+         get_recording_context().record("graphrag_result", result)
+-        progress_callback(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
++        # === CUSTOM BEGIN [graphrag-postprocess-status] ===
++        # The queued consumer owns the terminal task state.
++        if not result.get("postprocess_queued"):
++            progress_callback(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
++        # === CUSTOM END [graphrag-postprocess-status] ===
+         return
+     elif task_type == "mindmap":
+         progress_callback(1, "place holder")
+@@ -1926,6 +1930,15 @@ async def main():
      logging.error("BUG!!! You should not reach here!!!")
  
  

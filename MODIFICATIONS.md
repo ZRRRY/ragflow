@@ -26,13 +26,13 @@ git diff <旧tag>..<新tag> -- <官方文件>
 
 | # | 定制位置 | 复制/依赖的官方逻辑 | 需 diff 的官方文件 | 风险等级 | 最近核对 |
 |---|----------|--------------------|-------------------|---------|---------|
-| 1 | `rag/graphrag/general/index_extras.py` `run_graphrag_for_kb` | 官方同名编排函数（`index.py:257`）近全文复制加增量分支，上游编排层 bugfix 不传播；增量恢复允许空图，社区阶段在消解后及每次重试时读取完整图 | `rag/graphrag/general/index.py` | **高** | 2026-10-28 |
+| 1 | `rag/graphrag/general/index_extras.py` `run_graphrag_for_kb` | 官方同名编排函数（`index.py:257`）近全文复制加增量分支，上游编排层 bugfix 不传播；持锁在合并前确认阶段标记失效；增量恢复允许空图，社区阶段在消解后及每次重试时读取完整图 | `rag/graphrag/general/index.py` | **高** | 2026-10-30 |
 | 2 | `index_extras.py` `resolve_entities_incremental` + `index_patch.py` wrapper | 官方 `resolve_entities`（`index.py:758`）调用约定（8 位置参数 + `task_id=`/`entity_types=`）| 同上 | **高**（曾因签名漂移致 TypeError，2026-07-16 已修复并加回归测试） | 2026-10-28 |
 | 3 | `index_patch.py` `_wrap_extract_community` | 官方 `extract_community`（`index.py:804`）形参表 | 同上 | 低（2026-09-12 已改为 `inspect.signature` 按名绑定，漂移时打 WARNING 而非静默错位） | 2026-10-28 |
-| 4 | `rag/svr/task_executor_extras.py` | `sys.modules` 模块查找（生产为 `__main__`）；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值（有兜底默认值）；后处理按 KB 的 `embd_id` 选择模型，持有知识库锁后读图 | `rag/svr/task_executor.py` | **高** | 2026-10-28 |
+| 4 | `rag/svr/task_executor_extras.py` | `sys.modules` 模块查找（生产为 `__main__`）；`te.CONSUMER_NAME` 依赖 `__main__` 块赋值（有兜底默认值）；恢复计数排除编译记录且计数失败跳过；后处理按 KB 的 `embd_id` 选择模型，持有知识库锁后读图 | `rag/svr/task_executor.py` | **高** | 2026-10-30 |
 | 5 | `api/apps/services/dataset_api_service_extras.py` `get_knowledge_graph` | 整函数替换官方实现；截断策略已偏离（边 128→512、丢孤立节点、无向去重） | `api/apps/services/dataset_api_service.py` | 中（上游改进被屏蔽） | 2026-10-28 |
 | 6 | `rag/graphrag/document_delete_extras.py` | 官方文档删除 GraphRAG 清理流程副本（增量路径按 `source_id` 清理，不依赖 graph JSON；2026-10-27 起同步清理字段和 JSON 内来源） | `api/db/services/document_service.py` | 中 | 2026-10-28 |
-| 7 | `common/doc_store/es_conn_extras.py` | 遍历 `@singleton` 闭包 cell 定位 ESConnection 类（2026-09-12 起按 `__module__` 匹配，不再硬编码类名）；注入 `count`/`search_with_scroll`/insert 包装（scroll 初始请求应用 `_source` 投影并保留 `_id`） | `rag/utils/es_conn.py`、`common/decorator.py`（`singleton`） | 低（有 RuntimeError 兜底） | 2026-10-28 |
+| 7 | `common/doc_store/es_conn_extras.py` | 遍历 `@singleton` 闭包 cell 定位 ESConnection 类（2026-09-12 起按 `__module__` 匹配，不再硬编码类名）；注入 `count`（支持单/多字段 must_not.exists）/`search_with_scroll`/insert 包装（scroll 初始请求应用 `_source` 投影并保留 `_id`） | `rag/utils/es_conn.py`、`common/decorator.py`（`singleton`） | 低（有 RuntimeError 兜底） | 2026-10-30 |
 | 8 | `rag/llm/siliconflow_timeout_patch.py` | 替换 `SILICONFLOWEmbed._call`，假定其内部超时处理结构不变 | `rag/llm/embedding_model.py`（`SILICONFLOWEmbed`） | 低（有子类守卫） | 2026-10-28 |
 | 9 | `rag/utils/redis_conn_patch.py` | 替换 `RedisDistributedLock.spin_acquire`（依赖官方 `delete_if_equal` 锁协议）；新增 `RedisDB.ttl` | `rag/utils/redis_conn.py` | 中（无 hasattr 守卫，上游同名改动被静默覆盖） | 2026-10-28 |
 | 10 | `rag/graphrag/entity_resolution.py` 尾部 CUSTOM 块 | import 时类重绑定 `EntityResolution`→`IncrementalEntityResolution`；依赖「CUSTOM 块位于文件末尾」的执行顺序，且与 `entity_resolution_extras.py` 存在循环 import | `rag/graphrag/entity_resolution.py` | 中（上游在文件尾部新增代码即打破） | 2026-10-28 |
@@ -42,9 +42,9 @@ git diff <旧tag>..<新tag> -- <官方文件>
 
 ---
 
-## 二、官方文件修改清单（22 个）
+## 二、官方文件修改清单（23 个）
 
-### patch 管理内（21 个，对应 `patches/*.patch`）
+### patch 管理内（23 个，对应 `patches/*.patch`）
 
 | 官方文件 | 改动摘要 | patch 文件 |
 |---------|---------|-----------|
@@ -56,8 +56,10 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | `common/settings.py` | `init_settings()` 中安装 ES extras 与删除审计两个 hook（带异常兜底；OS extras hook 已于 2026-09-12 随 OS 后端弃用移除） | `common_settings.py.patch` |
 | `rag/graphrag/entity_resolution.py` | 尾部 CUSTOM 块：flag 开启时类重绑定 + 额外导出 | `rag_graphrag_entity_resolution.py.patch` |
 | `rag/graphrag/general/index.py` | 尾部调用 `index_patch.apply_patch()` | `rag_graphrag_general_index.py.patch` |
+| `rag/graphrag/phase_markers.py` | 返回标记删除是否全部成功，供图变更入口检查 | `rag_graphrag_phase_markers.py.patch` |
 | `rag/graphrag/utils.py` | `does_graph_contains`/`get_graph` flag 路由；`set_graph` 无条件委托 extras；书籍/章节跳过 embedding | `rag_graphrag_utils.py.patch` |
-| `rag/svr/task_executor.py` | 尾部 import 并调用 `patch_task_executor()` | `rag_svr_task_executor.py.patch` |
+| `rag/svr/task_executor.py` | 激活扩展；异步图谱后处理完成前不标记任务成功 | `rag_svr_task_executor.py.patch` |
+| `rag/svr/task_executor_refactor/task_handler.py` | 异步图谱后处理完成前不标记任务成功 | `rag_svr_task_executor_refactor_task_handler.py.patch` |
 | `rag/utils/es_conn.py` | 仅纯 GraphRAG bulk 不等待刷新；编译/普通写入 wait_for；delete 支持 refresh；多字段缺失条件 | `rag_utils_es_conn.py.patch` |
 | `test/unit_test/api/apps/services/test_delete_datasets.py` | 隔离自定义 service import 的 Quart 包和 NLP 包，保持删除测试独立运行 | `test_unit_test_api_apps_services_test_delete_datasets.py.patch` |
 | `web/src/locales/en.ts` | 新增 `datasetOverview.totalChunks` 文案 | `web_src_locales_en.ts.patch` |
@@ -89,7 +91,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | | `rag/graphrag/general/index_patch.py` | monkey-patch 调度器：保存原函数、按 flag 路由 |
 | | `rag/graphrag/utils_extras.py` | 增量存储层：set_graph_delta、merge_state、在线组图、可视化 256 节点策略、拓扑专用加载（PageRank 用） |
 | | `rag/graphrag/storage_scope.py` | GraphRAG 条件及原生查询排除 compile_kwd，隔离编译记录 |
-| | `rag/graphrag/utils_pagination.py` | search_after + `_doc` tiebreaker 分页（仅 ES/OS 后端） |
+| | `rag/graphrag/utils_pagination.py` | Elasticsearch PIT 快照 + search_after + `_shard_doc` 跨分片分页 |
 | | `rag/graphrag/entity_resolution_extras.py` | 增量实体消解（excluded_types、候选注入、数字 2-gram 规则） |
 | | `rag/graphrag/document_delete_extras.py` | 文档删除时的 KG 清理（显式 ID 防误删） |
 | 任务执行 | `rag/svr/task_executor_extras.py` | 卡死任务 reconcile、心跳、KG 后处理 Stream 消费者 |
@@ -103,7 +105,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | | `web/src/assets/svg/data-flow/total-chunks-icon{,-bri}.svg` | 统计卡图标（暗/亮主题） |
 | 测试 | `test/unit_test/rag/graphrag/` | GraphRAG 工具、分页、checkpoint、拓扑、增量写入/删除/消解回归测试；`test_review_findings.py` 覆盖五项审查问题及失败边界 |
 | 运维 | `docker/finisher/`（3 个文件） | 卡死任务收尾脚本（默认 dry-run）+ README + 辅助 SQL |
-| 管理 | `patches/`（21 patch + apply/regenerate 脚本 + README） | 官方文件改动的双轨管理 |
+| 管理 | `patches/`（23 patch + apply/regenerate 脚本 + README） | 官方文件改动的补丁管理 |
 | | `MAINTENANCE.md`、本文档 | 维护规范与漂移清单 |
 
 ---
@@ -201,7 +203,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 9. ~~**增量消解 checkpoint 是死代码**~~（调用方从不传 `checkpoints`/`save_checkpoint`）：已接上 `load_checkpoints`/`save_checkpoint`（与官方 `RESOLUTION_CHECKPOINT` 一致），中断后可续跑。
 10. ~~**`_wrap_extract_community` 按 `args[6]`/`args[7]` 位置取参**~~：已改为 `inspect.signature` 按名绑定，绑定失败打 WARNING 而非静默错位。
 11. ~~**`index_patch.apply_patch` 无幂等守卫**~~：重复调用会把 `_ORIGINALS` 覆盖成已包装版本。已加 `_graphrag_index_patch_applied` 标记。
-12. ~~**`recalc_global_pagerank` 每次重试都重新加载全图（大 KB OOM 风险）**~~：改为单次尝试、失败非致命（rank 保持陈旧至下次 merge）。
+12. **全局 PageRank 重算**：每次执行仅尝试一次；加载、分页、回写或最终刷新失败均使任务失败，保留已合并图谱与已写入排名，不自动重新加载全图。
 13. ~~**`write_merge_state` 写后无 refresh**~~（并发 retry 读到陈旧状态）：末尾加 `_post_insert_refresh`；`state="failed"` 写入失败不再掩盖原始 merge 异常。
 14. ~~**`get_graph_from_index_for_visualization` 静默覆写 `max_nodes` 为 256**~~：按入参分配 centers/neighbors 预算，`max_nodes` 作为硬上限生效。
 15. ~~**`does_graph_contains` 单 round-trip 只覆盖 OpenSearch**~~：已切到 ES 后端（`.es`），ES 同样享受 bool.should 单 round-trip。
@@ -233,7 +235,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 
 ### 仍未处理（第二轮审查复核确认）
 
-- `does_graph_contains` 官方 legacy 路径 size=1 假阴性、search_after 无 PIT、局部 PageRank 污染全局 rank：与第一轮记录一致。resume 空指针已于 2026-10-28 修复。
+- `does_graph_contains` 官方 legacy 路径 size=1 假阴性、局部 PageRank 污染全局 rank：与第一轮记录一致。resume 空指针已于 2026-10-28 修复，search_after 缺少 PIT 已于 2026-10-30 修复。
 - **KG-PP 失败/cancel 即 ack 无死信**：第二轮确认 cancel 路径（`task_executor_extras.py` 消费循环内 `has_canceled` 分支）与失败路径同样受影响——任何用户取消都会走此路径；官方 Redis Stream 本身无 DLQ 机制，属于框架级限制。
 - 增量消解的 `IncrementalEntityResolution.__init__` 已加 `*args/**kwargs` 前向兼容，但上游若在 `resolve_entities` 中新增调用参数仍需对照第一节第 2 项核对。
 
@@ -279,3 +281,33 @@ git diff <旧tag>..<新tag> -- <官方文件>
 - patch 清单扩展为 21 项，新增的官方文件修改纳入 v0.26.4 补丁再生成与字节一致性验证。
 
 验证结果：GraphRAG 237 项 + 数据集删除 2 项，共 239 项通过；本次新增 17 项回归测试。
+
+## 十、2026-10-30：分页快照、后处理恢复与启动计数修复
+
+- 分页每次遍历创建 Elasticsearch PIT，使用业务字段和 `_shard_doc` 排序。创建时指定索引，后续请求只携带 PIT，并以响应中的最新 ID 续期 `2m`。每页保留知识库过滤、编译记录排除和字段投影；部分分片、超时、过期、查询错误及分页上限均向上传播，不回退非快照读取。结束、异常和取消时关闭 PIT，流式消费者通过 `aclosing` 保证页面处理失败或提前退出时释放资源。
+- 增量编排在知识库锁内、确认文档尚未合并后、实际合并前清除 resolution/community 标记，并将本次请求的阶段设为待执行。清空已有合并数据也先持锁清除标记。删除返回失败或抛异常时中止图写入，键不存在视为成功；未发生新图变更的重跑保留有效标记。移除批末依赖 `final_graph` 的失效路径，避免持久化 `merged` 后刷新失败导致下次跳过后处理。
+- 启动恢复的节点与关系计数统一使用 `graph_condition`，排除带 `compile_kwd` 的记录。ES count 转换支持 `must_not.exists` 的单字段和字段列表，保留知识库和记录类型过滤；任一计数失败即跳过该任务，即使完成阈值配置为零也不标记完成。
+- `phase_markers.py` 的布尔返回值修改登记为第 22 个补丁，基线保持 `v0.26.4`。HTTP 接口、存储格式及现有配置项不变。
+
+回归测试覆盖双分片排序碰撞、PIT ID 轮换、页间索引变更、空结果、异常/取消/提前关闭/分页上限、PageRank 写回中断、合并各阶段故障、标记删除失败、无变更重跑，以及编译/GraphRAG 混合计数和 ES 查询条件。测试位于 `test_pit_pagination.py`、`test_review_findings.py`、`test_phase_markers.py`、`test_pagerank_recalc.py` 等 GraphRAG 单元测试文件，采用确定性存储与传输替身；不代表真实 Elasticsearch 集群验证。
+
+验证：先运行定向回归，再执行 `.venv-review/Scripts/python.exe -m pytest test/unit_test/rag/graphrag -q --tb=short`，共 **271 项通过**（237 项基线 + 34 项新增）。10 个修改/新增 Python 文件语法解析通过；Ruff 相对当前 HEAD 无新增诊断，仍有既有诊断。`git diff --check` 通过。新补丁在以 `v0.26.4` 初始化的临时索引和临时对象库中完成 `git apply --cached --check`、实际应用及文件内容一致性校验，没有改动当前 Git 索引。
+
+### 历史知识库恢复步骤（人工执行）
+
+本次代码不会自动修改历史图谱数据。部署修复后，按受影响知识库逐个选择恢复方式：
+
+1. 等待或取消目标知识库正在执行的 GraphRAG 与异步后处理任务，确认任务已停止，避免与人工恢复并发。
+2. **图完整，仅后处理标记或任务状态错误**：在处理目标知识库的 worker 环境中临时设置 `GRAPHRAG_KEEP_RESOLUTION=0`，保留 `GRAPHRAG_KEEP_SUBGRAPH=1`、`GRAPHRAG_KEEP_MERGE=1`，重启相关 worker 使配置生效。确认知识库已启用实体消解与社区报告，通过现有 GraphRAG 生成入口重新运行。检查任务日志中消解和社区阶段实际完成，并检查报告。开关影响这些 worker 上的全部 GraphRAG 任务，修复窗口仅投递目标知识库；完成后恢复 `GRAPHRAG_KEEP_RESOLUTION=1` 并重启 worker。
+3. **可能漏读、存在悬空关系，或因编译计数被误标完成且图不完整**：使用现有删图入口（`DELETE /api/v1/datasets/<dataset_id>/graph`，使用现有登录鉴权）清理该知识库 GraphRAG，确认删除成功后，通过现有生成入口重新构建。该入口清理 subgraph、合并实体/关系、社区和 merge_state，并排除编译记录；不删除整个数据集或共享索引。无法确认图完整时选此路径。
+4. 重跑完成后核对任务状态、实体/关系来源和社区报告；可能发生过漏读的知识库需重点检查关系端点是否存在。这里只提供操作步骤，本次未执行生产删图或重建。
+
+## 十一、2026-11-03：PageRank 慢回写保活与失败状态
+
+- PIT 保活期设为 10 分钟，后台每 60 秒以 `size=0`、`match_none`、`track_total_hits=false` 续期。分页与续期串行更新最新 PIT ID；取消时等待在途请求收尾再关闭 PIT。续期失败、部分分片结果和查询超时不允许被当成完整扫描。
+- PageRank 实体扫描只按 `_shard_doc` 排序，不统计总数；每批最多更新 1000 条。记录页查询与批量写入耗时、累计数量，写回进度每 30 秒最多报告一次。
+- 加载、分页、回写或最终刷新失败均向上传播，包括 `refresh_idx` 返回 `False`。合并后及消解后的 PageRank 每次仅尝试一次；失败保留图谱并明确提示排名可能只更新了一部分。
+- 异步后处理入队前写入处理中状态，两个任务入口均不提前标记成功；后处理成功/失败由消费者写入终态。消解完成标记在所需的 PageRank 成功后写入；异步进度队列在返回或任务交接前排空，避免旧进度覆盖终态。
+- 定向回归后，GraphRAG 全目录 **309 项通过**；最后的回调绑定及日志调整对应 **117 项定向回归通过**。覆盖 204 秒、248 秒和超过 10 分钟的模拟慢消费者，最新 PIT ID、取消、并发请求互斥、最终清理期间续期失败、批次上限、失败状态和进度节流。
+- `tools/scripts/validate_graphrag_pit.py` 在真实 ES **8.11.3** 上使用随机临时双分片索引验证：字段排序与 `_shard_doc` 各读取 12 条快照记录；页间写入/刷新不改变快照；后台续期 2 次，关闭 PIT 2 个，剩余搜索上下文为 0。临时索引已删除。该脚本按环境变量连接 ES，独立运行，不初始化其他应用服务。
+- 官方任务入口补丁已重新生成，并在临时目录针对 `v0.26.4` 验证应用及内容一致性；新增 refactor 入口补丁后共 23 项。未重启服务、未重跑业务知识库，尚未验证百万节点场景的整体耗时。

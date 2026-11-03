@@ -23,9 +23,9 @@ Markers are stored in Redis under ``graphrag:phase:{kb_id}:{phase}`` with a
 survive task cancellation and the creation of a new task on resume.
 
 Invalidation rules (callers responsibility):
-* ``clear_phase_markers`` is invoked by ``run_graphrag_for_kb`` whenever new
-  document content is merged into the global graph -- the merged graph has
-  changed, so prior resolution and community results are stale.
+* The incremental ``run_graphrag_for_kb`` confirms marker invalidation before
+  merging new document content or clearing merged graph data, under the KB lock.
+  This also covers partial writes from failed attempts.
 * ``clear_phase_markers`` is invoked by the unbind-task endpoint when the
   caller asks to wipe the graph.
 """
@@ -74,12 +74,23 @@ def set_phase_marker(kb_id: str, phase: str, ttl: int = _DEFAULT_TTL_SECONDS) ->
         return False
 
 
-def clear_phase_markers(kb_id: str, phases: tuple[str, ...] = ALL_PHASES) -> None:
-    """Drop the named phase markers for kb_id (no-op on miss)."""
+# === CUSTOM BEGIN [graphrag-marker-invalidation] ===
+# Require confirmed invalidation before graph mutations. Date: 2026-10-30.
+def clear_phase_markers(kb_id: str, phases: tuple[str, ...] = ALL_PHASES) -> bool:
+    """Drop the named markers; return False if any deletion failed.
+
+    RedisDB.delete returns True for a successful command even when the key is
+    absent. Mutation callers must check the result before changing the graph.
+    """
     if not kb_id:
-        return
+        return True
+    success = True
     for phase in phases:
         try:
-            REDIS_CONN.delete(_phase_key(kb_id, phase))
+            if not REDIS_CONN.delete(_phase_key(kb_id, phase)):
+                success = False
         except Exception:
             logging.exception("clear_phase_markers(%s, %s) failed", kb_id, phase)
+            success = False
+    return success
+# === CUSTOM END [graphrag-marker-invalidation] ===

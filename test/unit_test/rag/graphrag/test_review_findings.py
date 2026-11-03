@@ -9,6 +9,7 @@ the store, Redis locks/checkpoints and model responses are deterministic doubles
 import ast
 import asyncio
 import copy
+import importlib.util
 import json
 import logging
 import re
@@ -24,6 +25,8 @@ from uuid import uuid4
 import networkx as nx
 import numpy as np
 import pytest
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 # Match the existing service isolation, including standalone collection.
 for _name in (
@@ -233,7 +236,7 @@ def runtime(monkeypatch):
     for module in (index_extras, task_executor_extras):
         monkeypatch.setattr(module, "has_phase_marker", lambda kb, phase: phase in phases)
         monkeypatch.setattr(module, "set_phase_marker", lambda kb, phase: phases.add(phase))
-        monkeypatch.setattr(module, "clear_phase_markers", lambda *args: phases.clear())
+        monkeypatch.setattr(module, "clear_phase_markers", lambda *args: phases.clear() or True)
         monkeypatch.setattr(
             module,
             "RedisDistributedLock",
@@ -325,7 +328,7 @@ def prepare_consumer(runtime, monkeypatch, *, community=False, default_model=Non
     # their merge. The surviving entity is re-embedded by the real delta writer.
     seed_graph(runtime.store, make_graph("doc1", "中国科学院", "中国科学院院"))
     stop = asyncio.Event()
-    worker = SimpleNamespace(stop_event=stop, CONSUMER_NAME="review")
+    worker = SimpleNamespace(stop_event=stop, CONSUMER_NAME="review", set_progress=MagicMock())
     message = SimpleNamespace(
         get_message=lambda: {
             "tenant_id": "tenant",
@@ -349,7 +352,140 @@ def prepare_consumer(runtime, monkeypatch, *, community=False, default_model=Non
     monkeypatch.setattr(task_executor_extras, "get_model_config_from_provider_instance", get_provider)
     bundle = MagicMock(side_effect=lambda tenant, config, **kwargs: config)
     monkeypatch.setattr(task_executor_extras, "LLMBundle", bundle)
-    return SimpleNamespace(message=message, detail=detail, get_default=get_default, get_provider=get_provider, bundle=bundle)
+    return SimpleNamespace(message=message, detail=detail, get_default=get_default, get_provider=get_provider, bundle=bundle, worker=worker)
+
+
+@pytest.mark.parametrize("stage", ["merge", "resolution"])
+async def test_pagerank_failure_aborts_sync_task_without_retries(runtime, monkeypatch, stage):
+    graph = make_graph("doc1", "Alice", "Bob")
+    seed_graph(runtime.store, graph)
+    seed_checkpoint(runtime.store, "doc1", graph, merged=True)
+    monkeypatch.setattr(GraphRAGConfig, "RECALC_GLOBAL_PAGERANK_AFTER_MERGE", True)
+    recalc = AsyncMock(side_effect=RuntimeError("rank write failed") if stage == "merge" else [None, RuntimeError("rank write failed")])
+    monkeypatch.setattr(index_extras, "recalc_global_pagerank", recalc)
+    with pytest.raises(RuntimeError, match="rank write failed"):
+        await run_kb(runtime, ["doc1"], merge_retry_attempts=3)
+    assert recalc.await_count == (1 if stage == "merge" else 2)
+    assert index_extras.PHASE_RESOLUTION not in runtime.phases
+    assert any(row["knowledge_graph_kwd"] == "entity" for row in runtime.store.rows.values())
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_postprocess_rank_controls_terminal_state_and_marker(runtime, monkeypatch, failure):
+    consumer = prepare_consumer(runtime, monkeypatch, community=True)
+    monkeypatch.setattr(GraphRAGConfig, "RECALC_GLOBAL_PAGERANK_AFTER_MERGE", True)
+
+    async def recalc(*args, **kwargs):
+        assert index_extras.PHASE_RESOLUTION not in runtime.phases
+        if failure:
+            raise RuntimeError("rank write failed")
+
+    monkeypatch.setattr(index_extras, "recalc_global_pagerank", recalc)
+    await asyncio.wait_for(task_executor_extras.kg_postprocess_consumer(), timeout=5)
+    terminal = [call.kwargs["prog"] for call in consumer.worker.set_progress.call_args_list
+                if call.kwargs.get("prog") is not None]
+    assert terminal == ([-1.0] if failure else [1.0])
+    assert (index_extras.PHASE_RESOLUTION in runtime.phases) is not failure
+    assert bool(runtime.community_inputs) is not failure
+    consumer.message.ack.assert_called_once()
+
+
+async def test_postprocess_cancellation_is_not_success(runtime, monkeypatch):
+    from common.exceptions import TaskCanceledException
+
+    consumer = prepare_consumer(runtime, monkeypatch)
+    monkeypatch.setattr(GraphRAGConfig, "RECALC_GLOBAL_PAGERANK_AFTER_MERGE", True)
+    monkeypatch.setattr(index_extras, "recalc_global_pagerank", AsyncMock(side_effect=TaskCanceledException("cancelled")))
+    await asyncio.wait_for(task_executor_extras.kg_postprocess_consumer(), timeout=5)
+    assert not any(call.kwargs.get("prog") == 1.0 for call in consumer.worker.set_progress.call_args_list)
+    assert index_extras.PHASE_RESOLUTION not in runtime.phases
+    consumer.message.ack.assert_called_once()
+
+
+@pytest.mark.parametrize("asynchronous_progress", [False, True])
+async def test_progress_is_persisted_before_queue_publication(runtime, monkeypatch, asynchronous_progress):
+    graph = make_graph("doc1", "Alice", "Bob")
+    seed_graph(runtime.store, graph)
+    seed_checkpoint(runtime.store, "doc1", graph, merged=True)
+    monkeypatch.setattr(GraphRAGConfig, "USE_ASYNC_KG_PHASES", True)
+    monkeypatch.setattr(GraphRAGConfig, "GRAPHRAG_ASYNC_PROGRESS", asynchronous_progress)
+    monkeypatch.setattr(utils_extras, "has_canceled", lambda _: False)
+    events = []
+
+    def callback(**kwargs):
+        events.append(kwargs.get("prog"))
+
+    def publish(*args):
+        assert events[-1] == 0.9
+        events.append(1.0)  # A fast consumer publishes success immediately.
+        return True
+
+    monkeypatch.setattr(index_extras, "REDIS_CONN", SimpleNamespace(queue_product=publish))
+    result = await index_extras.run_graphrag_for_kb(
+        {"id": "task", "tenant_id": "tenant", "kb_id": "kb"}, ["doc1"], "English",
+        {"graphrag": {}}, None, runtime.model, callback, with_resolution=True, with_community=False,
+    )
+    assert result["postprocess_queued"] is True
+    assert events[-1] == 1.0
+
+
+async def test_async_progress_is_drained_before_failure_returns(runtime, monkeypatch):
+    monkeypatch.setattr(GraphRAGConfig, "GRAPHRAG_ASYNC_PROGRESS", True)
+    monkeypatch.setattr(utils_extras, "has_canceled", lambda _: False)
+    events = []
+
+    async def fail(*args, **kwargs):
+        args[6](prog=0.5, msg="pending write")
+        raise RuntimeError("rank write failed")
+
+    monkeypatch.setattr(index_extras, "_run_graphrag_for_kb", fail)
+    with pytest.raises(RuntimeError, match="rank write failed"):
+        await index_extras.run_graphrag_for_kb(
+            {"id": "task"}, [], "English", {}, None, None, lambda **kw: events.append(kw["prog"]),
+        )
+    events.append(-1)
+    assert events == [0.5, -1]
+
+
+@pytest.mark.parametrize("executor", ["main", "refactor"])
+@pytest.mark.parametrize("outcome", ["queued", "done", "failed"])
+async def test_task_entrypoints_only_complete_finished_graphs(monkeypatch, executor, outcome):
+    callback = MagicMock()
+    task = {"id": "task", "doc_ids": ["doc1"]}
+    run = AsyncMock(return_value={"postprocess_queued": outcome == "queued"})
+    if outcome == "failed":
+        run.side_effect = RuntimeError("rank write failed")
+    monkeypatch.setattr(index, "run_graphrag_for_kb", run)
+    namespace = {
+        "LLMBundle": MagicMock(), "LLMType": SimpleNamespace(CHAT="chat"),
+        "KnowledgebaseService": SimpleNamespace(get_by_id=lambda _: (True, SimpleNamespace(parser_config={"graphrag": {"use_graphrag": True}}))),
+        "get_model_config_from_provider_instance": MagicMock(), "timer": lambda: 1.0,
+        "logging": logging, "run_graphrag_for_kb": run, "get_recording_context": MagicMock(),
+    }
+    if executor == "main":
+        # Execute the actual GraphRAG branch without initializing unrelated
+        # ingestion/native/model services in the full worker module.
+        path = _PROJECT_ROOT / "rag/svr/task_executor.py"
+        tree = ast.parse(await asyncio.to_thread(path.read_bytes))
+        branch = next(n for n in ast.walk(tree) if isinstance(n, ast.If) and ast.unparse(n.test) == "task_type == 'graphrag'")
+        function = ast.parse("async def execute():\n    pass").body[0]
+        function.body = branch.body
+        namespace.update(task=task, progress_callback=callback, task_dataset_id="kb", task_tenant_id="tenant",
+                         kb_task_llm_id="chat", task_language="English", embedding_model=None, kg_limiter=asyncio.Semaphore(1))
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), str(path), "exec"), namespace)  # noqa: S102 - real worker branch
+        call = namespace["execute"]()
+    else:
+        load_production_functions("rag/svr/task_executor_refactor/task_handler.py", {"_run_graphrag"}, namespace)
+        ctx = SimpleNamespace(tenant_id="tenant", kb_id="kb", kb_parser_config={}, llm_id="chat", language="English",
+                              kg_limiter=asyncio.Semaphore(1), raw_task=task, doc_ids=["doc1"], progress_cb=callback,
+                              recording_context=MagicMock())
+        call = namespace["_run_graphrag"](SimpleNamespace(_task_context=ctx), None)
+    if outcome == "failed":
+        with pytest.raises(RuntimeError, match="rank write failed"):
+            await call
+    else:
+        await call
+    assert [c.kwargs["prog"] for c in callback.call_args_list] == ([1.0] if outcome == "done" else [])
 
 
 @pytest.mark.parametrize("use_kb_default", [False, True], ids=["different-models", "same-model-control"])
@@ -847,7 +983,8 @@ def test_graph_scope_preserves_existing_exclusions_and_input():
 
 
 async def test_search_after_scopes_every_page(runtime, mixed_graph):
-    def search(*, index, body):
+    def search(*, body, allow_partial_search_results):
+        assert allow_partial_search_results is False
         assert {"exists": {"field": "compile_kwd"}} in body["query"]["bool"]["must_not"]
         start = body.get("search_after", ["", -1])[1] + 1
         rows = [row for row in runtime.store.visible.values() if "compile_kwd" not in row and row["knowledge_graph_kwd"] == "entity"]
@@ -856,7 +993,9 @@ async def test_search_after_scopes_every_page(runtime, mixed_graph):
             for offset, row in enumerate(rows[start:start + body["size"]])
         ]}}
 
-    runtime.store.es = SimpleNamespace(search=search)
+    runtime.store.es = SimpleNamespace(
+        search=search, open_point_in_time=lambda **kwargs: {"id": "pit"}, close_point_in_time=MagicMock()
+    )
     rows = await utils_pagination.collect_all({"knowledge_graph_kwd": ["entity"]}, "idx", "kb", ["entity_kwd"], "entity_kwd", page_size=1)
     assert {row["entity_kwd"] for row in rows} == {"ALICE", "BOB"}
 
@@ -933,3 +1072,186 @@ def test_dataset_graph_wipe_preserves_compiled_records(runtime, mixed_graph, mon
     success, _ = ns[operation](*args)
     assert success
     assert runtime.store.rows == mixed_graph
+
+
+@pytest.mark.parametrize("failure", ["before-write", "partial-batch", "after-merged"])
+async def test_resume_after_merge_failure_runs_invalidated_phases(runtime, monkeypatch, failure):
+    seed_graph(runtime.store, make_graph("old", "Alice", "Bob"))
+    seed_checkpoint(runtime.store, "new", make_graph("new", "Carol", "Dave"))
+    docs = ["new"]
+    if failure == "partial-batch":
+        docs.append("next")
+        seed_checkpoint(runtime.store, "next", make_graph("next", "Eve", "Frank"))
+    runtime.phases.update({index_extras.PHASE_RESOLUTION, index_extras.PHASE_COMMUNITY})
+    merge, refresh = index_extras.merge_subgraph, index_extras.refresh_graphrag_index
+
+    async def fail_merge(*args, **kwargs):
+        if failure == "before-write" or args[2] == "next":
+            raise RuntimeError("injected merge failure")
+        return await merge(*args, **kwargs)
+
+    async def fail_refresh(*args, **kwargs):
+        if kwargs.get("label") == "merge_batch_end":
+            raise RuntimeError("injected batch refresh failure")
+        return await refresh(*args, **kwargs)
+
+    if failure == "after-merged":
+        monkeypatch.setattr(index_extras, "refresh_graphrag_index", fail_refresh)
+    else:
+        monkeypatch.setattr(index_extras, "merge_subgraph", fail_merge)
+    with pytest.raises(RuntimeError, match="injected"):
+        await run_kb(runtime, docs, with_community=True)
+    assert not runtime.phases
+    runtime.store.refresh_idx("idx")
+    if failure != "before-write":
+        assert await utils_extras.is_doc_merged("tenant", "kb", "new")
+    monkeypatch.setattr(index_extras, "merge_subgraph", merge)
+    monkeypatch.setattr(index_extras, "refresh_graphrag_index", refresh)
+    resolver = AsyncMock()
+    monkeypatch.setattr(index_extras, "resolve_entities", resolver)
+    await run_kb(runtime, docs, with_community=True)
+    resolver.assert_awaited_once()
+    assert len(runtime.community_inputs) == 1
+    assert runtime.phases == {index_extras.PHASE_RESOLUTION, index_extras.PHASE_COMMUNITY}
+
+
+async def test_merged_document_preserves_valid_phase_markers(runtime, monkeypatch):
+    graph = make_graph("doc", "Alice", "Bob")
+    seed_graph(runtime.store, graph)
+    seed_checkpoint(runtime.store, "doc", graph, merged=True)
+    runtime.phases.update({index_extras.PHASE_RESOLUTION, index_extras.PHASE_COMMUNITY})
+    resolver = AsyncMock()
+    monkeypatch.setattr(index_extras, "resolve_entities", resolver)
+    await run_kb(runtime, ["doc"], with_community=True)
+    resolver.assert_not_awaited()
+    assert not runtime.community_inputs
+    assert len(runtime.phases) == 2
+
+
+@pytest.mark.parametrize("reset", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+async def test_marker_invalidation_failure_prevents_graph_mutation(runtime, monkeypatch, reset, raises):
+    seed_graph(runtime.store, make_graph("old", "Alice", "Bob"))
+    seed_checkpoint(runtime.store, "new", make_graph("new", "Carol", "Dave"))
+    monkeypatch.setattr(GraphRAGConfig, "KEEP_MERGE", not reset)
+    before = deepcopy(runtime.store.rows)
+    clear = MagicMock(return_value=False, side_effect=RuntimeError("invalidation unavailable") if raises else None)
+    monkeypatch.setattr(index_extras, "clear_phase_markers", clear)
+    with pytest.raises(RuntimeError, match="invali"):
+        await run_kb(runtime, ["new"])
+    assert {cid: row for cid, row in runtime.store.rows.items() if row["knowledge_graph_kwd"] != "merge_state"} == before
+
+
+async def test_merge_reset_invalidates_under_lock_before_deletion(runtime, monkeypatch):
+    seed_graph(runtime.store, make_graph("old", "Alice", "Bob"))
+    seed_checkpoint(runtime.store, "new", make_graph("new", "Carol", "Dave"))
+    runtime.phases.update({index_extras.PHASE_RESOLUTION, index_extras.PHASE_COMMUNITY})
+    monkeypatch.setattr(GraphRAGConfig, "KEEP_MERGE", False)
+    held = False
+    resets = []
+
+    class Lock:
+        def acquire(self):
+            nonlocal held
+            assert not held
+            held = True
+            return True
+
+        def release(self):
+            nonlocal held
+            assert held
+            held = False
+
+    monkeypatch.setattr(index_extras, "RedisDistributedLock", lambda *a, **kw: Lock())
+    delete = runtime.store.delete
+
+    def checked_delete(condition, *args, **kwargs):
+        if "merge_state" in condition.get("knowledge_graph_kwd", []) and "graph" in condition["knowledge_graph_kwd"]:
+            assert held
+            assert not runtime.phases
+            resets.append(condition)
+        return delete(condition, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.store, "delete", checked_delete)
+    await run_kb(runtime, ["new"], with_community=True)
+    assert len(resets) == 1
+    assert not held
+    assert len(runtime.community_inputs) == 1
+
+
+@pytest.fixture
+def es_count(monkeypatch):
+    # Other GraphRAG test modules stub common.doc_store. Load the real connector
+    # extension directly, replacing only the service singleton's retry constant.
+    path = Path(__file__).resolve().parents[4] / "common/doc_store/es_conn_extras.py"
+    spec = importlib.util.spec_from_file_location("review_count_extras", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setitem(sys.modules, "rag.utils.es_conn", SimpleNamespace(ATTEMPT_TIME=1))
+    return module._es_count
+
+
+@pytest.mark.parametrize("excluded", ["compile_kwd", ["source_id", "compile_kwd"]])
+def test_es_count_translates_missing_fields(excluded, es_count):
+
+    raw = SimpleNamespace(count=MagicMock(return_value={"count": 3}))
+    connection = SimpleNamespace(es=raw, logger=logging.getLogger(__name__))
+    filters = {"knowledge_graph_kwd": ["entity"], "must_not": {"exists": excluded}}
+    before = deepcopy(filters)
+    assert es_count(connection, filters, "idx", ["kb"]) == 3
+    assert filters == before
+    query = raw.count.call_args.kwargs["body"]["query"]["bool"]
+    assert query["must_not"] == [{"exists": {"field": field}} for field in (excluded if isinstance(excluded, list) else [excluded])]
+    assert {"terms": {"kb_id": ["kb"]}} in query["filter"]
+    assert {"terms": {"knowledge_graph_kwd": ["entity"]}} in query["filter"]
+
+
+@pytest.mark.parametrize("graph_count,compiled_count,failure", [
+    (0, 3, None), (2, 3, None), (3, 3, None), (3, 0, None),
+    (3, 3, "entity"), (3, 3, "relation"),
+])
+async def test_reconcile_counts_only_graph_records(runtime, monkeypatch, es_count, graph_count, compiled_count, failure):
+    monkeypatch.setattr(GraphRAGConfig, "RECONCILE_STUCK_ON_BOOT", True)
+    # Even a zero configured threshold must not convert count failures to success.
+    monkeypatch.setattr(GraphRAGConfig, "STUCK_TASK_MIN_NODES", 0 if failure else 3)
+    monkeypatch.setattr(GraphRAGConfig, "STUCK_TASK_MIN_EDGES", 0 if failure else 3)
+    kb_service, task_service, redis = MagicMock(), MagicMock(), MagicMock()
+    kb_service.model.select.return_value.where.return_value.dicts.return_value = [
+        {"id": "kb", "tenant_id": "tenant", "graphrag_task_id": "task"}
+    ]
+    task_service.get_by_id.return_value = (True, SimpleNamespace(progress=0.5, update_time=0))
+    redis.REDIS.set.return_value = True
+    redis.REDIS.ttl.return_value = -2
+    monkeypatch.setattr(task_executor_extras, "KnowledgebaseService", kb_service)
+    monkeypatch.setattr(task_executor_extras, "TaskService", task_service)
+    monkeypatch.setattr(task_executor_extras, "REDIS_CONN", redis)
+    rows = [
+        {"knowledge_graph_kwd": kind, "kb_id": "kb", **extra}
+        for kind in ("entity", "relation")
+        for count, extra in ((graph_count, {}), (compiled_count, {"compile_kwd": "artifact_page"}))
+        for _ in range(count)
+    ]
+
+    def count(*, index, body):
+        query = body["query"]["bool"]
+        filters = {key: value for clause in query["filter"] for key, value in clause["terms"].items()}
+        if filters["knowledge_graph_kwd"] == [failure]:
+            raise RuntimeError("count unavailable")
+        filters["must_not"] = {"exists": [clause["exists"]["field"] for clause in query["must_not"]]}
+        return {"count": sum(RefreshStore.matches(row, filters) for row in rows)}
+
+    connection = SimpleNamespace(es=SimpleNamespace(count=count), logger=logging.getLogger(__name__))
+    monkeypatch.setattr(runtime.store, "count", lambda *args: es_count(connection, *args), raising=False)
+
+    async def inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(task_executor_extras, "thread_pool_exec", inline)
+    await task_executor_extras.reconcile_stuck_graphrag_tasks()
+    if graph_count >= 3 and not failure:
+        task_service.update_progress.assert_called_once()
+        assert task_service.update_progress.call_args.args[1]["progress"] == 1.0
+        kb_service.update_by_id.assert_called_once()
+    else:
+        task_service.update_progress.assert_not_called()
+        kb_service.update_by_id.assert_not_called()

@@ -56,7 +56,7 @@ def _es_search_with_scroll(
     fields: list[str],
     scroll_timeout="2m",
     batch_size=1000,
-    max_pages: int = 1000,
+    max_pages: int = 20000,
     hits_cap: int | None = None,
 ):
     """Use Elasticsearch scroll API to fetch large result sets safely.
@@ -176,6 +176,11 @@ def _es_count(self, condition: dict, index_name: str, knowledgebase_ids: list[st
                 )
             continue
         if not v:
+            continue
+        if k == "must_not" and isinstance(v, dict) and "exists" in v:
+            fields = v["exists"]
+            for field in fields if isinstance(fields, list) else [fields]:
+                bool_query.must_not.append(Q("exists", field=field))
             continue
         if isinstance(v, list):
             bool_query.filter.append(Q("terms", **{k: v}))
