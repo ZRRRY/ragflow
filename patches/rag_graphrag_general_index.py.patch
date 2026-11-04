@@ -1,5 +1,5 @@
 diff --git a/rag/graphrag/general/index.py b/rag/graphrag/general/index.py
-index 199a0bb17..50be63f19 100644
+index 199a0bb17..41806725e 100644
 --- a/rag/graphrag/general/index.py
 +++ b/rag/graphrag/general/index.py
 @@ -21,9 +21,11 @@ import networkx as nx
@@ -51,7 +51,33 @@ index 199a0bb17..50be63f19 100644
  
  DEFAULT_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 4096
  MIN_GRAPHRAG_BATCH_CHUNK_TOKEN_SIZE = 512
-@@ -215,11 +221,11 @@ async def load_subgraph_from_store(tenant_id: str, kb_id: str, doc_id: str):
+@@ -161,15 +167,22 @@ async def _run_with_retry(
+     last_error = None
+     for attempt in range(1, attempts + 1):
+         _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before {label}.", callback)
++        # === CUSTOM BEGIN [stage-timeout-ownership] ===
++        deadline = asyncio.timeout(timeout_seconds if timeout_seconds and timeout_seconds > 0 else None)
+         try:
+-            if timeout_seconds and timeout_seconds > 0:
+-                return await asyncio.wait_for(coro_factory(), timeout=timeout_seconds)
+-            return await coro_factory()
++            async with deadline:
++                return await coro_factory()
+         except (TaskCanceledException, asyncio.CancelledError):
+             raise
+         except asyncio.TimeoutError as e:
++            # An ES/client timeout is not this stage's elapsed-time limit.
++            if not deadline.expired():
++                if callback:
++                    callback(msg=f"[GraphRAG] {label} FAILED: inner operation timed out: {e!r}")
++                raise
+             last_error = e
+             error_msg = f"timeout after {timeout_seconds}s"
++        # === CUSTOM END [stage-timeout-ownership] ===
+         except Exception as e:
+             last_error = e
+             error_msg = repr(e)
+@@ -215,11 +228,11 @@ async def load_subgraph_from_store(tenant_id: str, kb_id: str, doc_id: str):
      Returns a networkx Graph on hit, or None on miss.
      """
      fields = ["content_with_weight", "source_id"]
@@ -65,7 +91,7 @@ index 199a0bb17..50be63f19 100644
      try:
          res = await thread_pool_exec(settings.docStoreConn.search, fields, [], condition, [], OrderByExpr(), 0, 1, search.index_name(tenant_id), [kb_id])
          field_map = settings.docStoreConn.get_fields(res, fields)
-@@ -802,7 +808,7 @@ async def generate_subgraph(
+@@ -802,7 +815,7 @@ async def generate_subgraph(
      _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before saving subgraph for doc {doc_id}.", callback)
      await thread_pool_exec(
          settings.docStoreConn.delete,
@@ -74,7 +100,7 @@ index 199a0bb17..50be63f19 100644
          search.index_name(tenant_id),
          kb_id,
      )
-@@ -978,7 +984,7 @@ async def extract_community(
+@@ -978,7 +991,7 @@ async def extract_community(
              settings.docStoreConn.search,
              ["id"],
              [],
@@ -83,7 +109,7 @@ index 199a0bb17..50be63f19 100644
              [],
              OrderByExpr(),
              0,
-@@ -990,7 +996,7 @@ async def extract_community(
+@@ -990,7 +1003,7 @@ async def extract_community(
          old_ids = list(existing_fields.keys())
      except Exception:
          logging.exception("Failed to enumerate existing community reports for kb %s; falling back to delete-then-insert.", kb_id)
@@ -92,7 +118,7 @@ index 199a0bb17..50be63f19 100644
          old_ids = []
  
      await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert community reports")
-@@ -1004,7 +1010,7 @@ async def extract_community(
+@@ -1004,7 +1017,7 @@ async def extract_community(
          try:
              await thread_pool_exec(
                  settings.docStoreConn.delete,
@@ -101,7 +127,7 @@ index 199a0bb17..50be63f19 100644
                  search.index_name(tenant_id),
                  kb_id,
              )
-@@ -1017,3 +1023,15 @@ async def extract_community(
+@@ -1017,3 +1030,15 @@ async def extract_community(
      now = asyncio.get_running_loop().time()
      callback(msg=f"Graph indexed {len(cr.structured_output)} communities in {now - start:.2f}s.")
      return community_structure, community_reports

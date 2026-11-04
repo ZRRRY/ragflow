@@ -1,8 +1,24 @@
 diff --git a/rag/svr/task_executor_refactor/task_handler.py b/rag/svr/task_executor_refactor/task_handler.py
-index cce68a985..127640331 100644
+index cce68a985..b75a58cfc 100644
 --- a/rag/svr/task_executor_refactor/task_handler.py
 +++ b/rag/svr/task_executor_refactor/task_handler.py
-@@ -508,7 +508,11 @@ class TaskHandler:
+@@ -195,8 +195,14 @@ class TaskHandler:
+                     except Exception as e:
+                         logging.exception(f"Remove doc({task_doc_id}) from docStore failed when task({task_id}) canceled, exception: {e}")
+ 
+-    @timeout(60 * 60 * 3, 1)
++    # === CUSTOM BEGIN [graphrag-stage-deadlines] ===
+     async def handle(self) -> None:
++        if self._task_context.task_type == "graphrag":
++            return await self._handle()
++        return await timeout(60 * 60 * 3, 1)(self._handle)()
++
++    async def _handle(self) -> None:
++        # === CUSTOM END [graphrag-stage-deadlines] ===
+         """Handle a document processing task."""
+         ctx = self._task_context
+         task_type = ctx.task_type
+@@ -508,7 +514,11 @@ class TaskHandler:
                  logging.info(f"GraphRAG task result for task {ctx.raw_task}:\n{result}")
  
              ctx.recording_context.record("graphrag_result", result)

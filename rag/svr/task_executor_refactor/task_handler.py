@@ -195,8 +195,14 @@ class TaskHandler:
                     except Exception as e:
                         logging.exception(f"Remove doc({task_doc_id}) from docStore failed when task({task_id}) canceled, exception: {e}")
 
-    @timeout(60 * 60 * 3, 1)
+    # === CUSTOM BEGIN [graphrag-stage-deadlines] ===
     async def handle(self) -> None:
+        if self._task_context.task_type == "graphrag":
+            return await self._handle()
+        return await timeout(60 * 60 * 3, 1)(self._handle)()
+
+    async def _handle(self) -> None:
+        # === CUSTOM END [graphrag-stage-deadlines] ===
         """Handle a document processing task."""
         ctx = self._task_context
         task_type = ctx.task_type

@@ -18,6 +18,7 @@ FILES=(
     "api/apps/services/dataset_api_service.py"
     "api/db/services/document_service.py"
     "common/settings.py"
+    "common/connection_utils.py"
     "common/doc_store/infinity_conn_base.py"
     "common/doc_store/ob_conn_base.py"
     "rag/graphrag/search.py"

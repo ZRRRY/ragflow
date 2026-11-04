@@ -21,7 +21,7 @@ async def validate():
     client = Elasticsearch(
         f"http://{os.environ.get('ES_HOST', 'es01')}:{os.environ.get('ES_PORT', '9200')}",
         basic_auth=(os.environ.get("ES_USER", "elastic"), os.environ["ELASTIC_PASSWORD"]),
-        request_timeout=30,
+        request_timeout=120,
     )
     # Import the real paginator without connecting unrelated application stores.
     settings = ModuleType("common.settings")
@@ -70,6 +70,9 @@ async def validate():
     created = False
     try:
         version = client.info()["version"]["number"]
+        print(f"Creating temporary index: {index_name}", flush=True)
+        # Creation can succeed server-side even if the response times out.
+        created = True
         client.indices.create(index=index_name, settings={"number_of_shards": 2, "number_of_replicas": 0}, mappings={
             "properties": {
                 "kb_id": {"type": "keyword"}, "knowledge_graph_kwd": {"type": "keyword"},
@@ -78,7 +81,6 @@ async def validate():
                 "q_2_vec": {"type": "dense_vector", "dims": 2, "index": False},
             },
         })
-        created = True
         expected = {str(i) for i in range(12)}
         results = []
         for sort_field in ("entity_kwd", "_shard_doc"):

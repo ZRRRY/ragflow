@@ -42,6 +42,8 @@ class GraphRAGConfig:
     RECALC_GLOBAL_PAGERANK_AFTER_MERGE = os.environ.get(
         "RECALC_GLOBAL_PAGERANK_AFTER_MERGE", "0"
     ) == "1"
+    # Whole PageRank phase, including topology loading; 0 disables this deadline.
+    PAGERANK_TIMEOUT_SECONDS = int(os.environ.get("GRAPHRAG_PAGERANK_TIMEOUT_SECONDS", "0"))
 
     # -----------------------------------------------------------------------------
     # Phase 3 – 增量实体消解开关
@@ -208,6 +210,7 @@ class GraphRAGConfig:
             "GraphRAGConfig: incremental_graph=%s incremental_merge=%s "
             "delete_subgraph_on_doc_delete=%s "
             "recalc_global_pagerank_after_merge=%s "
+            "pagerank_timeout_seconds=%d "
             "incremental_resolution=%s async_community=%s "
             "async_kg_phases=%s "
             "reconcile_on_boot=%s grace_min=%d min_nodes=%d min_edges=%d "
@@ -221,6 +224,7 @@ class GraphRAGConfig:
             cls.USE_INCREMENTAL_MERGE,
             cls.DELETE_SUBGRAPH_ON_DOC_DELETE,
             cls.RECALC_GLOBAL_PAGERANK_AFTER_MERGE,
+            cls.PAGERANK_TIMEOUT_SECONDS,
             cls.USE_INCREMENTAL_RESOLUTION,
             cls.USE_ASYNC_COMMUNITY,
             cls.USE_ASYNC_KG_PHASES,
@@ -278,6 +282,7 @@ class GraphRAGConfig:
         cls.RECALC_GLOBAL_PAGERANK_AFTER_MERGE = os.environ.get(
             "RECALC_GLOBAL_PAGERANK_AFTER_MERGE", "0"
         ) == "1"
+        cls.PAGERANK_TIMEOUT_SECONDS = int(os.environ.get("GRAPHRAG_PAGERANK_TIMEOUT_SECONDS", "0"))
         cls.USE_INCREMENTAL_RESOLUTION = os.environ.get("USE_INCREMENTAL_RESOLUTION", "0") == "1"
         cls.RESOLUTION_BATCH_SIZE = int(os.environ.get("RESOLUTION_BATCH_SIZE", "100"))
         cls.RESOLUTION_MAX_CONCURRENT_TASKS = int(os.environ.get("RESOLUTION_MAX_CONCURRENT_TASKS", "5"))

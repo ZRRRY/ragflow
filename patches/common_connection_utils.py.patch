@@ -1,0 +1,30 @@
+diff --git a/common/connection_utils.py b/common/connection_utils.py
+index 48327a187..a62683d35 100644
+--- a/common/connection_utils.py
++++ b/common/connection_utils.py
+@@ -62,16 +62,21 @@ def timeout(seconds: float | int | str = None, attempts: int = 2, *, exception:
+ 
+         @wraps(func)
+         async def async_wrapper(*args, **kwargs) -> Any:
+-            if seconds is None:
++            # === CUSTOM BEGIN [timeout-ownership] ===
++            # Inner request timeouts must retain their cause and must not retry
++            # the whole operation, including when deadline checks are disabled.
++            if seconds is None or not os.environ.get("ENABLE_TIMEOUT_ASSERTION"):
+                 return await func(*args, **kwargs)
+ 
+             for a in range(attempts):
++                deadline = asyncio.timeout(seconds)
+                 try:
+-                    if os.environ.get("ENABLE_TIMEOUT_ASSERTION"):
+-                        return await asyncio.wait_for(func(*args, **kwargs), timeout=seconds)
+-                    else:
++                    async with deadline:
+                         return await func(*args, **kwargs)
+                 except asyncio.TimeoutError:
++                    if not deadline.expired():
++                        raise
++                    # === CUSTOM END [timeout-ownership] ===
+                     if a < attempts - 1:
+                         continue
+                     if on_timeout is not None:

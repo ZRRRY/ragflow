@@ -167,15 +167,22 @@ async def _run_with_retry(
     last_error = None
     for attempt in range(1, attempts + 1):
         _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before {label}.", callback)
+        # === CUSTOM BEGIN [stage-timeout-ownership] ===
+        deadline = asyncio.timeout(timeout_seconds if timeout_seconds and timeout_seconds > 0 else None)
         try:
-            if timeout_seconds and timeout_seconds > 0:
-                return await asyncio.wait_for(coro_factory(), timeout=timeout_seconds)
-            return await coro_factory()
+            async with deadline:
+                return await coro_factory()
         except (TaskCanceledException, asyncio.CancelledError):
             raise
         except asyncio.TimeoutError as e:
+            # An ES/client timeout is not this stage's elapsed-time limit.
+            if not deadline.expired():
+                if callback:
+                    callback(msg=f"[GraphRAG] {label} FAILED: inner operation timed out: {e!r}")
+                raise
             last_error = e
             error_msg = f"timeout after {timeout_seconds}s"
+        # === CUSTOM END [stage-timeout-ownership] ===
         except Exception as e:
             last_error = e
             error_msg = repr(e)

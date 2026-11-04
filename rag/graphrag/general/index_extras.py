@@ -97,7 +97,7 @@ from rag.graphrag.utils_extras import (
     set_graph,
     write_merge_state,
 )
-from rag.graphrag.utils_pagination import search_all_by_search_after
+from rag.graphrag.utils_pagination import _finish_request, search_all_by_search_after
 from rag.nlp import rag_tokenizer, search
 from rag.utils.redis_conn import REDIS_CONN, RedisDistributedLock
 
@@ -676,16 +676,7 @@ async def _run_graphrag_for_kb(
             and ok_docs
         ):
             # Do not reload the full topology automatically after a failure.
-            await _run_with_retry(
-                "global pagerank recalc",
-                lambda: recalc_global_pagerank(tenant_id, kb_id, callback, task_id=task_id),
-                attempts=1,
-                timeout_seconds=merge_timeout_seconds,
-                backoff_seconds=retry_backoff_seconds,
-                backoff_max_seconds=retry_backoff_max_seconds,
-                callback=callback,
-                task_id=task_id,
-            )
+            await recalc_global_pagerank(tenant_id, kb_id, callback, task_id=task_id)
     finally:
         try:
             _held = asyncio.get_running_loop().time() - lock_held_t0
@@ -846,16 +837,7 @@ async def _run_graphrag_for_kb(
                 GraphRAGConfig.RECALC_GLOBAL_PAGERANK_AFTER_MERGE
                 and GraphRAGConfig.USE_INCREMENTAL_RESOLUTION
             ):
-                await _run_with_retry(
-                    "global pagerank recalc (post-resolution)",
-                    lambda: recalc_global_pagerank(tenant_id, kb_id, callback, task_id=task_id),
-                    attempts=1,
-                    timeout_seconds=merge_timeout_seconds,
-                    backoff_seconds=retry_backoff_seconds,
-                    backoff_max_seconds=retry_backoff_max_seconds,
-                    callback=callback,
-                    task_id=task_id,
-                )
+                await recalc_global_pagerank(tenant_id, kb_id, callback, task_id=task_id)
             set_phase_marker(kb_id, PHASE_RESOLUTION)
         elif with_resolution:
             callback(msg=f"[GraphRAG] dataset:{kb_id} resolution already completed previously, skipping.")
@@ -1306,111 +1288,141 @@ async def recalc_global_pagerank(
     streams ``search_after`` pages flushed in bounded windows, so resident
     memory stays flat regardless of entity count.
     """
+    seconds = GraphRAGConfig.PAGERANK_TIMEOUT_SECONDS
+    if seconds < 0:
+        raise ValueError("GRAPHRAG_PAGERANK_TIMEOUT_SECONDS must be nonnegative")
+    deadline = asyncio.timeout(seconds or None)
     try:
-        _has_cancel_and_exit(
-            task_id, f"Task {task_id} cancelled before global pagerank recalc.", callback
-        )
-        start = asyncio.get_running_loop().time()
-        callback(msg=f"[GraphRAG] dataset:{kb_id} start global pagerank recalc.")
+        async with deadline:
+            return await _recalc_global_pagerank(tenant_id, kb_id, callback, task_id)
+    except (TaskCanceledException, asyncio.CancelledError):
+        raise
+    except Exception as error:
+        if isinstance(error, TimeoutError) and deadline.expired():
+            message = f"PageRank phase exceeded configured limit of {seconds}s (including topology loading)"
+        else:
+            message = repr(error)
+        callback(msg=f"[GraphRAG] dataset:{kb_id} PageRank failed: graph preserved; "
+                 f"ranks may be partially updated. {message}")
+        if isinstance(error, TimeoutError) and deadline.expired():
+            raise TimeoutError(message) from error
+        raise
 
-        # 1. Capability check: topology loading needs scroll-based retrieval;
-        # entity write-back uses PIT pagination and partial updates.
-        has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
-        if not has_scroll and type(settings.docStoreConn).__name__ == "ESConnection":
-            try:
-                from common.doc_store.es_conn_extras import install as install_es_conn_extras
-                install_es_conn_extras()
-                has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
-                callback(
-                    msg=f"[GraphRAG] dataset:{kb_id} pagerank recalc: installed es extras, "
-                        f"search_with_scroll={has_scroll}."
-                )
-            except Exception as e:
-                logging.exception("Failed to install es_conn_extras: %s", e)
-                callback(msg=f"[GraphRAG] dataset:{kb_id} failed to install es extras: {e!r}")
 
-        update_docs = getattr(settings.docStoreConn, "update_docs", None)
-        refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
-        if not has_scroll or update_docs is None or refresh_fn is None:
-            raise RuntimeError("PageRank backend requires search_with_scroll/update_docs/refresh_idx")
-        raw = getattr(settings.docStoreConn, "es", None)
-        if raw is None or not all(callable(getattr(raw, name, None)) for name in ("open_point_in_time", "search", "close_point_in_time")):
-            raise RuntimeError("PageRank backend requires Elasticsearch PIT pagination")
+async def _recalc_global_pagerank(tenant_id, kb_id, callback, task_id):
+    _has_cancel_and_exit(
+        task_id, f"Task {task_id} cancelled before global pagerank recalc.", callback
+    )
+    start = asyncio.get_running_loop().time()
+    callback(msg=f"[GraphRAG] dataset:{kb_id} start global pagerank recalc.")
 
-        # 2. Load the global graph topology (entity names + edge endpoints only;
-        # descriptions stay in the doc store — at large-KB scale that is roughly
-        # an order of magnitude less resident memory). Structural (book/chapter)
-        # nodes are filtered with the same ``should_skip_embedding`` predicate used
-        # at write-back time, so the two can never disagree (alias names like
-        # "Book"/"Chapter" are covered as well as the exact 书籍/章节 types).
-        # Any scroll truncation (entities OR relations) aborts the recalc: ranks
-        # computed on a partial topology must never be written back.
-        hits_cap = GraphRAGConfig.SEARCH_WITH_SCROLL_HITS_CAP
+    # 1. Capability check: topology loading needs scroll-based retrieval;
+    # entity write-back uses PIT pagination and partial updates.
+    has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
+    if not has_scroll and type(settings.docStoreConn).__name__ == "ESConnection":
         try:
-            graph = await get_graph_topology_from_index(
-                tenant_id,
-                kb_id,
-                skip_entity_type=GraphRAGConfig.should_skip_embedding,
-                hits_cap=hits_cap,
+            from common.doc_store.es_conn_extras import install as install_es_conn_extras
+            install_es_conn_extras()
+            has_scroll = hasattr(settings.docStoreConn, "search_with_scroll")
+            callback(
+                msg=f"[GraphRAG] dataset:{kb_id} pagerank recalc: installed es extras, "
+                    f"search_with_scroll={has_scroll}."
             )
-        except GraphTopologyTruncatedError as e:
-            callback(msg=f"[GraphRAG] dataset:{kb_id} abort pagerank recalc: {e}")
-            logging.warning("pagerank recalc aborted for kb=%s: %s", kb_id, e)
-            raise
         except Exception as e:
-            logging.exception("topology load failed for pagerank recalc: %s", e)
-            callback(msg=f"[GraphRAG] dataset:{kb_id} topology load failed: {e!r}")
-            raise
+            logging.exception("Failed to install es_conn_extras: %s", e)
+            callback(msg=f"[GraphRAG] dataset:{kb_id} failed to install es extras: {e!r}")
 
-        if graph is None or len(graph.nodes) == 0:
-            callback(msg=f"[GraphRAG] dataset:{kb_id} no global graph; skip pagerank recalc.")
+    update_docs = getattr(settings.docStoreConn, "update_docs", None)
+    refresh_fn = getattr(settings.docStoreConn, "refresh_idx", None)
+    if not has_scroll or update_docs is None or refresh_fn is None:
+        raise RuntimeError("PageRank backend requires search_with_scroll/update_docs/refresh_idx")
+    raw = getattr(settings.docStoreConn, "es", None)
+    if raw is None or not all(callable(getattr(raw, name, None)) for name in ("open_point_in_time", "search", "close_point_in_time")):
+        raise RuntimeError("PageRank backend requires Elasticsearch PIT pagination")
+
+    # 2. Load the global graph topology (entity names + edge endpoints only;
+    # descriptions stay in the doc store — at large-KB scale that is roughly
+    # an order of magnitude less resident memory). Structural (book/chapter)
+    # nodes are filtered with the same ``should_skip_embedding`` predicate used
+    # at write-back time, so the two can never disagree (alias names like
+    # "Book"/"Chapter" are covered as well as the exact 书籍/章节 types).
+    # Any scroll truncation (entities OR relations) aborts the recalc: ranks
+    # computed on a partial topology must never be written back.
+    hits_cap = GraphRAGConfig.SEARCH_WITH_SCROLL_HITS_CAP
+    try:
+        graph = await get_graph_topology_from_index(
+            tenant_id,
+            kb_id,
+            skip_entity_type=GraphRAGConfig.should_skip_embedding,
+            hits_cap=hits_cap,
+        )
+    except GraphTopologyTruncatedError as e:
+        callback(msg=f"[GraphRAG] dataset:{kb_id} abort pagerank recalc: {e}")
+        logging.warning("pagerank recalc aborted for kb=%s: %s", kb_id, e)
+        raise
+    except Exception as e:
+        logging.exception("topology load failed for pagerank recalc: %s", e)
+        callback(msg=f"[GraphRAG] dataset:{kb_id} topology load failed: {e!r}")
+        raise
+
+    if graph is None or len(graph.nodes) == 0:
+        callback(msg=f"[GraphRAG] dataset:{kb_id} no global graph; skip pagerank recalc.")
+        return
+
+    callback(
+        msg=f"[GraphRAG] dataset:{kb_id} loaded global graph topology for pagerank recalc: "
+            f"nodes={len(graph.nodes)} edges={len(graph.edges)}."
+    )
+
+    # 3. Compute global PageRank on the filtered graph.
+    pr = nx.pagerank(graph)
+    callback(
+        msg=f"[GraphRAG] dataset:{kb_id} pagerank computed for {len(pr)} nodes."
+    )
+
+    # 4. Stream entity chunks page-by-page (search_after pagination — no
+    # result-window or hits-cap limit) with a narrow _source projection so
+    # embedding vectors never leave the doc store. Write back partial updates
+    # in bounded windows. Structural nodes are pinned to 0.0 (they never
+    # participate in ranking; without this the merge-time 0.001 placeholder
+    # would outrank real entities on large graphs). Entities missing from the
+    # pagerank map (e.g. parse failures at load time) are skipped, never
+    # zeroed.
+    _UPDATE_WINDOW = 1000
+    updates: list[tuple[str, dict]] = []
+    updated = 0
+    skipped = 0
+    scanned = 0
+    last_progress = start
+
+    def _report_progress():
+        nonlocal last_progress
+        now = asyncio.get_running_loop().time()
+        if now - last_progress >= 30:
+            callback(msg=f"[GraphRAG] dataset:{kb_id} pagerank write-back: "
+                     f"scanned={scanned} updated={updated} skipped={skipped}.")
+            last_progress = now
+
+    async def _flush_updates():
+        if not updates:
             return
-
-        callback(
-            msg=f"[GraphRAG] dataset:{kb_id} loaded global graph topology for pagerank recalc: "
-                f"nodes={len(graph.nodes)} edges={len(graph.edges)}."
+        _has_cancel_and_exit(
+            task_id, f"Task {task_id} cancelled before pagerank write-back.", callback
         )
+        write_started = asyncio.get_running_loop().time()
 
-        # 3. Compute global PageRank on the filtered graph.
-        pr = nx.pagerank(graph)
-        callback(
-            msg=f"[GraphRAG] dataset:{kb_id} pagerank computed for {len(pr)} nodes."
-        )
-
-        # 4. Stream entity chunks page-by-page (search_after pagination — no
-        # result-window or hits-cap limit) with a narrow _source projection so
-        # embedding vectors never leave the doc store. Write back partial updates
-        # in bounded windows. Structural nodes are pinned to 0.0 (they never
-        # participate in ranking; without this the merge-time 0.001 placeholder
-        # would outrank real entities on large graphs). Entities missing from the
-        # pagerank map (e.g. parse failures at load time) are skipped, never
-        # zeroed.
-        _UPDATE_WINDOW = 1000
-        updates: list[tuple[str, dict]] = []
-        updated = 0
-        skipped = 0
-        scanned = 0
-        last_progress = start
-
-        def _report_progress():
-            nonlocal last_progress
-            now = asyncio.get_running_loop().time()
-            if now - last_progress >= 30:
-                callback(msg=f"[GraphRAG] dataset:{kb_id} pagerank write-back: "
-                         f"scanned={scanned} updated={updated} skipped={skipped}.")
-                last_progress = now
-
-        async def _flush_updates():
+        async def write_batch():
             nonlocal updated
-            if not updates:
-                return
-            _has_cancel_and_exit(
-                task_id, f"Task {task_id} cancelled before pagerank write-back.", callback
-            )
-            write_started = asyncio.get_running_loop().time()
-            errors = await thread_pool_exec(update_docs, search.index_name(tenant_id), list(updates))
+            try:
+                errors = await thread_pool_exec(update_docs, search.index_name(tenant_id), list(updates))
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "[GraphRAG] dataset:%s PageRank batch result unconfirmed: batch=%d confirmed_updated=%d",
+                    kb_id, len(updates), updated,
+                )
+                raise
             if errors:
-                raise Exception(
+                raise RuntimeError(
                     f"update_docs failed for {len(errors)}/{len(updates)} entity chunks, "
                     f"first errors: {errors[:3]}"
                 )
@@ -1420,80 +1432,78 @@ async def recalc_global_pagerank(
                 kb_id, len(updates), asyncio.get_running_loop().time() - write_started, scanned, updated, skipped,
             )
             updates.clear()
+
+        # Thread cancellation cannot stop a dispatched bulk request. Record its
+        # acknowledgement before propagating cancellation and closing the PIT.
+        await _finish_request(write_batch())
+        _report_progress()
+
+    # The PIT keeps pagination stable while entity rows are updated. Close it
+    # immediately if processing or writing a page fails.
+    async with aclosing(search_all_by_search_after(
+        graph_condition({"knowledge_graph_kwd": ["entity"]}),
+        search.index_name(tenant_id),
+        kb_id,
+        ["entity_kwd", "content_with_weight"],
+        "_shard_doc",
+    )) as pages:
+        async for page in pages:
+            _has_cancel_and_exit(
+                task_id, f"Task {task_id} cancelled during pagerank recalc.", callback
+            )
+            for hit in page:
+                scanned += 1
+                cid = hit.get("id")
+                if not cid:
+                    skipped += 1
+                    continue
+
+                entity_name = hit.get("entity_kwd")
+                if isinstance(entity_name, list):
+                    entity_name = entity_name[0] if entity_name else None
+                if not entity_name:
+                    skipped += 1
+                    continue
+
+                try:
+                    meta = json.loads(hit.get("content_with_weight", "{}"))
+                except Exception:
+                    skipped += 1
+                    continue
+
+                if GraphRAGConfig.should_skip_embedding(meta.get("entity_type")):
+                    new_pr = 0.0
+                elif entity_name in pr:
+                    new_pr = float(pr[entity_name])
+                else:
+                    skipped += 1
+                    continue
+
+                meta["pagerank"] = new_pr
+                updates.append((cid, {
+                    "rank_flt": new_pr,
+                    "content_with_weight": json.dumps(meta, ensure_ascii=False),
+                }))
+                if len(updates) >= _UPDATE_WINDOW:
+                    await _flush_updates()
             _report_progress()
 
-        # The PIT keeps pagination stable while entity rows are updated. Close it
-        # immediately if processing or writing a page fails.
-        async with aclosing(search_all_by_search_after(
-            graph_condition({"knowledge_graph_kwd": ["entity"]}),
-            search.index_name(tenant_id),
-            kb_id,
-            ["entity_kwd", "content_with_weight"],
-            "_shard_doc",
-        )) as pages:
-            async for page in pages:
-                _has_cancel_and_exit(
-                    task_id, f"Task {task_id} cancelled during pagerank recalc.", callback
-                )
-                for hit in page:
-                    scanned += 1
-                    cid = hit.get("id")
-                    if not cid:
-                        skipped += 1
-                        continue
+    await _flush_updates()
 
-                    entity_name = hit.get("entity_kwd")
-                    if isinstance(entity_name, list):
-                        entity_name = entity_name[0] if entity_name else None
-                    if not entity_name:
-                        skipped += 1
-                        continue
+    if not updated:
+        callback(msg=f"[GraphRAG] dataset:{kb_id} no valid entity chunks to update.")
+        return
 
-                    try:
-                        meta = json.loads(hit.get("content_with_weight", "{}"))
-                    except Exception:
-                        skipped += 1
-                        continue
+    # Success requires the completed writes to be visible to downstream queries.
+    if await _finish_request(thread_pool_exec(refresh_fn, search.index_name(tenant_id))) is False:
+        raise RuntimeError("PageRank index refresh failed")
 
-                    if GraphRAGConfig.should_skip_embedding(meta.get("entity_type")):
-                        new_pr = 0.0
-                    elif entity_name in pr:
-                        new_pr = float(pr[entity_name])
-                    else:
-                        skipped += 1
-                        continue
-
-                    meta["pagerank"] = new_pr
-                    updates.append((cid, {
-                        "rank_flt": new_pr,
-                        "content_with_weight": json.dumps(meta, ensure_ascii=False),
-                    }))
-                    if len(updates) >= _UPDATE_WINDOW:
-                        await _flush_updates()
-                _report_progress()
-
-        await _flush_updates()
-
-        if not updated:
-            callback(msg=f"[GraphRAG] dataset:{kb_id} no valid entity chunks to update.")
-            return
-
-        # Success requires the completed writes to be visible to downstream queries.
-        if await thread_pool_exec(refresh_fn, search.index_name(tenant_id)) is False:
-            raise RuntimeError("PageRank index refresh failed")
-
-        now = asyncio.get_running_loop().time()
-        callback(
-            msg=f"[GraphRAG] dataset:{kb_id} global pagerank recalc done: "
-                f"updated {updated} entities, skipped {skipped}, "
-                f"in {now - start:.2f}s."
-        )
-    except (TaskCanceledException, asyncio.CancelledError):
-        raise
-    except Exception as error:
-        callback(msg=f"[GraphRAG] dataset:{kb_id} PageRank failed: graph preserved; "
-                 f"ranks may be partially updated. {error!r}")
-        raise
+    now = asyncio.get_running_loop().time()
+    callback(
+        msg=f"[GraphRAG] dataset:{kb_id} global pagerank recalc done: "
+            f"updated {updated} entities, skipped {skipped}, "
+            f"in {now - start:.2f}s."
+    )
 
 
 async def merge_subgraph_incremental(

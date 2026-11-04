@@ -1369,8 +1369,16 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
     return True
 
 
-@timeout(60 * 60 * 3, 1)
+# === CUSTOM BEGIN [graphrag-stage-deadlines] ===
 async def do_handle_task(task):
+    # GraphRAG stages own their deadlines; PageRank may legitimately take days.
+    if task.get("task_type") == "graphrag":
+        return await _do_handle_task(task)
+    return await timeout(60 * 60 * 3, 1)(_do_handle_task)(task)
+
+
+async def _do_handle_task(task):
+    # === CUSTOM END [graphrag-stage-deadlines] ===
     task_type = task.get("task_type", "")
 
     if task_type == "memory":

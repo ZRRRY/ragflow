@@ -1,8 +1,26 @@
 diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
-index 2e85ef7e8..7b41aac4e 100644
+index 2e85ef7e8..6cd138545 100644
 --- a/rag/svr/task_executor.py
 +++ b/rag/svr/task_executor.py
-@@ -1541,7 +1541,11 @@ async def do_handle_task(task):
+@@ -1369,8 +1369,16 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
+     return True
+ 
+ 
+-@timeout(60 * 60 * 3, 1)
++# === CUSTOM BEGIN [graphrag-stage-deadlines] ===
+ async def do_handle_task(task):
++    # GraphRAG stages own their deadlines; PageRank may legitimately take days.
++    if task.get("task_type") == "graphrag":
++        return await _do_handle_task(task)
++    return await timeout(60 * 60 * 3, 1)(_do_handle_task)(task)
++
++
++async def _do_handle_task(task):
++    # === CUSTOM END [graphrag-stage-deadlines] ===
+     task_type = task.get("task_type", "")
+ 
+     if task_type == "memory":
+@@ -1541,7 +1549,11 @@ async def do_handle_task(task):
              )
              logging.info(f"GraphRAG task result for task {task}:\n{result}")
          get_recording_context().record("graphrag_result", result)
@@ -15,7 +33,7 @@ index 2e85ef7e8..7b41aac4e 100644
          return
      elif task_type == "mindmap":
          progress_callback(1, "place holder")
-@@ -1926,6 +1930,15 @@ async def main():
+@@ -1926,6 +1938,15 @@ async def main():
      logging.error("BUG!!! You should not reach here!!!")
  
  

@@ -47,6 +47,10 @@ async def _finish_request(request):
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
+        if task.cancelled():
+            # Preserve cancellation raised by the request itself (including its
+            # message), rather than shield's synthetic CancelledError.
+            return task.result()
         # Cancelling the asyncio waiter cannot stop the underlying ES request.
         # Recover its latest PIT ID before cleanup, even on repeated cancellation.
         while not task.done():
@@ -55,7 +59,7 @@ async def _finish_request(request):
             except asyncio.CancelledError:
                 continue
             except Exception:
-                logger.debug("PIT request failed while cancellation was pending", exc_info=True)
+                logger.warning("GraphRAG request failed while cancellation was pending", exc_info=True)
                 break
         if not task.cancelled():
             task.exception()

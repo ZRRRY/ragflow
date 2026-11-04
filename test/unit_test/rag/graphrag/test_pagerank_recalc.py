@@ -357,6 +357,7 @@ class TestRecalcGlobalPagerank:
         now = 0
         monkeypatch.setattr(index_extras, "asyncio", SimpleNamespace(
             get_running_loop=lambda: SimpleNamespace(time=lambda: now), CancelledError=asyncio.CancelledError,
+            timeout=asyncio.timeout,
         ))
         valid = _hits()[0]["_source"]
 
@@ -385,3 +386,168 @@ class TestFinalGraphIsDelta:
     def test_official_mode_never_delta(self, monkeypatch):
         monkeypatch.setattr(GraphRAGConfig, "USE_INCREMENTAL_MERGE", False)
         assert index_extras._final_graph_is_delta(nx.Graph()) is False
+
+
+@pytest.mark.parametrize("operation", ["write", "refresh"])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_cancel_drains_write_or_refresh(monkeypatch, caplog, operation, failure):
+    store, _, msgs, callback = _setup(monkeypatch, _hits(), _graph())
+    started, finish = asyncio.Event(), asyncio.Event()
+    settled = []
+
+    async def dispatch(fn, *args, **kwargs):
+        target = store.update_docs if operation == "write" else store.refresh_idx
+        if fn == target:
+            started.set()
+            await finish.wait()
+            settled.append(operation)
+            if failure:
+                raise TimeoutError("ES request timed out")
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(index_extras, "thread_pool_exec", dispatch)
+    task = asyncio.create_task(index_extras.recalc_global_pagerank("t1", "kb1", callback))
+    await started.wait()
+    for _ in range(2):
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert settled == []
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert settled == [operation]
+    assert not any("recalc done" in msg for msg in msgs)
+    if operation == "write":
+        assert store.refreshed is False
+        assert len(store.update_calls) == (0 if failure else 1)
+        if failure:
+            assert "result unconfirmed" in caplog.text
+
+
+async def test_default_pagerank_runs_beyond_five_hours(monkeypatch):
+    store, _, msgs, callback = _setup(monkeypatch, _hits(), _graph())
+    monkeypatch.setattr(GraphRAGConfig, "PAGERANK_TIMEOUT_SECONDS", 0)
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    offset = 0
+    valid = _hits()[0]["_source"]
+
+    async def scan(*args, **kwargs):
+        nonlocal offset
+        for i in range(4):
+            offset += 5400
+            await asyncio.sleep(0)
+            yield [dict(valid, id=f"{i}-{j}") for j in range(1000)]
+
+    monkeypatch.setattr(index_extras, "search_all_by_search_after", scan)
+    with monkeypatch.context() as clock:
+        clock.setattr(loop, "time", lambda: real_time() + offset)
+        await index_extras.recalc_global_pagerank("t1", "kb1", callback)
+    assert sum(map(len, store.update_calls)) == 4000
+    assert store.refreshed
+    assert "recalc done" in msgs[-1]
+
+
+@pytest.mark.parametrize("inner_timeout", [False, True])
+async def test_pagerank_deadline_distinguishes_request_timeout(monkeypatch, inner_timeout):
+    from unittest.mock import AsyncMock
+
+    messages = []
+    request_error = TimeoutError("ES request timed out")
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    offset = 0
+
+    async def run(*args):
+        nonlocal offset
+        if inner_timeout:
+            raise request_error
+        offset = 200
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    worker = AsyncMock(side_effect=run)
+    monkeypatch.setattr(index_extras, "_recalc_global_pagerank", worker)
+    monkeypatch.setattr(GraphRAGConfig, "PAGERANK_TIMEOUT_SECONDS", 100)
+    with monkeypatch.context() as clock:
+        clock.setattr(loop, "time", lambda: real_time() + offset)
+        with pytest.raises(TimeoutError) as caught:
+            await index_extras.recalc_global_pagerank("t1", "kb1", lambda **kw: messages.append(kw["msg"]))
+    worker.assert_awaited_once()
+    assert "graph preserved" in messages[-1]
+    if inner_timeout:
+        assert caught.value is request_error
+        assert "configured limit" not in messages[-1]
+    else:
+        assert "configured limit" in str(caught.value)
+
+
+@pytest.mark.parametrize("operation", ["write", "refresh"])
+async def test_phase_timeout_drains_inflight_request_before_failure(monkeypatch, operation):
+    store, _, messages, callback = _setup(monkeypatch, _hits(), _graph())
+    monkeypatch.setattr(GraphRAGConfig, "PAGERANK_TIMEOUT_SECONDS", 18000)
+    started, finish = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    offset = 0
+    async def dispatch(fn, *args, **kwargs):
+        if fn == (store.update_docs if operation == "write" else store.refresh_idx):
+            started.set()
+            await finish.wait()
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(index_extras, "thread_pool_exec", dispatch)
+    with monkeypatch.context() as clock:
+        clock.setattr(loop, "time", lambda: real_time() + offset)
+        task = asyncio.create_task(index_extras.recalc_global_pagerank("t1", "kb1", callback))
+        await started.wait()
+        offset = 18001
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert not any("PageRank failed" in msg for msg in messages)
+        finish.set()
+        with pytest.raises(TimeoutError, match="configured limit of 18000s"):
+            await task
+    assert len(store.update_calls) == 1
+    assert store.refreshed is (operation == "refresh")
+    assert "graph preserved" in messages[-1]
+    assert not any("recalc done" in msg for msg in messages)
+
+
+async def test_rank_only_rerun_rewrites_partial_results_without_old_cursor(monkeypatch):
+    from copy import deepcopy
+
+    store, _, _, callback = _setup(monkeypatch, _hits(), _graph())
+    row = _hits()[0]["_source"]
+    rows = {str(i): dict(deepcopy(row), q_2_vec=[0.2, 0.8]) for i in range(1001)}
+    scans = []
+    fail = True
+
+    async def scan(*args, **kwargs):
+        scans.append(True)
+        snapshot = deepcopy(rows)
+        yield [dict(fields, id=cid) for cid, fields in snapshot.items()]
+
+    def update(index_name, updates):
+        if fail and len(updates) == 1:
+            raise TimeoutError("second batch failed")
+        for cid, fields in updates:
+            rows[cid].update(fields)
+        store.update_calls.append(updates)
+        return []
+
+    monkeypatch.setattr(index_extras, "search_all_by_search_after", scan)
+    monkeypatch.setattr(store, "update_docs", update)
+    with pytest.raises(TimeoutError, match="second batch failed"):
+        await index_extras.recalc_global_pagerank("t1", "kb1", callback)
+    assert len(store.update_calls) == 1
+    assert not store.refreshed
+    fail = False
+    await index_extras.recalc_global_pagerank("t1", "kb1", callback)
+    expected = nx.pagerank(_graph())["Alpha"]
+    assert len(scans) == 2
+    assert [len(batch) for batch in store.update_calls] == [1000, 1000, 1]
+    assert all(row["rank_flt"] == expected and json.loads(row["content_with_weight"])["pagerank"] == expected
+               and row["q_2_vec"] == [0.2, 0.8] for row in rows.values())
+    assert store.refreshed

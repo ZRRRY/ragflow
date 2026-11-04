@@ -42,9 +42,9 @@ git diff <旧tag>..<新tag> -- <官方文件>
 
 ---
 
-## 二、官方文件修改清单（23 个）
+## 二、官方文件修改清单（24 个）
 
-### patch 管理内（23 个，对应 `patches/*.patch`）
+### patch 管理内（24 个，对应 `patches/*.patch`）
 
 | 官方文件 | 改动摘要 | patch 文件 |
 |---------|---------|-----------|
@@ -53,6 +53,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | `api/apps/restful_apis/dataset_api.py` | 新增 `delete_knowledge_graph` 转发函数（修复 main 上 `backward_compat.py` 废弃端点的坏引用） | `api_apps_restful_apis_dataset_api.py.patch` |
 | `api/apps/services/dataset_api_service.py` | `get_knowledge_graph` 委托 extras；删图关键词增加 `merge_state` | `api_apps_services_dataset_api_service.py.patch` |
 | `api/db/services/document_service.py` | 删文档的 GraphRAG 清理委托 extras；legacy 和增量路径均排除编译数据 | `api_db_services_document_service.py.patch` |
+| `common/connection_utils.py` | 异步超时仅处理本层期限，保留内部超时原因，不误重试 | `common_connection_utils.py.patch` |
 | `common/settings.py` | `init_settings()` 中安装 ES extras 与删除审计两个 hook（带异常兜底；OS extras hook 已于 2026-09-12 随 OS 后端弃用移除） | `common_settings.py.patch` |
 | `rag/graphrag/entity_resolution.py` | 尾部 CUSTOM 块：flag 开启时类重绑定 + 额外导出 | `rag_graphrag_entity_resolution.py.patch` |
 | `rag/graphrag/general/index.py` | 尾部调用 `index_patch.apply_patch()` | `rag_graphrag_general_index.py.patch` |
@@ -105,7 +106,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | | `web/src/assets/svg/data-flow/total-chunks-icon{,-bri}.svg` | 统计卡图标（暗/亮主题） |
 | 测试 | `test/unit_test/rag/graphrag/` | GraphRAG 工具、分页、checkpoint、拓扑、增量写入/删除/消解回归测试；`test_review_findings.py` 覆盖五项审查问题及失败边界 |
 | 运维 | `docker/finisher/`（3 个文件） | 卡死任务收尾脚本（默认 dry-run）+ README + 辅助 SQL |
-| 管理 | `patches/`（23 patch + apply/regenerate 脚本 + README） | 官方文件改动的补丁管理 |
+| 管理 | `patches/`（24 patch + apply/regenerate 脚本 + README） | 官方文件改动的补丁管理 |
 | | `MAINTENANCE.md`、本文档 | 维护规范与漂移清单 |
 
 ---
@@ -179,7 +180,7 @@ git diff <旧tag>..<新tag> -- <官方文件>
 | Dealer 白名单修复 | 已还原 `rag/nlp/search.py`，暂不处理 | ⏸️ 已撤回 |
 | Infinity `count()` | 决定不移植 | ⏸️ 已放弃 |
 | 批量 Entity/Edge 摘要 | 决定不移植 | ⏸️ 已放弃 |
-| `common/connection_utils.py` 超时兜底修复 | 决定保持官方原样 | ⏸️ 已放弃 |
+| `common/connection_utils.py` 超时归属修复 | 仅本层期限到期才转译并重试 | 2026-11-03 已实现 |
 | `rag/graphrag/utils.py` Dealer 绕过逻辑 | `is_doc_merged` 已改为基于 `query_merge_state()`（merge_state 表）判断，不再经 Dealer 查 `source_id`，绕过逻辑不再必要 | ⏸️ 已放弃 |
 | 前端删除图谱相关修改 | 官方 v0.26.x 前端已自带删除按钮，无需额外修改 | ⏸️ 无需处理 |
 
@@ -311,3 +312,13 @@ git diff <旧tag>..<新tag> -- <官方文件>
 - 定向回归后，GraphRAG 全目录 **309 项通过**；最后的回调绑定及日志调整对应 **117 项定向回归通过**。覆盖 204 秒、248 秒和超过 10 分钟的模拟慢消费者，最新 PIT ID、取消、并发请求互斥、最终清理期间续期失败、批次上限、失败状态和进度节流。
 - `tools/scripts/validate_graphrag_pit.py` 在真实 ES **8.11.3** 上使用随机临时双分片索引验证：字段排序与 `_shard_doc` 各读取 12 条快照记录；页间写入/刷新不改变快照；后台续期 2 次，关闭 PIT 2 个，剩余搜索上下文为 0。临时索引已删除。该脚本按环境变量连接 ES，独立运行，不初始化其他应用服务。
 - 官方任务入口补丁已重新生成，并在临时目录针对 `v0.26.4` 验证应用及内容一致性；新增 refactor 入口补丁后共 23 项。未重启服务、未重跑业务知识库，尚未验证百万节点场景的整体耗时。
+
+
+## 2026-11-03：PageRank 总时限与取消收尾修复
+
+- 新增 `GRAPHRAG_PAGERANK_TIMEOUT_SECONDS`，默认 `0` 表示不限制整个 PageRank 阶段累计耗时；正数限制包括拓扑加载在内的完整阶段，负数拒绝执行。支持配置 reload 和启动日志。合并、实体消解及异步后处理统一由 PageRank 自己管理期限，每次只执行一次。
+- 两个任务入口仅对非 GraphRAG 任务保留通用 3 小时超时；图谱其他阶段仍使用各自原有期限。异步超时装饰器和阶段重试器区分内部请求超时与自己的期限，不再把 18000 秒错误重写为 10800 秒，也不因内部超时重复整个操作。
+- PageRank bulk 与最终刷新在取消时等待在途线程请求收尾。成功确认的批次仍记账；传输异常记录结果未确认。失败/取消不写入成功状态或实体消解完成标记，成功批次不回滚。
+- 排名修复沿用 `recalc_global_pagerank`：重新加载当前拓扑并从新 PIT 完整扫描，只更新排名与 JSON 元数据，不执行实体抽取或图谱合并。旧 PIT 的 `_shard_doc` 游标不能用于新 PIT；没有持久化逐页续传功能。调用方仍须排除同知识库并发写入，并在全部请求收尾后释放锁。本次未触发业务修复运行。
+- 单次 ES 传输超时与有界请求重试继续沿用后端配置，不把 bulk 的服务端 `timeout=60s` 当作整个 HTTP 请求期限。此次改动不承诺改善磁盘 I/O 或百万节点总运行时长。
+- 验证：GraphRAG 共 335 项测试通过（包含三个入口的独立期限/终态矩阵）；定向语法、正确性与异步 lint 通过。完整 lint 仍存在既有诊断。四个受影响官方文件的补丁针对 v0.26.4 验证应用与内容一致性。ES 8.11.3 临时两分片索引验证通过：字段排序与 `_shard_doc` 各扫描 12 条，续期 3 次，关闭 2 个 PIT，剩余上下文 0。首次创建请求超时留下的临时索引及最终成功验证的临时索引均已删除；未重启服务或重跑业务知识库。
