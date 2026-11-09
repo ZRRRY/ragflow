@@ -197,8 +197,7 @@ class VolcEngine(Base):
     def _get_model_list_url(self):
         if not self.base_url:
             self.base_url = "https://ark.cn-beijing.volces.com/api/v3"
-        parsed = urlparse(self.base_url)
-        return f"{parsed.scheme}://{parsed.netloc}/api/v3/models"
+        return self.base_url.rstrip("/") + "/models"
 
     def _format_model_list(self, raw_model_list):
         serving_model = [model for model in raw_model_list["data"] if model.get("status", "") != "Shutdown"]

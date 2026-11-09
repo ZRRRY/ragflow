@@ -19,6 +19,9 @@ import { LLMFactory } from '@/constants/llm';
 import type { ProviderConfig } from '../types';
 import { parseApiKeyAsObject } from './utils';
 
+const VolcEngineCodingBaseUrl =
+  'https://ark.cn-beijing.volces.com/api/coding/v3';
+
 const buildMineruApiKey = (values: Record<string, any>) => {
   const cfg: Record<string, any> = { ...values };
   delete cfg.instance_name;
@@ -123,15 +126,32 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
         shouldRender: 'hideWhenInstanceExists',
         validation: { message: 'ArkApiKeyMessage' },
       },
+      {
+        name: 'base_url',
+        label: 'baseUrl',
+        type: 'inputSelect',
+        required: true,
+        placeholder: 'baseUrlNameMessage',
+        validation: { message: 'baseUrlNameMessage' },
+        options: [
+          { label: 'Coding Plan', value: VolcEngineCodingBaseUrl },
+          {
+            label: 'https://ark.cn-beijing.volces.com/api/v3',
+            value: 'https://ark.cn-beijing.volces.com/api/v3',
+          },
+        ],
+      },
     ],
     verifyTransform: (values) => ({
       apiKey: values.api_key,
+      baseUrl: values.base_url,
       modelInfo: [],
     }),
     submitTransform: (values) => ({
       instance_name: values.instance_name,
       llm_factory: LLMFactory.VolcEngine,
       api_key: values.api_key,
+      base_url: values.base_url,
       model_info: [],
     }),
   },
