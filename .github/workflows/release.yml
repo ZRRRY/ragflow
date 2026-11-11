@@ -272,6 +272,7 @@ jobs:
   # manifest list and then deletes them from Docker Hub, leaving only the
   # version/latest/nightly dual-structure tags.
   build-amd64:
+    if: github.repository == 'infiniflow/ragflow'
     needs:
       - prepare
     runs-on: ubuntu-24.04
@@ -322,6 +323,7 @@ jobs:
   # deleted from Docker Hub, leaving only the dual-structure tags
   # (${RELEASE_TAG}, :latest for stable, or :nightly).
   build-arm64:
+    if: github.repository == 'infiniflow/ragflow'
     needs:
       - build-amd64
       - prepare
